@@ -1,0 +1,14 @@
+# Ignore Cargo build artifacts and cache
+/target/
+
+# Ignore generated C header file if it's always rebuilt
+# For now, let's keep it versioned to see it, but typically it might be ignored
+# klipper_rust_port.h
+
+# Ignore other common Rust temporary files
+Cargo.lock # Depending on policy, Cargo.lock might be committed for libraries if reproducible deps are needed by the lib itself.
+           # For a porting project like this, it's often committed. Let's keep it for now.
+# *.rs.bk # Backup files
+# .DS_Store # macOS specific
+# .idea/ # IntelliJ specific
+# .vscode/ # VSCode specific
