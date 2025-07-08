@@ -1,0 +1,18 @@
+[package]
+name = "stepper_motor_controller"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+heapless = "0.8" # Using 0.8 as it's the latest version at the time of writing
+bitflags = "2.5"
+
+# Placeholder for a HAL crate - replace with actual target HAL
+# For example:
+# stm32f4xx-hal = { version = "0.17.2", features = ["stm32f401"] }
+# rp2040-hal = "0.10.1"
+    cortex-m = "0.7.7" # For interrupt::free example, and common for embedded
+
+[dev-dependencies]
+# cortex-m-rt = "0.7.3" # Example for embedded testing
+# panic-halt = "0.2.0"   # Example for embedded testing

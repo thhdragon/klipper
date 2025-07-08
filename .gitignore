@@ -5,3 +5,4 @@ out
 .config.old
 klippy/.version
 klipper_rust/target
+/target/
