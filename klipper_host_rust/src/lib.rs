@@ -18,6 +18,9 @@ pub mod webhooks;
 pub mod console;
 pub mod mathutil;
 pub mod msgproto;
+pub mod trapq; // Added trapq module
+pub mod itersolve; // Added itersolve module
+pub mod stepcompress; // Added stepcompress module
 
 // Declare module for the kinematics subdirectory
 pub mod kinematics;

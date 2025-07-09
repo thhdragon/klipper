@@ -363,6 +363,17 @@ impl Move {
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
+#[derive(Debug, Clone, PartialEq, Default)]
+#[cfg_attr(feature = "std", derive(serde::Serialize, serde::Deserialize))]
+pub struct PullMove {
+    pub print_time: f64,
+    pub move_t: f64,
+    pub start_v: f64,
+    pub accel: f64,
+    pub start_pos: Coord, // Using the existing Coord struct for x,y,z
+    pub axes_r: Coord,    // Using the existing Coord struct for x_r,y_r,z_r
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TrapQ {
     #[cfg(feature = "alloc")]
@@ -732,6 +743,73 @@ impl TrapQ {
         };
         self.history.insert(0, marker_move); // Add to head of history
     }
+
+    /// Return history of movement queue.
+    /// Corresponds to C: int trapq_extract_old(...)
+    #[cfg(feature = "alloc")]
+    pub fn extract_old(
+        &self,
+        max_moves: usize,
+        start_time: f64,
+        end_time: f64,
+    ) -> Vec<PullMove> {
+        let mut result = Vec::new();
+        if max_moves == 0 {
+            return result;
+        }
+
+        for m_hist in &self.history {
+            // In C: if (start_time >= m->print_time + m->move_t || res >= max) break;
+            // This means moves that *end* at or before start_time are too old.
+            if start_time >= m_hist.print_time + m_hist.move_t {
+                break; // This move and subsequent (older) ones are too old
+            }
+
+            // In C: if (end_time <= m->print_time) continue;
+            // This means moves that *start* at or after end_time are too new.
+            if end_time <= m_hist.print_time {
+                continue; // This move is too new, check the next (older) one
+            }
+
+            // If we reach here, the move is within the time window [start_time, end_time)
+            // considering move intervals.
+            let p_move = PullMove {
+                print_time: m_hist.print_time,
+                move_t: m_hist.move_t,
+                start_v: m_hist.start_v,
+                accel: 2.0 * m_hist.half_accel,
+                start_pos: m_hist.start_pos,
+                axes_r: m_hist.axes_r,
+            };
+            result.push(p_move);
+
+            if result.len() >= max_moves {
+                break; // Reached max number of moves to extract
+            }
+        }
+        result
+    }
+
+    /// Returns the print time when the last move in the queue finishes.
+    /// This provides similar information to accessing the C version's tail sentinel's print_time.
+    #[cfg(feature = "alloc")]
+    pub fn last_move_end_time(&self) -> Option<f64> {
+        self.moves.last().map(|last_move| last_move.print_time + last_move.move_t)
+    }
+
+    /// Returns the position where the last move in the queue finishes.
+    /// This provides similar information to accessing the C version's tail sentinel's start_pos.
+    #[cfg(feature = "alloc")]
+    pub fn last_move_end_pos(&self) -> Option<Coord> {
+        self.moves.last().map(|last_move| {
+            let move_dist = last_move.get_distance(last_move.move_t);
+            Coord {
+                x: last_move.start_pos.x + last_move.axes_r.x * move_dist,
+                y: last_move.start_pos.y + last_move.axes_r.y * move_dist,
+                z: last_move.start_pos.z + last_move.axes_r.z * move_dist,
+            }
+        })
+    }
 }
 
 
@@ -1007,4 +1085,265 @@ mod tests {
     //     let tq = TrapQ::new_no_alloc();
     //     // Add assertions based on fixed-size array initialization
     // }
+
+    #[cfg(feature = "alloc")]
+    mod trapq_extract_old_tests {
+        use super::*; // Imports Move, Coord, TrapQ, PullMove, new_test_tq, etc.
+        use float_cmp::assert_approx_eq;
+
+        // Helper to create a non-null move for history
+        fn history_move(print_time: f64, move_t: f64, id: f64) -> Move {
+            Move::new(
+                print_time,
+                move_t,
+                1.0, // start_v
+                0.5, // half_accel (implies accel = 1.0 for PullMove)
+                Coord::new(id, id, id), // start_pos
+                Coord::new(1.0, 0.0, 0.0), // axes_r
+            )
+        }
+
+        #[test]
+        fn extract_old_empty_history() {
+            let tq = new_test_tq();
+            let result = tq.extract_old(5, 0.0, 10.0);
+            assert!(result.is_empty());
+        }
+
+        #[test]
+        fn extract_old_max_moves_zero() {
+            let mut tq = new_test_tq();
+            tq.history.push(history_move(0.0, 1.0, 1.0));
+            let result = tq.extract_old(0, 0.0, 10.0);
+            assert!(result.is_empty());
+        }
+
+        #[test]
+        fn extract_old_no_moves_in_time_window() {
+            let mut tq = new_test_tq();
+            // History (newest to oldest): m(2.0, 1.0), m(0.0, 1.0)
+            tq.history.push(history_move(0.0, 1.0, 1.0)); // Ends at 1.0
+            tq.history.push(history_move(2.0, 1.0, 2.0)); // Ends at 3.0 (This is at index 0)
+
+            // Window [1.0, 2.0)
+            // m(2.0, 1.0) starts at 2.0, so end_time(2.0) <= m.print_time(2.0) -> continue (skip)
+            // m(0.0, 1.0) ends at 1.0, so start_time(1.0) >= m.print_time(0.0)+m.move_t(1.0) -> break
+            let result = tq.extract_old(5, 1.0, 2.0);
+            assert!(result.is_empty());
+        }
+
+        #[test]
+        fn extract_old_all_moves_fit_max_moves_and_window() {
+            let mut tq = new_test_tq();
+            let m1 = history_move(0.0, 1.0, 1.0); // Ends 1.0
+            let m2 = history_move(1.0, 1.0, 2.0); // Ends 2.0
+            // History (newest to oldest): m2, m1
+            tq.history.push(m1.clone());
+            tq.history.push(m2.clone());
+
+
+            let result = tq.extract_old(5, 0.0, 2.5);
+            assert_eq!(result.len(), 2);
+            // Order in result should be same as history: newest to oldest
+            assert_approx_eq!(f64, result[0].print_time, m2.print_time);
+            assert_approx_eq!(f64, result[0].accel, 2.0 * m2.half_accel);
+            assert_eq!(result[0].start_pos, m2.start_pos);
+
+            assert_approx_eq!(f64, result[1].print_time, m1.print_time);
+            assert_approx_eq!(f64, result[1].accel, 2.0 * m1.half_accel);
+            assert_eq!(result[1].start_pos, m1.start_pos);
+        }
+
+        #[test]
+        fn extract_old_limited_by_max_moves() {
+            let mut tq = new_test_tq();
+            let m1 = history_move(0.0, 1.0, 1.0);
+            let m2 = history_move(1.0, 1.0, 2.0);
+            let m3 = history_move(2.0, 1.0, 3.0);
+            // History (newest to oldest): m3, m2, m1
+            tq.history.push(m1.clone());
+            tq.history.push(m2.clone());
+            tq.history.push(m3.clone());
+
+            let result = tq.extract_old(2, 0.0, 3.5); // Max 2 moves
+            assert_eq!(result.len(), 2);
+            assert_approx_eq!(f64, result[0].print_time, m3.print_time);
+            assert_approx_eq!(f64, result[1].print_time, m2.print_time);
+        }
+
+        #[test]
+        fn extract_old_limited_by_start_time() {
+            let mut tq = new_test_tq();
+            let m1 = history_move(0.0, 1.0, 1.0); // Ends 1.0
+            let m2 = history_move(1.0, 1.0, 2.0); // Ends 2.0
+            let m3 = history_move(2.0, 1.0, 3.0); // Ends 3.0
+            // History: m3, m2, m1
+            tq.history.push(m1.clone());
+            tq.history.push(m2.clone());
+            tq.history.push(m3.clone());
+
+            // start_time = 1.5.
+            // m3 (pt=2, mt=1, ends=3): 1.5 < 3.0 (ok). end_time(3.5) > 2.0 (ok). Include.
+            // m2 (pt=1, mt=1, ends=2): 1.5 < 2.0 (ok). end_time(3.5) > 1.0 (ok). Include.
+            // m1 (pt=0, mt=1, ends=1): 1.5 >= 1.0 (start_time >= move_end_time). Break.
+            let result = tq.extract_old(5, 1.5, 3.5);
+            assert_eq!(result.len(), 2);
+            assert_approx_eq!(f64, result[0].print_time, m3.print_time);
+            assert_approx_eq!(f64, result[1].print_time, m2.print_time);
+        }
+
+        #[test]
+        fn extract_old_limited_by_end_time() {
+            let mut tq = new_test_tq();
+            let m1 = history_move(0.0, 1.0, 1.0); // Ends 1.0
+            let m2 = history_move(1.0, 1.0, 2.0); // Ends 2.0
+            let m3 = history_move(2.0, 1.0, 3.0); // Ends 3.0
+            // History: m3, m2, m1
+            tq.history.push(m1.clone());
+            tq.history.push(m2.clone());
+            tq.history.push(m3.clone());
+
+            // end_time = 1.5
+            // m3 (pt=2, mt=1): end_time(1.5) <= pt(2.0). Skip.
+            // m2 (pt=1, mt=1): end_time(1.5) > pt(1.0) (ok). start_time(0.0) < ends(2.0) (ok). Include.
+            // m1 (pt=0, mt=1): end_time(1.5) > pt(0.0) (ok). start_time(0.0) < ends(1.0) (ok). Include.
+            let result = tq.extract_old(5, 0.0, 1.5);
+            assert_eq!(result.len(), 2);
+            assert_approx_eq!(f64, result[0].print_time, m2.print_time); // m3 skipped
+            assert_approx_eq!(f64, result[1].print_time, m1.print_time);
+        }
+
+        #[test]
+        fn extract_old_exact_time_match() {
+            let mut tq = new_test_tq();
+            let m = history_move(1.0, 1.0, 1.0); // pt=1, ends=2
+            tq.history.push(m.clone());
+
+            // Window [1.0, 2.0) should include the move
+            // start_time(1.0) < m.print_time(1.0)+m.move_t(1.0) -> 1.0 < 2.0 (ok)
+            // end_time(2.0) > m.print_time(1.0) -> 2.0 > 1.0 (ok)
+            let result = tq.extract_old(5, 1.0, 2.0);
+            assert_eq!(result.len(), 1);
+            assert_approx_eq!(f64, result[0].print_time, m.print_time);
+
+            // Window [1.0, 1.9) should include the move
+            let result_tight_end = tq.extract_old(5, 1.0, 1.9);
+            assert_eq!(result_tight_end.len(), 1);
+
+            // Window [1.1, 2.0) should include the move
+            let result_tight_start = tq.extract_old(5, 1.1, 2.0);
+            assert_eq!(result_tight_start.len(), 1);
+
+            // Window covering exactly the move's print_time to print_time + move_t
+            // Move starts at 1.0, ends at 2.0.
+            // start_time = 1.0. Condition: 1.0 < 1.0 + 1.0 (true)
+            // end_time = 2.0. Condition: 2.0 <= 1.0 (false) -> so it is included.
+            let result_exact = tq.extract_old(1, m.print_time, m.print_time + m.move_t);
+            assert_eq!(result_exact.len(), 1);
+
+
+            // Move starts at 1.0, ends at 2.0
+            // Test case: start_time = 2.0 (exactly when move ends)
+            // Condition: start_time >= m.print_time + m.move_t  => 2.0 >= 1.0 + 1.0  => 2.0 >= 2.0 (true) -> break. So, not included.
+            let result_start_at_end = tq.extract_old(1, m.print_time + m.move_t, m.print_time + m.move_t + 1.0);
+            assert!(result_start_at_end.is_empty());
+
+            // Test case: end_time = 1.0 (exactly when move starts)
+            // Condition: end_time <= m.print_time => 1.0 <= 1.0 (true) -> continue. So, not included.
+            let result_end_at_start = tq.extract_old(1, m.print_time - 1.0, m.print_time);
+            assert!(result_end_at_start.is_empty());
+        }
+    }
+
+    #[cfg(feature = "alloc")]
+    mod trapq_last_move_info_tests {
+        use super::*;
+        use float_cmp::assert_approx_eq;
+
+        fn create_move(print_time: f64, move_t: f64, start_pos: Coord, axes_r: Coord) -> Move {
+            Move::new(print_time, move_t, 1.0, 0.5, start_pos, axes_r)
+        }
+
+        #[test]
+        fn last_move_info_empty_queue() {
+            let tq = new_test_tq();
+            assert!(tq.last_move_end_time().is_none());
+            assert!(tq.last_move_end_pos().is_none());
+        }
+
+        #[test]
+        fn last_move_info_single_move() {
+            let mut tq = new_test_tq();
+            let start_pos = Coord::new(1.0, 2.0, 3.0);
+            let axes_r = Coord::new(1.0, 0.0, 0.0); // Moves in X
+            let m = create_move(10.0, 2.0, start_pos, axes_r); // pt=10, mt=2
+                                                                 // start_v=1, half_accel=0.5
+            tq.moves.push(m.clone());
+
+            let expected_end_time = 10.0 + 2.0;
+            assert!(tq.last_move_end_time().is_some());
+            assert_approx_eq!(f64, tq.last_move_end_time().unwrap(), expected_end_time);
+
+            // dist = start_v * t + half_accel * t^2 = 1*2 + 0.5*2^2 = 2 + 2 = 4
+            let expected_dist = m.start_v * m.move_t + m.half_accel * m.move_t * m.move_t;
+            let expected_end_pos = Coord {
+                x: start_pos.x + axes_r.x * expected_dist, // 1 + 1*4 = 5
+                y: start_pos.y + axes_r.y * expected_dist, // 2 + 0*4 = 2
+                z: start_pos.z + axes_r.z * expected_dist, // 3 + 0*4 = 3
+            };
+            assert!(tq.last_move_end_pos().is_some());
+            let actual_end_pos = tq.last_move_end_pos().unwrap();
+            assert_approx_eq!(f64, actual_end_pos.x, expected_end_pos.x);
+            assert_approx_eq!(f64, actual_end_pos.y, expected_end_pos.y);
+            assert_approx_eq!(f64, actual_end_pos.z, expected_end_pos.z);
+        }
+
+        #[test]
+        fn last_move_info_multiple_moves() {
+            let mut tq = new_test_tq();
+            let start_pos1 = Coord::new(0.0, 0.0, 0.0);
+            let axes_r1 = Coord::new(1.0, 0.0, 0.0);
+            let m1 = create_move(0.0, 1.0, start_pos1, axes_r1); // Ends at t=1.0, pos_x=1.5
+            tq.moves.push(m1.clone());
+
+            let start_pos2 = Coord::new(1.5, 0.0, 0.0); // Start where m1 ended
+            let axes_r2 = Coord::new(0.0, 1.0, 0.0); // Moves in Y
+            let m2 = create_move(1.0, 2.0, start_pos2, axes_r2); // pt=1, mt=2. start_v=1, half_accel=0.5
+            tq.moves.push(m2.clone()); // This is the last move
+
+            let expected_end_time = 1.0 + 2.0; // m2.print_time + m2.move_t
+            assert!(tq.last_move_end_time().is_some());
+            assert_approx_eq!(f64, tq.last_move_end_time().unwrap(), expected_end_time);
+
+            // For m2: dist = 1*2 + 0.5*2^2 = 2 + 2 = 4
+            let expected_dist_m2 = m2.start_v * m2.move_t + m2.half_accel * m2.move_t * m2.move_t;
+            let expected_end_pos_m2 = Coord {
+                x: start_pos2.x + axes_r2.x * expected_dist_m2, // 1.5 + 0*4 = 1.5
+                y: start_pos2.y + axes_r2.y * expected_dist_m2, // 0.0 + 1*4 = 4.0
+                z: start_pos2.z + axes_r2.z * expected_dist_m2, // 0.0 + 0*4 = 0.0
+            };
+            assert!(tq.last_move_end_pos().is_some());
+            let actual_end_pos = tq.last_move_end_pos().unwrap();
+            assert_approx_eq!(f64, actual_end_pos.x, expected_end_pos_m2.x);
+            assert_approx_eq!(f64, actual_end_pos.y, expected_end_pos_m2.y);
+            assert_approx_eq!(f64, actual_end_pos.z, expected_end_pos_m2.z);
+        }
+         #[test]
+        fn last_move_info_move_with_zero_duration() {
+            let mut tq = new_test_tq();
+            let start_pos = Coord::new(1.0, 1.0, 1.0);
+            let m = create_move(5.0, 0.0, start_pos, Coord::new(1.0,0.0,0.0)); // move_t = 0
+            tq.moves.push(m.clone());
+
+            let expected_end_time = 5.0 + 0.0;
+            assert_approx_eq!(f64, tq.last_move_end_time().unwrap(), expected_end_time);
+
+            // dist for zero duration move is 0
+            let expected_end_pos = start_pos; // Position should not change
+            let actual_end_pos = tq.last_move_end_pos().unwrap();
+            assert_approx_eq!(f64, actual_end_pos.x, expected_end_pos.x);
+            assert_approx_eq!(f64, actual_end_pos.y, expected_end_pos.y);
+            assert_approx_eq!(f64, actual_end_pos.z, expected_end_pos.z);
+        }
+    }
 }
