@@ -165,6 +165,10 @@ dependencies = [
 [[package]]
 name = "klipper_host_rust"
 version = "0.1.0"
+dependencies = [
+ "float-cmp",
+ "log",
+]
 
 [[package]]
 name = "klipper_mcu_rust"

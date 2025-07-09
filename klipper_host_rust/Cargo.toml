@@ -10,3 +10,4 @@ alloc = []
 
 [dependencies]
 float-cmp = "0.9"
+log = "0.4"

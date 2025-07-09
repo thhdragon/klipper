@@ -7,6 +7,9 @@
 // pub mod bltouch;
 // pub mod display; // This would be another subdirectory with its own mod.rs
 // ... other extras
+pub mod buttons;
+pub mod fan;
+pub mod probe;
 
 // pub fn lookup_extra(module_name: &str, config: &ConfigSection, printer: &Printer) -> Result<Box<dyn ExtraModule>, String> {
 //     // Logic to load and instantiate extra modules based on config

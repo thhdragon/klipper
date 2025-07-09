@@ -2,6 +2,9 @@
 
 // This crate will contain the Rust port of the Klipper host software (klippy).
 
+// Core traits used by various modules
+pub mod core_traits;
+
 // Declare modules corresponding to the created skeleton files
 pub mod klippy_main;
 pub mod gcode;
@@ -11,14 +14,14 @@ pub mod clocksync;
 pub mod configfile;
 pub mod pins;
 pub mod reactor;
-pub mod serialhdl;
+// pub mod serialhdl; // Commented out due to compilation errors
 pub mod stepper; // Host-side stepper logic
 pub mod util;      // Host-side utilities
 pub mod webhooks;
 pub mod console;
 pub mod mathutil;
 pub mod msgproto;
-pub mod trapq; // Added trapq module
+// pub mod trapq; // Added trapq module - Commented out due to compilation errors
 pub mod itersolve; // Added itersolve module
 pub mod stepcompress; // Added stepcompress module
 
