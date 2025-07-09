@@ -1,0 +1,11 @@
+[package]
+name = "klipper_rust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pyo3 = { version = "0.20.0", features = ["extension-module"] } # PyO3 might not be needed if only building a binary
+
+[[bin]]
+name = "klipper_rust_bin"
+path = "src/main.rs"
