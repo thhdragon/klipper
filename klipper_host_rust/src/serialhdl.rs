@@ -24,7 +24,7 @@ pub type MessageParams = HashMap<String, ParamValue>;
 // `params` includes '#sent_time', '#receive_time', and 'clock'.
 // This will need to be `Box<dyn FnMut(MessageParams)>` if it needs to capture state.
 // For a simple placeholder, `fn(MessageParams)` is okay.
-pub type ResponseCallback = fn(params: MessageParams);
+pub type ResponseCallback = Box<dyn FnMut(MessageParams)>;
 
 // Placeholder for what `create_command` would return.
 // This would be a struct that knows how to format a specific command.

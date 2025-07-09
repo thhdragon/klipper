@@ -12,7 +12,7 @@ pub struct TimerHandle(usize);
 // would typically be a closure or a method call on a trait object.
 // For simplicity in placeholders, we'll use a simple fn pointer.
 // A more robust solution would use `Box<dyn FnMut(f64) -> f64>`.
-pub type TimerCallback = fn(eventtime: f64) -> f64;
+pub type TimerCallback = Box<dyn FnMut(f64) -> f64>;
 
 pub struct Reactor {
     next_timer_handle: usize,
