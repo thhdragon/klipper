@@ -7,6 +7,10 @@
 use core::ffi::c_uchar;
 use core::panic::PanicInfo;
 
+pub mod trapq; // Add trapq as a public module
+pub mod itersolve; // Add itersolve as a public module
+pub mod stepcompress; // Add stepcompress as a public module
+
 /// Implement the standard crc "ccitt" algorithm on the given buffer
 #[unsafe(no_mangle)]
 pub extern "C" fn crc16_ccitt(buf: *const u8, len: c_uchar) -> u16 {
