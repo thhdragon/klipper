@@ -214,12 +214,21 @@ fn get_repo_info_internal(gitdir_str: &str) -> Result<(String, String, String), 
 
 
 // Placeholder for other functions from util.py
-use signal_hook::{consts::SIGINT, low_level::signal_handler};
+use signal_hook::consts::signal::SIGINT;
+use signal_hook::consts::SIG_DFL; // For the handler address
+use signal_hook::low_level::signal as low_level_signal; // Alias to avoid conflict if any
+use signal_hook::low_level::Handler as SigHandler; // Alias for clarity
+use std::os::unix::io::{AsRawFd, BorrowedFd, IntoRawFd, OwnedFd};
+
 
 // Return the SIGINT interrupt handler back to the OS default
 pub fn fix_sigint() {
     unsafe {
-        if let Err(e) = signal_handler(SIGINT, signal_hook::low_level::Handler::SigDfl) {
+        // SIG_DFL is usize (actually sighandler_t from libc, which is usize on many platforms)
+        // signal_hook::low_level::Handler is also an alias for sighandler_t (extern "C" fn(c_int))
+        // So, a direct cast should work, or transmute if sizes/types are tricky.
+        // Given SIG_DFL is specifically for this, direct use or simple cast is intended.
+        if let Err(e) = low_level_signal(SIGINT, SIG_DFL as SigHandler) {
             eprintln!("Failed to set SIGINT handler to default: {}", e);
         }
     }
@@ -238,14 +247,17 @@ pub fn set_nonblock(fd: RawFd) -> Result<(), nix::Error> {
     Ok(())
 }
 
-use nix::sys::termios::{tcgetattr, tcsetattr, SetArg, Termios, LocalFlags};
+use nix::sys::termios::{tcgetattr, tcsetattr, SetArg};
+// Removed LocalFlags direct import to use fully qualified path
 
 // Clear HUPCL flag
 pub fn clear_hupcl(fd: RawFd) -> Result<(), nix::Error> {
+    // isatty expects RawFd
     if isatty(fd)? {
-        let mut termios_attrs = tcgetattr(fd)?;
-        termios_attrs.local_flags.remove(LocalFlags::HUPCL);
-        tcsetattr(fd, SetArg::TCSADRAIN, &termios_attrs)?;
+        let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
+        let mut termios_attrs = tcgetattr(borrowed_fd)?;
+        termios_attrs.local_flags.remove(nix::sys::termios::LocalFlags::HUPCL);
+        tcsetattr(borrowed_fd, SetArg::TCSADRAIN, &termios_attrs)?;
     }
     Ok(())
 }
@@ -253,74 +265,62 @@ pub fn clear_hupcl(fd: RawFd) -> Result<(), nix::Error> {
 use nix::pty::openpty;
 use std::fs as std_fs;
 use std::os::unix::fs::symlink;
-use nix::sys::stat::{chmod, Mode};
+// No specific import for nix::sys::stat::chmod, will use fully qualified path
 use nix::unistd::ttyname;
 
 // Support for creating a pseudo-tty for emulating a serial port
 pub fn create_pty(ptyname: &str) -> Result<RawFd, String> {
-    let pty = openpty(None, None).map_err(|e| format!("Failed to open PTY: {}", e))?;
-    let master_fd = pty.master;
-    let slave_fd = pty.slave;
+    let pty_results = openpty(None, None).map_err(|e| format!("Failed to open PTY: {}", e))?;
+    let master_owned_fd = pty_results.master;
+    let slave_owned_fd = pty_results.slave;
 
     if let Err(e) = std_fs::remove_file(ptyname) {
         if e.kind() != std::io::ErrorKind::NotFound {
-            // Only error if it's not a "file not found" error
-            close_fds_and_return_err(master_fd, slave_fd, format!("Failed to unlink old ptyname {}: {}", ptyname, e))?;
+            return Err(format!("Failed to unlink old ptyname {}: {}", ptyname, e));
         }
     }
 
-    let slave_name = match ttyname(slave_fd) {
-        Ok(name_cstr) => match name_cstr.into_string() {
-            Ok(name_str) => name_str,
-            Err(e) => {
-                return close_fds_and_return_err(master_fd, slave_fd, format!("Failed to convert slave PTY name to string: {:?}", e));
-            }
-        },
+    let slave_name_path = match ttyname(slave_owned_fd.as_raw_fd()) {
+        Ok(name_path) => name_path,
         Err(e) => {
-            return close_fds_and_return_err(master_fd, slave_fd, format!("Failed to get slave PTY name: {}", e));
+            return Err(format!("Failed to get slave PTY name: {}", e));
         }
     };
+    let slave_name = slave_name_path.to_str().ok_or_else(|| {
+        format!("Slave PTY name is not valid UTF-8: {:?}", slave_name_path)
+    })?;
 
-    if let Err(e) = chmod(&slave_name, Mode::S_IRUSR | Mode::S_IWUSR | Mode::S_IRGRP | Mode::S_IWGRP) {
-        return close_fds_and_return_err(master_fd, slave_fd, format!("Failed to chmod slave PTY {}: {}", slave_name, e));
+    if let Err(e) = nix::sys::stat::chmod(slave_name, nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR | nix::sys::stat::Mode::S_IRGRP | nix::sys::stat::Mode::S_IWGRP) {
+        return Err(format!("Failed to chmod slave PTY {}: {}", slave_name, e));
     }
 
-    if let Err(e) = symlink(&slave_name, ptyname) {
-        return close_fds_and_return_err(master_fd, slave_fd, format!("Failed to symlink {} to {}: {}", slave_name, ptyname, e));
+    if let Err(e) = symlink(slave_name, ptyname) {
+        return Err(format!("Failed to symlink {} to {}: {}", slave_name, ptyname, e));
     }
 
-    if let Err(e) = set_nonblock(master_fd) {
-        return close_fds_and_return_err(master_fd, slave_fd, format!("Failed to set master PTY to non-blocking: {}", e));
+    let master_fd_raw = master_owned_fd.as_raw_fd();
+    if let Err(e) = set_nonblock(master_fd_raw) {
+        return Err(format!("Failed to set master PTY to non-blocking: {}", e));
     }
 
-    if isatty(master_fd).unwrap_or(false) {
-        match tcgetattr(master_fd) {
+    // isatty expects RawFd
+    if isatty(master_fd_raw).unwrap_or(false) {
+        let borrowed_master_fd = unsafe { BorrowedFd::borrow_raw(master_fd_raw) };
+        match tcgetattr(borrowed_master_fd) {
             Ok(mut termios_attrs) => {
-                termios_attrs.local_flags.remove(LocalFlags::ECHO);
-                if let Err(e) = tcsetattr(master_fd, SetArg::TCSADRAIN, &termios_attrs) {
-                     // Not returning error here as in original python code
+                termios_attrs.local_flags.remove(nix::sys::termios::LocalFlags::ECHO); // Fully qualify ECHO as well
+                if let Err(e) = tcsetattr(borrowed_master_fd, SetArg::TCSADRAIN, &termios_attrs) {
                     eprintln!("Failed to tcsetattr on master PTY: {}", e);
                 }
             }
             Err(e) => {
-                // Not returning error here as in original python code
                 eprintln!("Failed to tcgetattr on master PTY: {}", e);
             }
         }
     }
-    // Only slave_fd is closed here as master_fd is returned
-    if let Err(e) = nix::unistd::close(slave_fd) {
-         eprintln!("Warning: Failed to close slave PTY fd {}: {}", slave_fd, e);
-    }
-
-    Ok(master_fd)
+    Ok(master_owned_fd.into_raw_fd())
 }
 
-fn close_fds_and_return_err<T>(master_fd: RawFd, slave_fd: RawFd, msg: String) -> Result<T, String> {
-    let _ = nix::unistd::close(master_fd); // Ignore error on close
-    let _ = nix::unistd::close(slave_fd); // Ignore error on close
-    Err(msg)
-}
 
 use std::path::PathBuf;
 use std::collections::HashMap;
@@ -526,14 +526,15 @@ mod tests {
         assert!(clear_hupcl(fd_hupcl_nontty).is_ok(), "clear_hupcl on non-TTY fd failed");
 
         let stdin_fd = std::io::stdin().as_raw_fd();
-        if nix::unistd::isatty(stdin_fd).unwrap_or(false) {
+        if nix::unistd::isatty(stdin_fd).unwrap_or(false) { // isatty takes RawFd
             println!("Attempting clear_hupcl on stdin (TTY)");
-            let original_termios = nix::sys::termios::tcgetattr(stdin_fd).ok();
+            let borrowed_stdin = unsafe { BorrowedFd::borrow_raw(stdin_fd) };
+            let original_termios = nix::sys::termios::tcgetattr(borrowed_stdin).ok();
             // This might fail if stdin is not a controlling TTY or due to permissions.
             // We are primarily testing that the function call itself doesn't panic.
-            let _ = clear_hupcl(stdin_fd); // Don't assert on result for stdin to avoid flaky tests
+            let _ = clear_hupcl(stdin_fd); // clear_hupcl takes RawFd
             if let Some(orig) = original_termios {
-                let _ = nix::sys::termios::tcsetattr(stdin_fd, nix::sys::termios::SetArg::TCSADRAIN, &orig);
+                let _ = nix::sys::termios::tcsetattr(borrowed_stdin, nix::sys::termios::SetArg::TCSADRAIN, &orig);
             }
         } else {
             println!("Skipping clear_hupcl TTY-specific part as stdin is not a TTY");

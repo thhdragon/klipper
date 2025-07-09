@@ -9,6 +9,6 @@
 /**
  * Implement the standard crc "ccitt" algorithm on the given buffer
  */
-uint16_t crc16_ccitt(const uint8_t *buf, uintptr_t len);
+uint16_t crc16_ccitt(const uint8_t *buf, unsigned char len);
 
 #endif  /* KLIPPER_RUST_PORT_H */
