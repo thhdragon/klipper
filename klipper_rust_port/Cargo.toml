@@ -4,9 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [lib]
-crate-type = ["staticlib", "rlib"] # staticlib for C, rlib for Rust tests/benchmarks
+crate-type = ["rlib"] # For Rust tests/benchmarks and use by other Rust crates
 
 [dependencies]
-
-[build-dependencies]
-cbindgen = "0.29"

@@ -4,9 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-pyo3 = { version = "0.20.0", features = ["extension-module"] } # PyO3 might not be needed if only building a binary
-signal-hook = "0.3"
-nix = { version = "0.27.1", features = ["fs", "term"] }
+# pyo3 removed
+# signal-hook removed
+# nix removed
+# libc removed
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 chrono = "0.4" # For formatting timestamps

@@ -18,7 +18,7 @@ CFLAGS_pru1.elf := $(CFLAGS)
 src-y += pru/main.c pru/gpio.c generic/timer_irq.c
 src-$(CONFIG_WANT_ADC) += pru/adc.c
 
-pru0-y := pru/pru0.c generic/crc16_ccitt.c command.c
+pru0-y := pru/pru0.c command.c
 pru0-y += ../lib/pru_rpmsg/pru_rpmsg.c ../lib/pru_rpmsg/pru_virtqueue.c
 
 # Build the PRU binaries
