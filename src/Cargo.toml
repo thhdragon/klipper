@@ -1,0 +1,30 @@
+[package]
+name = "klipper_mcu_rust"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["rlib"] # For firmware, rlib is appropriate
+path = "lib.rs"
+
+[dependencies]
+bitflags = "2.4.0" # Used in src/lib.rs
+heapless = "0.7.16" # Used for heapless::Deque in src/lib.rs
+
+# Optional: Add cortex-m if targeting ARM Cortex-M MCUs and using its features like interrupt::free
+# cortex-m = { version = "0.7.7", features = ["critical-section-single-core"] }
+
+# For no_std with alloc (needed by trapq.rs which uses Vec)
+# This requires nightly compiler and a global allocator definition.
+# For now, I will assume the `alloc` feature can be enabled on a crate/module basis
+# or that `trapq.rs` will be refactored to use `heapless::Vec` if truly no_std + no_alloc.
+# The `klipper_rust_port/src/trapq.rs` has `#[cfg(feature = "alloc")]` which is good.
+# We'll need to ensure this feature is properly handled during builds.
+
+[features]
+default = ["alloc"] # Make alloc a default feature
+alloc = []
+
+[dev-dependencies]
+# For tests, especially for float comparisons in trapq.rs and itersolve.rs
+float-cmp = "0.9"
