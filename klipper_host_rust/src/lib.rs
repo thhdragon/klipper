@@ -2,6 +2,9 @@
 
 // This crate will contain the Rust port of the Klipper host software (klippy).
 
+// Core traits used by various modules
+pub mod core_traits;
+
 // Declare modules corresponding to the created skeleton files
 pub mod klippy_main;
 pub mod gcode;
