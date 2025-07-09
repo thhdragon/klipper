@@ -1,8 +1,11 @@
+#![no_std]
+
 // Equivalent of #include "misc.h" for crc16_ccitt declaration
 // In Rust, functions are typically public if they are meant to be called from outside the module.
 // We will make this function public.
 
-use std::os::raw::c_uchar;
+use core::ffi::c_uchar;
+use core::panic::PanicInfo;
 
 /// Implement the standard crc "ccitt" algorithm on the given buffer
 #[unsafe(no_mangle)]
@@ -40,34 +43,41 @@ mod tests {
     #[test]
     fn test_crc16_ccitt_empty() {
         let data: [u8; 0] = [];
-        assert_eq!(crc16_ccitt(data.as_ptr(), data.len()), 0xffff);
+        assert_eq!(crc16_ccitt(data.as_ptr(), data.len() as u8), 0xffff);
     }
 
     #[test]
     fn test_crc16_ccitt_basic() {
         // Value from running Klipper's C code for "123456789"
         let data1 = b"123456789";
-        assert_eq!(crc16_ccitt(data1.as_ptr(), data1.len()), 0x6F91);
+        assert_eq!(crc16_ccitt(data1.as_ptr(), data1.len() as u8), 0x6F91);
     }
 
     #[test]
     fn test_crc16_ccitt_klipper_example() {
         // Value from running Klipper's C code for {0x01, 0x02, 0x03, 0x04, 0x05}
         let data = [0x01, 0x02, 0x03, 0x04, 0x05];
-        assert_eq!(crc16_ccitt(data.as_ptr(), data.len()), 0xDD13);
+        assert_eq!(crc16_ccitt(data.as_ptr(), data.len() as u8), 0xDD13);
     }
 
     #[test]
     fn test_crc16_ccitt_single_byte() {
         // Value from running Klipper's C code for {0xAA}
         let data = [0xAA];
-        assert_eq!(crc16_ccitt(data.as_ptr(), data.len()), 0x05D7);
+        assert_eq!(crc16_ccitt(data.as_ptr(), data.len() as u8), 0x05D7);
     }
 
     #[test]
     fn test_crc16_ccitt_all_zeros() {
         // Value from running Klipper's C code for {0x00, 0x00, 0x00, 0x00}
         let data = [0x00, 0x00, 0x00, 0x00];
-        assert_eq!(crc16_ccitt(data.as_ptr(), data.len()), 0x0321);
+        assert_eq!(crc16_ccitt(data.as_ptr(), data.len() as u8), 0x0321);
     }
+}
+
+/// Panic handler for #![no_std] environment
+#[cfg(not(test))] // Only compile for non-test builds (tests run with std)
+#[panic_handler]
+fn panic(_info: &PanicInfo) -> ! {
+    loop {}
 }

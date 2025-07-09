@@ -125,18 +125,19 @@ pub struct Stepper<STEP: GpioOut, DIR: GpioOut, T: Timer, SCHED: Scheduler> {
     // If multiple steppers share a scheduler, a reference is better.
     // scheduler: SCHED, // This might be better passed into methods needing it.
 
-_scheduler_phantom: PhantomData<SCHED>,
-
-// --- Public modules ---
-pub mod shaper;
-pub mod itersolve; // Assuming itersolve.rs will exist for StepperKinematics
-pub mod trapq;     // Assuming trapq.rs will exist for Move, Vec2D
-
+    _scheduler_phantom: PhantomData<SCHED>,
     // Placeholder for target-specific optimizations
     // HAVE_EDGE_OPTIMIZATION, HAVE_AVR_OPTIMIZATION will be handled by
     // different implementations or conditional compilation later.
-    _scheduler_phantom: PhantomData<SCHED>,
 }
+
+// --- Public modules ---
+// TODO: Create these module files (shaper.rs, itersolve.rs, trapq.rs) or remove these declarations
+// For now, commenting them out to allow src/lib.rs to compile for testing basic structure.
+// pub mod shaper;
+// pub mod itersolve; // Assuming itersolve.rs will exist for StepperKinematics
+// pub mod trapq;     // Assuming trapq.rs will exist for Move, Vec2D
+
 
 // --- Helper Functions (Conceptual for now) ---
 
