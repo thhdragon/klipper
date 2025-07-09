@@ -3,4 +3,10 @@ name = "klipper_host_rust"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["std"]
+std = []
+alloc = []
+
 [dependencies]
+float-cmp = "0.9"
