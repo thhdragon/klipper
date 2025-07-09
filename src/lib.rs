@@ -125,6 +125,13 @@ pub struct Stepper<STEP: GpioOut, DIR: GpioOut, T: Timer, SCHED: Scheduler> {
     // If multiple steppers share a scheduler, a reference is better.
     // scheduler: SCHED, // This might be better passed into methods needing it.
 
+_scheduler_phantom: PhantomData<SCHED>,
+
+// --- Public modules ---
+pub mod shaper;
+pub mod itersolve; // Assuming itersolve.rs will exist for StepperKinematics
+pub mod trapq;     // Assuming trapq.rs will exist for Move, Vec2D
+
     // Placeholder for target-specific optimizations
     // HAVE_EDGE_OPTIMIZATION, HAVE_AVR_OPTIMIZATION will be handled by
     // different implementations or conditional compilation later.
