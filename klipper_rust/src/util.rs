@@ -1,6 +1,5 @@
 use std::fs;
 use std::process::Command;
-// use std::path::Path; // Unused
 
 #[cfg(target_os = "linux")]
 pub fn get_cpu_info() -> String {

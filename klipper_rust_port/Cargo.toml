@@ -1,9 +1,0 @@
-[package]
-name = "klipper_rust_port"
-version = "0.1.0"
-edition = "2024"
-
-[lib]
-crate-type = ["rlib"] # For Rust tests/benchmarks and use by other Rust crates
-
-[dependencies]

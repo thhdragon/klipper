@@ -13,7 +13,6 @@ serde_json = "1.0"
 chrono = "0.4" # For formatting timestamps
 
 [dev-dependencies]
-tempfile = "3"
 
 [[bin]]
 name = "klipper_rust_bin"
