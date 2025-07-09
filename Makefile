@@ -29,7 +29,17 @@ dirs-y = src
 cc-option=$(shell if test -z "`$(1) $(2) -S -o /dev/null -xc /dev/null 2>&1`" \
     ; then echo "$(2)"; else echo "$(3)"; fi ;)
 
+# Klipper Rust Port Integration
+KLIPPER_RUST_PORT_DIR := $(CURDIR)/klipper_rust_port
+# TODO: Dynamically set RUST_TARGET_TRIPLE based on Klipper MCU config
+RUST_TARGET_TRIPLE ?= thumbv7m-none-eabi
+KLIPPER_RUST_LIB_PATH := $(KLIPPER_RUST_PORT_DIR)/target/$(RUST_TARGET_TRIPLE)/release
+KLIPPER_RUST_LIB_NAME := klipper_rust_port
+KLIPPER_RUST_STATIC_LIB := $(KLIPPER_RUST_LIB_PATH)/lib$(KLIPPER_RUST_LIB_NAME).a
+KLIPPER_RUST_HEADER_DIR := $(KLIPPER_RUST_PORT_DIR)
+
 CFLAGS := -iquote $(OUT) -iquote src -iquote $(OUT)board-generic/ \
+		-I$(KLIPPER_RUST_HEADER_DIR) \
 		-std=gnu11 -O2 -MD -Wall \
 		-Wold-style-definition $(call cc-option,$(CC),-Wtype-limits,) \
     -ffunction-sections -fdata-sections -fno-delete-null-pointer-checks
@@ -37,9 +47,10 @@ CFLAGS += -flto=auto -fwhole-program -fno-use-linker-plugin -ggdb3
 
 OBJS_klipper.elf = $(patsubst %.c, $(OUT)src/%.o,$(src-y))
 OBJS_klipper.elf += $(OUT)compile_time_request.o
-CFLAGS_klipper.elf = $(CFLAGS) -Wl,--gc-sections
+# Add Rust library linker flags
+CFLAGS_klipper.elf = $(CFLAGS) -Wl,--gc-sections -L$(KLIPPER_RUST_LIB_PATH) -l$(KLIPPER_RUST_LIB_NAME)
 
-CPPFLAGS = -I$(OUT) -P -MD -MT $@
+CPPFLAGS = -I$(OUT) -I$(KLIPPER_RUST_HEADER_DIR) -P -MD -MT $@
 
 # Default targets
 target-y := $(OUT)klipper.elf
@@ -66,9 +77,14 @@ $(OUT)%.o: %.c $(OUT)autoconf.h
 
 $(OUT)%.ld: %.lds.S $(OUT)autoconf.h
 	@echo "  Preprocessing $@"
-	$(Q)$(CPP) -I$(OUT) -P -MD -MT $@ $< -o $@
+	$(Q)$(CPP) -I$(OUT) -I$(KLIPPER_RUST_HEADER_DIR) -P -MD -MT $@ $< -o $@
 
-$(OUT)klipper.elf: $(OBJS_klipper.elf)
+# Rule to build the Rust static library
+$(KLIPPER_RUST_STATIC_LIB): $(KLIPPER_RUST_PORT_DIR)/src/lib.rs $(KLIPPER_RUST_PORT_DIR)/Cargo.toml $(KLIPPER_RUST_PORT_DIR)/build.rs
+	@echo "  Building Rust library $@"
+	+$(Q)cd $(KLIPPER_RUST_PORT_DIR) && PATH=$(HOME)/.cargo/bin:$(PATH) cargo build --target=$(RUST_TARGET_TRIPLE) --release
+
+$(OUT)klipper.elf: $(OBJS_klipper.elf) $(KLIPPER_RUST_STATIC_LIB)
 	@echo "  Linking $@"
 	$(Q)$(CC) $(OBJS_klipper.elf) $(CFLAGS_klipper.elf) -o $@
 	$(Q)scripts/check-gcc.sh $@ $(OUT)compile_time_request.o
