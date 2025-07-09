@@ -213,227 +213,14 @@ fn get_repo_info_internal(gitdir_str: &str) -> Result<(String, String, String), 
 }
 
 
-// Placeholder for other functions from util.py
-use signal_hook::consts::signal::SIGINT;
-use signal_hook::consts::SIG_DFL; // For the handler address
-use signal_hook::low_level::signal as low_level_signal; // Alias to avoid conflict if any
-use signal_hook::low_level::Handler as SigHandler; // Alias for clarity
-use std::os::unix::io::{AsRawFd, BorrowedFd, IntoRawFd, OwnedFd};
-
-
-// Return the SIGINT interrupt handler back to the OS default
-pub fn fix_sigint() {
-    unsafe {
-        // SIG_DFL is usize (actually sighandler_t from libc, which is usize on many platforms)
-        // signal_hook::low_level::Handler is also an alias for sighandler_t (extern "C" fn(c_int))
-        // So, a direct cast should work, or transmute if sizes/types are tricky.
-        // Given SIG_DFL is specifically for this, direct use or simple cast is intended.
-        if let Err(e) = low_level_signal(SIGINT, SIG_DFL as SigHandler) {
-            eprintln!("Failed to set SIGINT handler to default: {}", e);
-        }
-    }
-}
-
-use nix::fcntl::{fcntl, FcntlArg, OFlag};
-use nix::unistd::isatty;
-use std::os::unix::io::RawFd;
-
-// Set a file-descriptor as non-blocking
-pub fn set_nonblock(fd: RawFd) -> Result<(), nix::Error> {
-    let flags = fcntl(fd, FcntlArg::F_GETFL)?;
-    let mut nonblock_flags = OFlag::from_bits_truncate(flags);
-    nonblock_flags.insert(OFlag::O_NONBLOCK);
-    fcntl(fd, FcntlArg::F_SETFL(nonblock_flags))?;
-    Ok(())
-}
-
-use nix::sys::termios::{tcgetattr, tcsetattr, SetArg};
-// Removed LocalFlags direct import to use fully qualified path
-
-// Clear HUPCL flag
-pub fn clear_hupcl(fd: RawFd) -> Result<(), nix::Error> {
-    // isatty expects RawFd
-    if isatty(fd)? {
-        let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
-        let mut termios_attrs = tcgetattr(borrowed_fd)?;
-        termios_attrs.local_flags.remove(nix::sys::termios::LocalFlags::HUPCL);
-        tcsetattr(borrowed_fd, SetArg::TCSADRAIN, &termios_attrs)?;
-    }
-    Ok(())
-}
-
-use nix::pty::openpty;
-use std::fs as std_fs;
-use std::os::unix::fs::symlink;
-// No specific import for nix::sys::stat::chmod, will use fully qualified path
-use nix::unistd::ttyname;
-
-// Support for creating a pseudo-tty for emulating a serial port
-pub fn create_pty(ptyname: &str) -> Result<RawFd, String> {
-    let pty_results = openpty(None, None).map_err(|e| format!("Failed to open PTY: {}", e))?;
-    let master_owned_fd = pty_results.master;
-    let slave_owned_fd = pty_results.slave;
-
-    if let Err(e) = std_fs::remove_file(ptyname) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            return Err(format!("Failed to unlink old ptyname {}: {}", ptyname, e));
-        }
-    }
-
-    let slave_name_path = match ttyname(slave_owned_fd.as_raw_fd()) {
-        Ok(name_path) => name_path,
-        Err(e) => {
-            return Err(format!("Failed to get slave PTY name: {}", e));
-        }
-    };
-    let slave_name = slave_name_path.to_str().ok_or_else(|| {
-        format!("Slave PTY name is not valid UTF-8: {:?}", slave_name_path)
-    })?;
-
-    if let Err(e) = nix::sys::stat::chmod(slave_name, nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR | nix::sys::stat::Mode::S_IRGRP | nix::sys::stat::Mode::S_IWGRP) {
-        return Err(format!("Failed to chmod slave PTY {}: {}", slave_name, e));
-    }
-
-    if let Err(e) = symlink(slave_name, ptyname) {
-        return Err(format!("Failed to symlink {} to {}: {}", slave_name, ptyname, e));
-    }
-
-    let master_fd_raw = master_owned_fd.as_raw_fd();
-    if let Err(e) = set_nonblock(master_fd_raw) {
-        return Err(format!("Failed to set master PTY to non-blocking: {}", e));
-    }
-
-    // isatty expects RawFd
-    if isatty(master_fd_raw).unwrap_or(false) {
-        let borrowed_master_fd = unsafe { BorrowedFd::borrow_raw(master_fd_raw) };
-        match tcgetattr(borrowed_master_fd) {
-            Ok(mut termios_attrs) => {
-                termios_attrs.local_flags.remove(nix::sys::termios::LocalFlags::ECHO); // Fully qualify ECHO as well
-                if let Err(e) = tcsetattr(borrowed_master_fd, SetArg::TCSADRAIN, &termios_attrs) {
-                    eprintln!("Failed to tcsetattr on master PTY: {}", e);
-                }
-            }
-            Err(e) => {
-                eprintln!("Failed to tcgetattr on master PTY: {}", e);
-            }
-        }
-    }
-    Ok(master_owned_fd.into_raw_fd())
-}
-
-
-use std::path::PathBuf;
-use std::collections::HashMap;
-use serde::Deserialize;
-use chrono::{DateTime, Local, TimeZone};
-
-
-fn get_build_dir() -> PathBuf {
-    // Assuming klipper_rust is inside the main klipper directory structure
-    // and this util.rs is at klipper_rust/src/util.rs
-    // We want to get to the klipper root directory.
-    let current_exe = std::env::current_exe().unwrap_or_default();
-    // Try to find klipper root by going up from current_exe
-    // This is a bit fragile, might need a more robust way if deployed differently
-    let mut path = current_exe.parent().unwrap_or(&PathBuf::from(".")).to_path_buf(); // klipper_rust/target/debug or release
-    if path.ends_with("debug") || path.ends_with("release") {
-        path.pop(); // klipper_rust/target
-    }
-    if path.ends_with("target"){
-        path.pop(); // klipper_rust
-    }
-    path.pop(); // klipper (root)
-    if !path.join(".config").exists() && !path.join("out/klipper.dict").exists() {
-        // Fallback for when running tests (current_dir is klipper_rust)
-        let mut test_path = std::env::current_dir().unwrap_or_default(); // klipper_rust
-        test_path.pop(); // klipper (root)
-        if test_path.join(".config").exists() || test_path.join("out/klipper.dict").exists() {
-            return test_path;
-        }
-        // If still not found, try relative to where util.py was
-         let mut py_path = PathBuf::from(file!()); // klipper_rust/src/util.rs
-         py_path.pop(); // klipper_rust/src
-         py_path.pop(); // klipper_rust
-         py_path.pop(); // klipper (root)
-         return py_path;
-    }
-    path
-}
-
-fn dump_file_stats(build_dir: &PathBuf, filename: &str) {
-    let fpath = build_dir.join(filename);
-    match std_fs::metadata(&fpath) {
-        Ok(metadata) => {
-            let mtime = metadata.modified().ok().map(|st| {
-                let dt: DateTime<Local> = st.into();
-                dt.format("%a %b %d %H:%M:%S %Y").to_string()
-            }).unwrap_or_else(|| "N/A".to_string());
-            let fsize = metadata.len();
-            println!("INFO: Build file {}({}): {}", fpath.display(), fsize, mtime);
-        }
-        Err(_) => {
-            println!("INFO: No build file {}", fpath.display());
-        }
-    }
-}
-
-#[derive(Deserialize, Debug)]
-struct KlipperDict {
-    version: Option<String>,
-    build_versions: Option<String>,
-    config: Option<HashMap<String, serde_json::Value>>,
-}
-
-// Try to log information on the last mcu build
-pub fn dump_mcu_build() {
-    let build_dir = get_build_dir();
-    println!("INFO: Using build directory: {}", build_dir.display());
-
-    // Try to log last mcu config
-    dump_file_stats(&build_dir, ".config");
-    match std_fs::read_to_string(build_dir.join(".config")) {
-        Ok(data) => {
-            println!("INFO: ========= Last MCU build config =========\n{}\n=======================", data.chars().take(32 * 1024).collect::<String>());
-        }
-        Err(_) => {
-            // Python version just continues, so we do too.
-        }
-    }
-
-    // Try to log last mcu build version
-    dump_file_stats(&build_dir, "out/klipper.dict");
-    match std_fs::read_to_string(build_dir.join("out/klipper.dict")) {
-        Ok(data) => {
-            match serde_json::from_str::<KlipperDict>(&data) {
-                Ok(parsed_data) => {
-                    println!("INFO: Last MCU build version: {}", parsed_data.version.unwrap_or_default());
-                    println!("INFO: Last MCU build tools: {}", parsed_data.build_versions.unwrap_or_default());
-                    if let Some(config) = parsed_data.config {
-                        let cparts: Vec<String> = config.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
-                        println!("INFO: Last MCU build config: {}", cparts.join(" "));
-                    } else {
-                        println!("INFO: Last MCU build config: (empty)");
-                    }
-                }
-                Err(e) => {
-                    eprintln!("ERROR: Failed to parse klipper.dict: {}", e);
-                }
-            }
-        }
-        Err(_) => {
-            // Python version just continues.
-        }
-    }
-    dump_file_stats(&build_dir, "out/klipper.elf");
-}
-
 // Python2 wrappers are not needed in Rust.
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path; // Ensure Path is imported for tests
-    use tempfile; // For creating temporary files/dirs if needed for specific tests
+    // use std::path::Path; // No longer needed after removing PTY tests
+    // tempfile might not be needed if fd_operations_smoke is removed or simplified further
+    // use tempfile;
 
     #[test]
     fn test_get_cpu_info() {
@@ -468,9 +255,9 @@ mod tests {
             // Create a dummy .version file to test the fallback.
             let klippy_dir = project_root.join("klippy");
             let dummy_version_path = klippy_dir.join(".version");
-            let _ = std_fs::create_dir_all(&klippy_dir); // Ensure klippy directory exists
-            let pre_existing_version = std_fs::read_to_string(&dummy_version_path).ok();
-            let _ = std_fs::write(&dummy_version_path, "test-version-from-file");
+            let _ = fs::create_dir_all(&klippy_dir); // Ensure klippy directory exists
+            let pre_existing_version = fs::read_to_string(&dummy_version_path).ok();
+            let _ = fs::write(&dummy_version_path, "test-version-from-file");
 
             let result_fallback = get_git_version(true);
             assert!(result_fallback.is_ok(), "Expected Ok from get_git_version(true) with fallback, got Err: {:?}", result_fallback.err());
@@ -478,13 +265,13 @@ mod tests {
 
             // Clean up: remove dummy .version or restore original
             if let Some(original_content) = pre_existing_version {
-                let _ = std_fs::write(&dummy_version_path, original_content);
+                let _ = fs::write(&dummy_version_path, original_content);
             } else {
-                let _ = std_fs::remove_file(&dummy_version_path);
+                let _ = fs::remove_file(&dummy_version_path);
             }
             // Attempt to remove klippy dir only if it was created by this test and is empty
-            if std_fs::read_dir(&klippy_dir).map_or(false, |mut d| d.next().is_none()) {
-                 let _ = std_fs::remove_dir(&klippy_dir);
+            if fs::read_dir(&klippy_dir).map_or(false, |mut d| d.next().is_none()) {
+                 let _ = fs::remove_dir(&klippy_dir);
             }
              println!("Git version (from_file=true, no repo/git): {:?}", result_fallback.as_ref().unwrap());
         }
@@ -502,97 +289,83 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_fix_sigint_smoke() {
-        fix_sigint(); // Just ensure it runs without panic
-    }
+    // The following smoke tests are removed as the functions themselves are removed.
+    // #[test]
+    // fn test_fix_sigint_smoke() {
+    //     fix_sigint(); // Just ensure it runs without panic
+    // }
 
-    #[test]
-    #[cfg(unix)] // These tests are Unix-specific
-    fn test_fd_operations_smoke() {
-        use std::os::unix::io::AsRawFd;
+    // #[test]
+    // #[cfg(unix)] // These tests are Unix-specific
+    // fn test_fd_operations_smoke() {
+    //     use std::os::unix::io::AsRawFd;
 
-        // Test set_nonblock
-        let file_for_nonblock = tempfile::tempfile().expect("Failed to create tempfile for set_nonblock test");
-        let fd_nonblock = file_for_nonblock.as_raw_fd();
-        assert!(set_nonblock(fd_nonblock).is_ok(), "set_nonblock failed");
+    //     // Test set_nonblock
+    //     let file_for_nonblock = tempfile::tempfile().expect("Failed to create tempfile for set_nonblock test");
+    //     let fd_nonblock = file_for_nonblock.as_raw_fd();
+    //     assert!(set_nonblock(fd_nonblock).is_ok(), "set_nonblock failed");
 
-        // Test clear_hupcl
-        // This is hard to test reliably for its actual effect without a real PTY setup.
-        // We'll test with a non-TTY fd (should do nothing and return Ok)
-        // and with stdin if it's a TTY (more of a smoke test).
-        let file_for_hupcl = tempfile::tempfile().expect("Failed to create tempfile for clear_hupcl non-TTY test");
-        let fd_hupcl_nontty = file_for_hupcl.as_raw_fd();
-        assert!(clear_hupcl(fd_hupcl_nontty).is_ok(), "clear_hupcl on non-TTY fd failed");
+    //     // Test clear_hupcl
+    //     let file_for_hupcl = tempfile::tempfile().expect("Failed to create tempfile for clear_hupcl non-TTY test");
+    //     let fd_hupcl_nontty = file_for_hupcl.as_raw_fd();
+    //     assert!(clear_hupcl(fd_hupcl_nontty).is_ok(), "clear_hupcl on non-TTY fd failed");
 
-        let stdin_fd = std::io::stdin().as_raw_fd();
-        if nix::unistd::isatty(stdin_fd).unwrap_or(false) { // isatty takes RawFd
-            println!("Attempting clear_hupcl on stdin (TTY)");
-            let borrowed_stdin = unsafe { BorrowedFd::borrow_raw(stdin_fd) };
-            let original_termios = nix::sys::termios::tcgetattr(borrowed_stdin).ok();
-            // This might fail if stdin is not a controlling TTY or due to permissions.
-            // We are primarily testing that the function call itself doesn't panic.
-            let _ = clear_hupcl(stdin_fd); // clear_hupcl takes RawFd
-            if let Some(orig) = original_termios {
-                let _ = nix::sys::termios::tcsetattr(borrowed_stdin, nix::sys::termios::SetArg::TCSADRAIN, &orig);
-            }
-        } else {
-            println!("Skipping clear_hupcl TTY-specific part as stdin is not a TTY");
-        }
+    //     let stdin_fd = std::io::stdin().as_raw_fd();
+    //     if nix::unistd::isatty(stdin_fd).unwrap_or(false) {
+    //         println!("Attempting clear_hupcl on stdin (TTY)");
+    //         let borrowed_stdin = unsafe { BorrowedFd::borrow_raw(stdin_fd) };
+    //         let original_termios = nix::sys::termios::tcgetattr(borrowed_stdin).ok();
+    //         let _ = clear_hupcl(stdin_fd);
+    //         if let Some(orig) = original_termios {
+    //             let _ = nix::sys::termios::tcsetattr(borrowed_stdin, nix::sys::termios::SetArg::TCSADRAIN, &orig);
+    //         }
+    //     } else {
+    //         println!("Skipping clear_hupcl TTY-specific part as stdin is not a TTY");
+    //     }
 
-        // Test create_pty
-        let pty_symlink_name = format!("test_pty_symlink_{}", std::process::id());
-        let pty_path = std::env::temp_dir().join(&pty_symlink_name);
-        let ptyname_str = pty_path.to_str().expect("Failed to create temp pty name");
+    //     // Test create_pty
+    //     let pty_symlink_name = format!("test_pty_symlink_{}", std::process::id());
+    //     let pty_path = std::env::temp_dir().join(&pty_symlink_name);
+    //     let ptyname_str = pty_path.to_str().expect("Failed to create temp pty name");
 
-        match create_pty(ptyname_str) {
-            Ok(master_fd) => {
-                assert!(master_fd > 0, "Master FD from create_pty should be positive");
-                assert!(Path::new(ptyname_str).exists(), "PTY symlink not created at {}", ptyname_str);
-                assert!(Path::new(ptyname_str).is_symlink(), "PTY path {} is not a symlink", ptyname_str);
-                let _ = nix::unistd::close(master_fd);
-                let _ = std_fs::remove_file(ptyname_str);
-            }
-            Err(e) => {
-                // In some CI environments (like GitHub Actions), creating PTYs might be restricted.
-                // Log the error but don't fail the test outright if it seems like a known CI issue.
-                if e.contains("Operation not permitted") || e.contains("such file or directory") || e.contains("function not implemented") {
-                    println!("Skipping PTY creation test due to environment restrictions: {}", e);
-                } else {
-                    panic!("create_pty failed: {}", e);
-                }
-            }
-        }
-    }
+    //     match create_pty(ptyname_str) {
+    //         Ok(master_fd) => {
+    //             assert!(master_fd > 0, "Master FD from create_pty should be positive");
+    //             assert!(Path::new(ptyname_str).exists(), "PTY symlink not created at {}", ptyname_str);
+    //             assert!(Path::new(ptyname_str).is_symlink(), "PTY path {} is not a symlink", ptyname_str);
+    //             let _ = nix::unistd::close(master_fd);
+    //             let _ = std_fs::remove_file(ptyname_str);
+    //         }
+    //         Err(e) => {
+    //             if e.contains("Operation not permitted") || e.contains("such file or directory") || e.contains("function not implemented") {
+    //                 println!("Skipping PTY creation test due to environment restrictions: {}", e);
+    //             } else {
+    //                 panic!("create_pty failed: {}", e);
+    //             }
+    //         }
+    //     }
+    // }
 
-    #[test]
-    fn test_dump_mcu_build_smoke() {
-        // Create dummy files to allow the function to run.
-        // get_build_dir() navigates from executable path or current_dir.
-        // In tests, current_dir is usually klipper_rust. So build_dir will be 'klipper'.
-        let mut build_dir_path = std::env::current_dir().unwrap_or_default(); // klipper_rust
-        build_dir_path.pop(); // klipper
+    // #[test]
+    // fn test_dump_mcu_build_smoke() {
+    //     let mut build_dir_path = std::env::current_dir().unwrap_or_default();
+    //     build_dir_path.pop();
 
-        let _ = std_fs::create_dir_all(build_dir_path.join("out"));
-        let config_path = build_dir_path.join(".config");
-        let dict_path = build_dir_path.join("out/klipper.dict");
-        let elf_path = build_dir_path.join("out/klipper.elf");
+    //     let _ = std_fs::create_dir_all(build_dir_path.join("out"));
+    //     let config_path = build_dir_path.join(".config");
+    //     let dict_path = build_dir_path.join("out/klipper.dict");
+    //     let elf_path = build_dir_path.join("out/klipper.elf");
 
-        let _ = std_fs::write(&config_path, "CONFIG_TEST=y\n");
-        let _ = std_fs::write(&dict_path, r#"{"version": "test-123-smoke", "build_versions": "tools-v1-smoke", "config": {"CONFIG_SMOKE":"1"}}"#);
-        let _ = std_fs::write(&elf_path, "dummy elf data for smoke test");
+    //     let _ = std_fs::write(&config_path, "CONFIG_TEST=y\n");
+    //     let _ = std_fs::write(&dict_path, r#"{"version": "test-123-smoke", "build_versions": "tools-v1-smoke", "config": {"CONFIG_SMOKE":"1"}}"#);
+    //     let _ = std_fs::write(&elf_path, "dummy elf data for smoke test");
+    //     dump_mcu_build();
 
-        // Capture stdout to check if it prints something (optional, simple smoke test just runs)
-        // This is more involved, so for now, just ensure it runs without panic.
-        dump_mcu_build();
-
-        // Clean up dummy files
-        let _ = std_fs::remove_file(&config_path);
-        let _ = std_fs::remove_file(&dict_path);
-        let _ = std_fs::remove_file(&elf_path);
-        // Remove 'out' dir only if it's empty and was likely created by this test
-        if std_fs::read_dir(build_dir_path.join("out")).map_or(false, |mut d| d.next().is_none()) {
-            let _ = std_fs::remove_dir(build_dir_path.join("out"));
-        }
-    }
+    //     let _ = std_fs::remove_file(&config_path);
+    //     let _ = std_fs::remove_file(&dict_path);
+    //     let _ = std_fs::remove_file(&elf_path);
+    //     if std_fs::read_dir(build_dir_path.join("out")).map_or(false, |mut d| d.next().is_none()) {
+    //         let _ = std_fs::remove_dir(build_dir_path.join("out"));
+    //     }
+    // }
 }

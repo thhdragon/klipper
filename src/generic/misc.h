@@ -16,7 +16,7 @@ void timer_kick(void);
 void *dynmem_start(void);
 void *dynmem_end(void);
 
-uint16_t crc16_ccitt(uint8_t *buf, uint_fast8_t len);
+// uint16_t crc16_ccitt(uint8_t *buf, uint_fast8_t len); // Now provided by Rust via klipper_rust_port.h
 
 void bootloader_request(void);
 

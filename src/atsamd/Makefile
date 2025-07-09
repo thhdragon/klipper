@@ -20,7 +20,7 @@ CFLAGS_klipper.elf += -T $(OUT)src/generic/armcm_link.ld
 $(OUT)klipper.elf: $(OUT)src/generic/armcm_link.ld
 
 # Add source files
-src-y += atsamd/main.c atsamd/gpio.c generic/crc16_ccitt.c
+src-y += atsamd/main.c atsamd/gpio.c
 src-y += generic/armcm_boot.c generic/armcm_irq.c generic/armcm_reset.c
 src-$(CONFIG_USBSERIAL) += atsamd/usbserial.c atsamd/chipid.c generic/usb_cdc.c
 src-$(CONFIG_SERIAL) += atsamd/serial.c generic/serial_irq.c

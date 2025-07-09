@@ -28,7 +28,6 @@ $(OUT)klipper.elf: $(samlink-y)
 # Add source files
 src-y += atsam/main.c atsam/gpio.c atsam/i2c.c atsam/spi.c
 src-y += generic/armcm_boot.c generic/armcm_irq.c generic/armcm_timer.c
-src-y += generic/crc16_ccitt.c
 usb-src-$(CONFIG_MACH_SAM3X) := atsam/sam3_usb.c
 usb-src-$(CONFIG_MACH_SAM4) := atsam/sam4_usb.c
 usb-src-$(CONFIG_MACH_SAME70) := atsam/sam3_usb.c
