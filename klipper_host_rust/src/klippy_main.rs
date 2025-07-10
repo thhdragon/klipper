@@ -69,6 +69,7 @@ pub fn klippy_main() {
 
     // 5. Simulate processing some G-code lines
     let gcode_lines = vec![
+        "G28",                      // Home all axes
         "G90",                      // Absolute positioning
         "G1 X10 Y20 Z5 F3000",      // Move to X10 Y20 Z5
         "G1 E10",                   // Extrude 10mm
@@ -77,6 +78,8 @@ pub fn klippy_main() {
         "G92 X0 Y0",                // Set current X and Y to 0 (creates an offset)
         "G90",                      // Absolute positioning
         "G1 X1 Z1",                 // Move to G-code X1 Z1 (actual machine pos will be different due to G92)
+        "G28 Y",                    // Re-home Y
+        "G1 Y15",                   // Move Y to 15 (should be machine 15, gcode 15)
         "INVALID GCODE",            // Test error handling
         "G1 X10000",                // Test potential toolhead error (if limits were enforced)
     ];

@@ -173,6 +173,7 @@ impl<'a> GCode<'a> {
         match cmd.command_letter {
             'G' => match cmd.command_number as i32 {
                 0 | 1 => self.cmd_g0_g1(cmd, toolhead),
+                28 => self.cmd_g28(cmd, toolhead),
                 90 => self.cmd_g90(cmd),
                 91 => self.cmd_g91(cmd),
                 92 => self.cmd_g92(cmd),
@@ -302,6 +303,83 @@ impl<'a> GCode<'a> {
         // This might be needed here if G92 is to affect ToolHead's internal view of commanded_pos directly.
         // For now, we only update GCode state. ToolHead's commanded_pos is updated by move_to.
         // toolhead.set_position([new_base_pos.x.unwrap_or(0.0) - new_offsets.x.unwrap_or(0.0), ...])
+        Ok(())
+    }
+
+    // G28: Home Axes
+    fn cmd_g28(&mut self, cmd: &GCodeCommand, toolhead: &mut ToolHead<'a>) -> Result<(), CommandError> {
+        // In Klipper, G28 without params homes X, then Y, then Z by default,
+        // or specific axes if provided (G28 X Z).
+        // We'll use the constants defined in ToolHead for G-code positions after homing for now.
+        // These would typically come from printer config ([stepper_x] position_endstop etc.)
+
+        let home_x = self.get_flag_param(&cmd.params, 'X');
+        let home_y = self.get_flag_param(&cmd.params, 'Y');
+        let home_z = self.get_flag_param(&cmd.params, 'Z');
+
+        let home_all = !home_x && !home_y && !home_z;
+
+        let axes_to_home: Vec<(usize, f64)> = if home_all {
+            vec![
+                (0, toolhead::X_GCODE_POSITION_AFTER_HOMING), // Axis index, G-code position to set
+                (1, toolhead::Y_GCODE_POSITION_AFTER_HOMING),
+                (2, toolhead::Z_GCODE_POSITION_AFTER_HOMING),
+            ]
+        } else {
+            let mut axes = Vec::new();
+            if home_x { axes.push((0, toolhead::X_GCODE_POSITION_AFTER_HOMING)); }
+            if home_y { axes.push((1, toolhead::Y_GCODE_POSITION_AFTER_HOMING)); }
+            if home_z { axes.push((2, toolhead::Z_GCODE_POSITION_AFTER_HOMING)); }
+            axes
+        };
+
+        if axes_to_home.is_empty() && !home_all {
+            // G28 with parameters, but none are X, Y, or Z (e.g., G28 F100 - invalid by most standards)
+            // Klipper's G28 with no X/Y/Z params means home all configured default axes.
+            // If specific non-X/Y/Z params are given, it's usually an error or ignored for homing.
+            // For simplicity, if specific axes are requested but none are X,Y,Z, we do nothing or error.
+            // Let's do nothing for now, as Klipper might just ignore unknown flags for G28.
+            return Ok(());
+        }
+
+        // Ensure moves are flushed before homing
+        // toolhead.flush_moves(); // In Klipper, this is more complex. wait_moves() in perform_homing_move is enough for mock.
+
+        for (axis_index, gcode_pos_to_set) in axes_to_home {
+            let machine_pos_at_trigger = toolhead.perform_homing_move(axis_index)?;
+
+            // Update GCodeState based on homing result (similar to G92)
+            match axis_index {
+                0 => {
+                    self.state.gcode_offset.x = Some(machine_pos_at_trigger - gcode_pos_to_set);
+                    self.state.base_position.x = Some(gcode_pos_to_set);
+                    self.state.last_position.x = Some(machine_pos_at_trigger);
+                }
+                1 => {
+                    self.state.gcode_offset.y = Some(machine_pos_at_trigger - gcode_pos_to_set);
+                    self.state.base_position.y = Some(gcode_pos_to_set);
+                    self.state.last_position.y = Some(machine_pos_at_trigger);
+                }
+                2 => {
+                    self.state.gcode_offset.z = Some(machine_pos_at_trigger - gcode_pos_to_set);
+                    self.state.base_position.z = Some(gcode_pos_to_set);
+                    self.state.last_position.z = Some(machine_pos_at_trigger);
+                }
+                _ => unreachable!(),
+            }
+
+            // Update toolhead's internal commanded_pos to the new G-CODE coordinate
+            let mut new_th_pos = toolhead.get_position();
+            new_th_pos[axis_index] = gcode_pos_to_set;
+
+            let mut homing_axes_flags = [false; 3];
+            homing_axes_flags[axis_index] = true;
+            toolhead.set_position(new_th_pos, Some(homing_axes_flags));
+        }
+
+        // Ensure moves are flushed after homing
+        // toolhead.flush_moves();
+
         Ok(())
     }
 }
@@ -687,4 +765,97 @@ mod tests {
         assert_eq!(gcode.state.gcode_offset, Coord::new(Some(0.0), Some(0.0), Some(0.0), Some(200.0)));
         assert_eq!(gcode.state.base_position, Coord::new(Some(10.0), Some(20.0), Some(5.0), Some(0.0)));
     }
+
+    // Tests for G28
+    #[test]
+    fn test_cmd_g28_home_all() {
+        let mut gcode = create_test_gcode();
+        let mut toolhead = create_test_toolhead();
+        // Prime toolhead with a known G-code position that is NOT 0,0,0 to see G92 effects
+        toolhead.set_position([10.0, 10.0, 10.0, 0.0], None);
+        gcode.state.last_position = Coord::new(Some(10.0), Some(10.0), Some(10.0), Some(0.0)); // Machine pos
+        gcode.state.base_position = Coord::new(Some(10.0), Some(10.0), Some(10.0), Some(0.0)); // GCode pos
+        gcode.state.gcode_offset = Coord::new(Some(0.0), Some(0.0), Some(0.0), Some(0.0));   // No initial offset
+
+
+        let cmd = gcode.parse_line("G28").unwrap();
+        gcode.process_command(&cmd, &mut toolhead).unwrap();
+
+        // Assuming *_MACHINE_POSITION_AT_ENDSTOP are all 0.0
+        // And *_GCODE_POSITION_AFTER_HOMING are all 0.0
+        // Offset = machine_triggered_pos (0.0) - gcode_to_set (0.0) = 0.0
+        // Base position (gcode) becomes 0.0
+        // Last position (machine) becomes 0.0 (where it triggered)
+        assert_eq!(gcode.state.gcode_offset, Coord::new(Some(0.0), Some(0.0), Some(0.0), Some(0.0)));
+        assert_eq!(gcode.state.base_position, Coord::new(Some(0.0), Some(0.0), Some(0.0), Some(0.0)));
+        assert_eq!(gcode.state.last_position, Coord::new(Some(0.0), Some(0.0), Some(0.0), Some(0.0)));
+
+        // Check toolhead's commanded position reflects the new G-code coordinates
+        let th_pos = toolhead.get_position();
+        assert_eq!(th_pos[0], toolhead::X_GCODE_POSITION_AFTER_HOMING);
+        assert_eq!(th_pos[1], toolhead::Y_GCODE_POSITION_AFTER_HOMING);
+        assert_eq!(th_pos[2], toolhead::Z_GCODE_POSITION_AFTER_HOMING);
+    }
+
+    #[test]
+    fn test_cmd_g28_home_x_z() {
+        let mut gcode = create_test_gcode();
+        let mut toolhead = create_test_toolhead();
+        toolhead.set_position([10.0, 20.0, 30.0, 0.0], None);
+        gcode.state.last_position = Coord::new(Some(10.0), Some(20.0), Some(30.0), Some(0.0));
+        gcode.state.base_position = Coord::new(Some(10.0), Some(20.0), Some(30.0), Some(0.0));
+        gcode.state.gcode_offset = Coord::new(Some(0.0), Some(0.0), Some(0.0), Some(0.0));
+
+        let cmd = gcode.parse_line("G28 X Z").unwrap();
+        gcode.process_command(&cmd, &mut toolhead).unwrap();
+
+        // X and Z should be homed (machine pos 0, gcode pos 0, offset 0)
+        // Y should be untouched
+        assert_eq!(gcode.state.gcode_offset, Coord::new(Some(0.0), Some(0.0), Some(0.0), Some(0.0)));
+        assert_eq!(gcode.state.base_position, Coord::new(Some(0.0), Some(20.0), Some(0.0), Some(0.0))); // Y base is original
+        assert_eq!(gcode.state.last_position, Coord::new(Some(0.0), Some(20.0), Some(0.0), Some(0.0))); // Y last_pos is original
+
+        let th_pos = toolhead.get_position();
+        assert_eq!(th_pos[0], toolhead::X_GCODE_POSITION_AFTER_HOMING);
+        assert_eq!(th_pos[1], 20.0); // Y unchanged
+        assert_eq!(th_pos[2], toolhead::Z_GCODE_POSITION_AFTER_HOMING);
+    }
+
+    #[test]
+    fn test_cmd_g28_home_y_with_initial_offset() {
+        let mut gcode = create_test_gcode();
+        let mut toolhead = create_test_toolhead();
+        // Machine Y is at 100. G92 Y50 was issued.
+        // So, gcode Y is 50, machine Y is 100. Offset Y = 100 - 50 = 50.
+        gcode.state.last_position = Coord::new(Some(10.0), Some(100.0), Some(5.0), Some(0.0)); // Machine pos
+        gcode.state.base_position = Coord::new(Some(10.0), Some(50.0), Some(5.0), Some(0.0));  // GCode pos
+        gcode.state.gcode_offset  = Coord::new(Some(0.0), Some(50.0), Some(0.0), Some(0.0));    // Offset for Y
+
+        toolhead.set_position(gcode.state.base_position.x.unwrap_or_default(), /* ... */); // Ensure toolhead starts at GCODE 50 for Y
+         let mut initial_th_pos = [0.0;4];
+        initial_th_pos[0] = gcode.state.base_position.x.unwrap_or_default();
+        initial_th_pos[1] = gcode.state.base_position.y.unwrap_or_default();
+        initial_th_pos[2] = gcode.state.base_position.z.unwrap_or_default();
+        initial_th_pos[3] = gcode.state.base_position.e.unwrap_or_default();
+        toolhead.set_position(initial_th_pos, None);
+
+
+        let cmd = gcode.parse_line("G28 Y").unwrap();
+        gcode.process_command(&cmd, &mut toolhead).unwrap();
+
+        // Y is homed. Assume Y_MACHINE_POSITION_AT_ENDSTOP = 0 and Y_GCODE_POSITION_AFTER_HOMING = 0.
+        // New Y offset = machine_triggered_pos (0.0) - gcode_to_set (0.0) = 0.0.
+        // New Y base_position (gcode) = 0.0.
+        // New Y last_position (machine) = 0.0.
+        // X, Z, E offsets and positions should be unchanged.
+        assert_eq!(gcode.state.gcode_offset, Coord::new(Some(0.0), Some(0.0), Some(0.0), Some(0.0)));
+        assert_eq!(gcode.state.base_position, Coord::new(Some(10.0), Some(0.0), Some(5.0), Some(0.0)));
+        assert_eq!(gcode.state.last_position, Coord::new(Some(10.0), Some(0.0), Some(5.0), Some(0.0)));
+
+        let th_pos = toolhead.get_position();
+        assert_eq!(th_pos[0], 10.0); // X unchanged
+        assert_eq!(th_pos[1], toolhead::Y_GCODE_POSITION_AFTER_HOMING);
+        assert_eq!(th_pos[2], 5.0);  // Z unchanged
+    }
+
 }

@@ -622,8 +622,128 @@ impl<'a> ToolHead<'a> {
         self.commanded_pos
     }
 
+    pub fn set_position(&mut self, new_pos: [f64; 4], homing_axes: Option<[bool;3]>) {
+        // This method in Klipper also calls self.kin.set_position()
+        // and trapq_set_position. For now, just update commanded_pos.
+        // It's used by G92 and after homing.
+        // The actual machine position doesn't change here, rather the G-code interpretation of it.
+        // However, ToolHead's commanded_pos should reflect the G-code coordinate space after G92 or homing.
+
+        // If specific axes are being homed/set, only update those.
+        // G92 without params doesn't mean "set all to current commanded_pos",
+        // it means "reset offsets so current machine pos becomes current gcode pos".
+        // G92 X10 means "current machine X is now to be known as G-code X10".
+
+        // For now, G92 in gcode.rs directly updates gcode.state.
+        // Toolhead's commanded_pos is updated via move_to.
+        // A direct set_position on toolhead should reflect the *new G-code coordinates*.
+
+        if let Some(axes) = homing_axes { // Typically used after homing an axis
+            if axes[0] { self.commanded_pos[0] = new_pos[0]; }
+            if axes[1] { self.commanded_pos[1] = new_pos[1]; }
+            if axes[2] { self.commanded_pos[2] = new_pos[2]; }
+            // Extruder 'E' is usually handled by G92 E0, not directly by homing_axes flags.
+            if new_pos.len() > 3 { // If E is provided in new_pos (e.g. G92 E0)
+                 if self.commanded_pos.len() > 3 { // Ensure commanded_pos has an E axis
+                    // This part is a bit tricky. G92 E0 means set E to 0.
+                    // If G92 X10 Y10 is called, E should remain unchanged unless E is also specified.
+                    // The new_pos here should ideally come from gcode.rs which knows which params were in G92.
+                    // For now, let's assume if new_pos has E, it's meant to be set.
+                    // A better G92 would pass Option<f64> for each axis.
+                 }
+            }
+        } else { // General G92 or full set_position
+            self.commanded_pos = new_pos;
+        }
+        // TODO: self.trapq.set_position(...)
+        // TODO: self.kin.set_position(...)
+        self.printer.send_event("toolhead:set_position"); // Assuming printer object and event system
+    }
+
+
+    // Performs a homing move for a single axis.
+    // axis_index: 0 for X, 1 for Y, 2 for Z.
+    // For now, this is a simplified, mocked version.
+    // It will "move" to a conceptual endstop and return its configured machine position at trigger.
+    pub fn perform_homing_move(
+        &mut self,
+        axis_index: usize,
+        // config_homing_speed: f64, // TODO: Would come from config
+        // config_position_endstop: f64, // TODO: Would come from config (this is the GCODE value to set)
+        // config_homing_dir_is_positive: bool // TODO: Whether homing towards positive or negative
+    ) -> Result<f64, String> {
+        if axis_index > 2 {
+            return Err("Invalid axis_index for homing".to_string());
+        }
+
+        // Mocked parameters (would normally come from config per axis)
+        // These constants are defined at the top of the ToolHead struct for now
+        let homing_speed = DEFAULT_HOMING_SPEED; // mm/s
+        // This is the MACHINE coordinate where the endstop is physically located.
+        // After homing, G28 will typically issue a G92 to make this machine coordinate
+        // correspond to a specific G-CODE coordinate (often 0, or bed_size).
+        let machine_pos_at_endstop_trigger = match axis_index {
+            0 => X_MACHINE_POSITION_AT_ENDSTOP, // e.g., 0.0 if min endstop at 0
+            1 => Y_MACHINE_POSITION_AT_ENDSTOP, // e.g., 0.0
+            2 => Z_MACHINE_POSITION_AT_ENDSTOP, // e.g., 0.0
+            _ => unreachable!(),
+        };
+
+        // Simulate flushing moves before homing that axis
+        self.wait_moves(); // Existing method to flush lookahead and wait
+
+        let axis_char = ['X', 'Y', 'Z'][axis_index];
+        println!(
+            "ToolHead: Mock homing for axis {}. Moving at speed {} mm/s. Expecting endstop trigger at machine pos: {:.3}",
+            axis_char, homing_speed, machine_pos_at_endstop_trigger
+        );
+
+        // In a real implementation:
+        // 1. Get current G-CODE position: self.commanded_pos[axis_index]
+        // 2. Get current G92 offset for the axis from gcode_state (passed in or accessed).
+        // 3. Calculate current MACHINE position = GCODE_pos - G92_offset.
+        // 4. Determine homing direction (e.g., towards negative for X min).
+        // 5. Command a move to a point far beyond the expected endstop trigger point in that direction.
+        //    This move would be executed via drip_move, monitoring the endstop.
+        // 6. drip_move would return the MACHINE position where the endstop triggered.
+
+        // For this mock:
+        // We directly "know" the machine_pos_at_endstop_trigger.
+        // We need to update self.commanded_pos to reflect the G-CODE coordinate that G28 will set.
+        // G28 will call G92 logic: G92 NewGcodePos.
+        // The NewGcodePos is often 0 (e.g. X_POSITION_ENDSTOP_GCODE_VALUE).
+        // The G92 logic calculates: offset = machine_pos_at_endstop_trigger - NewGcodePos.
+        // Then G28 calls toolhead.set_position(NewGcodePos for this axis).
+        // So, after this homing move, toolhead's commanded_pos for this axis should become NewGcodePos.
+
+        let gcode_pos_after_homing_g92 = match axis_index {
+             0 => X_GCODE_POSITION_AFTER_HOMING,
+             1 => Y_GCODE_POSITION_AFTER_HOMING,
+             2 => Z_GCODE_POSITION_AFTER_HOMING,
+            _ => unreachable!(),
+        };
+        self.commanded_pos[axis_index] = gcode_pos_after_homing_g92;
+
+        // Simulate that the toolhead is now physically at machine_pos_at_endstop_trigger,
+        // and its G-code coordinate for this axis is gcode_pos_after_homing_g92.
+        // The actual update to GCodeState's last_position (machine) and base_position (gcode)
+        // will be handled by the G28 command in gcode.rs using the returned machine_pos_at_endstop_trigger.
+
+        println!(
+            "ToolHead: Axis {} mock homing complete. Endstop 'triggered' at machine position {:.3f}. Toolhead G-code pos for axis set to {:.3f}.",
+            axis_char, machine_pos_at_endstop_trigger, gcode_pos_after_homing_g92
+        );
+
+        Ok(machine_pos_at_endstop_trigger)
+    }
+
     // newpos is [f64;4]
     pub fn move_to(&mut self, newpos: [f64; 4], speed: f64) -> Result<(), String> {
+        // Before executing the move, ensure lookahead queue is processed to reflect latest position
+        // self._process_lookahead(false); // Process entire queue if any doubt about current state.
+                                        // This might be too aggressive here.
+                                        // commanded_pos should be the authoritative source from GCode's perspective.
+
         let move_instance = Move::new(
             self.max_accel,
             self.junction_deviation,
