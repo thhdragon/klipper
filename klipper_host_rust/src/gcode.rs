@@ -1,20 +1,690 @@
 // klipper_host_rust/src/gcode.rs
 // Corresponds to klippy/gcode.py - G-code processing.
 
-// pub struct GCode {
-//     // state, command templates, etc.
-// }
+use std::collections::HashMap;
+use crate::toolhead::ToolHead; // Assuming ToolHead is in the crate root or accessible
 
-// impl GCode {
-//     pub fn new(/* ... */) -> Self { /* ... */ }
-//     pub fn process_line(&mut self, line: &str, client_sd: bool) { /* ... */ }
-//     // ... other gcode handling methods
-// }
+// Represents the current position of the toolhead
+// In Klipper, this is often managed within the GCodeMove class or similar state holders.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Coord {
+    pub x: Option<f64>,
+    pub y: Option<f64>,
+    pub z: Option<f64>,
+    pub e: Option<f64>,
+}
 
-// pub struct GCodeMove {
-//     // state for G1/G0 commands
-// }
+impl Coord {
+    pub fn new(x: Option<f64>, y: Option<f64>, z: Option<f64>, e: Option<f64>) -> Self {
+        Coord { x, y, z, e }
+    }
 
-// impl GCodeMove {
-//    // ...
-// }
+    // Helper to get a value or default to 0.0 if None.
+    // Useful for calculations where an unspecified coordinate means no change (relative)
+    // or a specific value (absolute, though usually taken from last_position).
+    fn get_or_default(&self, axis_val: Option<f64>) -> f64 {
+        axis_val.unwrap_or(0.0)
+    }
+}
+
+// State that GCode commands modify or use
+#[derive(Debug, Clone, PartialEq)]
+pub struct GCodeState {
+    pub absolute_coord: bool,          // G90/G91
+    pub absolute_extrude: bool,        // M82/M83
+    pub base_position: Coord,          // Last commanded position in G92-based coordinates (raw values from G1 with G92 offsets)
+    pub last_position: Coord,          // Actual machine position (base_position - gcode_offsets)
+    // home_position: Coord,           // Position after homing - Klipper seems to set gcode_offset instead of this directly for G28
+    pub speed: f64,                    // Current speed / feedrate F parameter (mm/min)
+    pub speed_factor: f64,             // M220 speed factor override (S)
+    pub extrude_factor: f64,           // M221 extrude factor override (S)
+    // current_z: f64,                 // current_z in Klipper is last_position.z - gcode_offset.z
+    // pub virtual_sdcard: Option<VirtualSD>, // TODO: If/when SD card support is added
+    // pub move_with_transform: bool, // TODO: If/when bed_mesh or other transforms are added
+    // Offsets applied by G92. When G92 X10 is called and current X is 50, offset becomes 40.
+    // New position = G92_value - offset. So, Machine_pos = GCode_pos - G92_offset
+    pub gcode_offset: Coord,
+}
+
+impl GCodeState {
+    pub fn new() -> Self {
+        GCodeState {
+            absolute_coord: true,
+            absolute_extrude: true, // Klipper's default is true via M82 in [printer] usually
+            base_position: Coord::new(Some(0.0), Some(0.0), Some(0.0), Some(0.0)),
+            last_position: Coord::new(Some(0.0), Some(0.0), Some(0.0), Some(0.0)),
+            // home_position: Coord::new(Some(0.0), Some(0.0), Some(0.0), Some(0.0)),
+            speed: 25.0 * 60.0, // Default speed from Klipper gcode.py (25mm/s * 60 = 1500mm/min)
+            speed_factor: 1.0,  // Factor of 1.0 means 100%
+            extrude_factor: 1.0, // Factor of 1.0 means 100%
+            // current_z: 0.0, // Removed, use last_position.z
+            gcode_offset: Coord::new(Some(0.0), Some(0.0), Some(0.0), Some(0.0)),
+        }
+    }
+}
+
+// Represents a parsed G-code command
+#[derive(Debug, PartialEq)]
+pub struct GCodeCommand<'a> {
+    pub command_letter: char, // 'G', 'M', 'T', etc.
+    pub command_number: f64,  // Numerical part of the command, e.g., 1.0, 28.0, 104.0
+    pub raw_line: &'a str,
+    pub params: HashMap<char, f64>,
+    // TODO: Add any other fields needed from Klipper's GCodeCommand if necessary
+}
+
+
+// The main G-Code processor
+pub struct GCode<'a> {
+    pub state: GCodeState,
+    printer_name: String, // Just an example, Klipper has a printer object
+    // Required for ToolHead methods, even if ToolHead itself is passed as arg to cmd_g0_g1
+    _toolhead_lifetime_marker: std::marker::PhantomData<&'a mut ()>,
+}
+
+impl<'a> GCode<'a> {
+    pub fn new(printer_name: String) -> Self {
+        GCode {
+            state: GCodeState::new(),
+            printer_name,
+            _toolhead_lifetime_marker: std::marker::PhantomData,
+        }
+    }
+
+    // Parses a G-code line into a GCodeCommand struct
+    pub fn parse_line<'line>(&self, line: &'line str) -> Result<GCodeCommand<'line>, CommandError> {
+        let clean_line = line.split(';').next().unwrap_or("").trim();
+        if clean_line.is_empty() {
+            return Err(CommandError("Empty G-code line".to_string()));
+        }
+
+        let mut parts = clean_line.split_whitespace();
+        let command_part = parts.next().ok_or_else(|| CommandError(format!("Missing command in line: {}", line)))?.to_uppercase();
+
+        if command_part.len() < 1 || !command_part.is_ascii() { // Command can be just "G" or "M" if number is 0 and omitted
+            return Err(CommandError(format!("Invalid command format: {}", command_part)));
+        }
+
+        let command_letter = command_part.chars().next().unwrap();
+        if !command_letter.is_alphabetic() {
+            return Err(CommandError(format!("Command must start with a letter: {}", command_part)));
+        }
+
+        let command_number_str = if command_part.len() > 1 { &command_part[1..] } else { "0" }; // Default to 0 if no number
+        let command_number = command_number_str.parse::<f64>().map_err(|_| {
+            CommandError(format!("Invalid command number: {} in {}", command_number_str, command_part))
+        })?;
+
+
+        let mut params = HashMap::new();
+        for part in parts {
+            if part.is_empty() {
+                continue;
+            }
+            let param_char = part.chars().next().ok_or_else(|| CommandError(format!("Invalid parameter format: {}", part)))?.to_ascii_uppercase();
+            if !param_char.is_alphabetic() {
+                 return Err(CommandError(format!("Parameter must start with a letter: {}", part)));
+            }
+
+            if part.len() > 1 {
+                let value_str = &part[1..];
+                // Special handling for M109 S / M109 R without a value - Klipper specific
+                if command_letter == 'M' && command_number == 109.0 && (param_char == 'S' || param_char == 'R') && value_str.is_empty() {
+                    // Klipper's M109 S (no value) means "wait for temp previously set by M104"
+                    // Klipper's M109 R (no value) means "wait for temp previously set by M104 R"
+                    // We'll insert NaN to signify this special case, to be handled by M109 logic.
+                    params.insert(param_char, f64::NAN);
+                    continue;
+                }
+
+                let value = value_str.parse::<f64>().map_err(|_| {
+                    CommandError(format!("Invalid parameter value for {}: {}", param_char, value_str))
+                })?;
+                params.insert(param_char, value);
+            } else {
+                // Flag parameter like G28 X (no value for X, Y, Z means home that axis)
+                // Insert NaN to signify a flag.
+                params.insert(param_char, f64::NAN);
+            }
+        }
+
+        Ok(GCodeCommand {
+            command_letter,
+            command_number,
+            raw_line: line,
+            params,
+        })
+    }
+
+    // Helper to get a parameter value, returning None if not present or not a valid float
+    fn get_float_param_opt(&self, params: &HashMap<char, f64>, key: char) -> Option<f64> {
+        params.get(&key).copied().filter(|&v| !v.is_nan())
+    }
+
+    // Helper to check if a parameter flag is present (value is NaN)
+    #[allow(dead_code)] // Will be used by G28 etc.
+    fn get_flag_param(&self, params: &HashMap<char, f64>, key: char) -> bool {
+        params.get(&key).map_or(false, |v| v.is_nan())
+    }
+
+
+    // Generic command dispatcher
+    pub fn process_command(&mut self, cmd: &GCodeCommand, toolhead: &mut ToolHead<'a>) -> Result<(), CommandError> {
+        match cmd.command_letter {
+            'G' => match cmd.command_number as i32 {
+                0 | 1 => self.cmd_g0_g1(cmd, toolhead),
+                90 => self.cmd_g90(cmd),
+                91 => self.cmd_g91(cmd),
+                92 => self.cmd_g92(cmd),
+                _ => Err(CommandError(format!("Unknown G-code: G{}", cmd.command_number))),
+            },
+            // 'M' => match cmd.command_number as i32 {
+            //     // TODO: M82, M83 for extruder absolute/relative
+            //     _ => Err(CommandError(format!("Unknown M-code: M{}", cmd.command_number))),
+            // },
+            _ => Err(CommandError(format!("Unsupported command type: {}{}", cmd.command_letter, cmd.command_number))),
+        }
+    }
+
+    // G0/G1: Move
+    fn cmd_g0_g1(&mut self, cmd: &GCodeCommand, toolhead: &mut ToolHead<'a>) -> Result<(), CommandError> {
+        if let Some(f_val) = self.get_float_param_opt(&cmd.params, 'F') {
+            self.state.speed = f_val; // F value is typically in mm/min
+        }
+
+        let mut target_pos = self.state.last_position; // Start with current known position
+        let mut new_base_pos = self.state.base_position; // For G92-relative calculations
+
+        let cur_x = self.state.last_position.x.unwrap_or(0.0);
+        let cur_y = self.state.last_position.y.unwrap_or(0.0);
+        let cur_z = self.state.last_position.z.unwrap_or(0.0);
+        let cur_e = self.state.last_position.e.unwrap_or(0.0);
+
+        let gcode_off_x = self.state.gcode_offset.x.unwrap_or(0.0);
+        let gcode_off_y = self.state.gcode_offset.y.unwrap_or(0.0);
+        let gcode_off_z = self.state.gcode_offset.z.unwrap_or(0.0);
+        let gcode_off_e = self.state.gcode_offset.e.unwrap_or(0.0);
+
+        if self.state.absolute_coord {
+            target_pos.x = self.get_float_param_opt(&cmd.params, 'X').map(|v| v - gcode_off_x).or(target_pos.x);
+            target_pos.y = self.get_float_param_opt(&cmd.params, 'Y').map(|v| v - gcode_off_y).or(target_pos.y);
+            target_pos.z = self.get_float_param_opt(&cmd.params, 'Z').map(|v| v - gcode_off_z).or(target_pos.z);
+
+            new_base_pos.x = self.get_float_param_opt(&cmd.params, 'X').or(self.state.base_position.x);
+            new_base_pos.y = self.get_float_param_opt(&cmd.params, 'Y').or(self.state.base_position.y);
+            new_base_pos.z = self.get_float_param_opt(&cmd.params, 'Z').or(self.state.base_position.z);
+        } else { // Relative coordinates
+            target_pos.x = Some(cur_x + self.get_float_param_opt(&cmd.params, 'X').unwrap_or(0.0));
+            target_pos.y = Some(cur_y + self.get_float_param_opt(&cmd.params, 'Y').unwrap_or(0.0));
+            target_pos.z = Some(cur_z + self.get_float_param_opt(&cmd.params, 'Z').unwrap_or(0.0));
+
+            new_base_pos.x = Some(self.state.base_position.x.unwrap_or(0.0) + self.get_float_param_opt(&cmd.params, 'X').unwrap_or(0.0));
+            new_base_pos.y = Some(self.state.base_position.y.unwrap_or(0.0) + self.get_float_param_opt(&cmd.params, 'Y').unwrap_or(0.0));
+            new_base_pos.z = Some(self.state.base_position.z.unwrap_or(0.0) + self.get_float_param_opt(&cmd.params, 'Z').unwrap_or(0.0));
+        }
+
+        if self.state.absolute_extrude {
+            target_pos.e = self.get_float_param_opt(&cmd.params, 'E').map(|v| v - gcode_off_e).or(target_pos.e);
+            new_base_pos.e = self.get_float_param_opt(&cmd.params, 'E').or(self.state.base_position.e);
+        } else { // Relative extrusion
+            target_pos.e = Some(cur_e + self.get_float_param_opt(&cmd.params, 'E').unwrap_or(0.0));
+            new_base_pos.e = Some(self.state.base_position.e.unwrap_or(0.0) + self.get_float_param_opt(&cmd.params, 'E').unwrap_or(0.0));
+        }
+
+        // Klipper's toolhead.move takes [x, y, z, e] and speed (mm/sec)
+        // Our speed is in mm/min, so convert.
+        let speed_mm_s = self.state.speed / 60.0 * self.state.speed_factor;
+
+        // Ensure all target coordinates are Some, defaulting to current if not specified
+        let final_x = target_pos.x.unwrap_or(cur_x);
+        let final_y = target_pos.y.unwrap_or(cur_y);
+        let final_z = target_pos.z.unwrap_or(cur_z);
+        let final_e = target_pos.e.unwrap_or(cur_e);
+
+        toolhead.move_to([final_x, final_y, final_z, final_e], speed_mm_s)
+            .map_err(|e| CommandError(format!("Toolhead move error: {}", e)))?;
+
+        self.state.last_position = Coord::new(Some(final_x), Some(final_y), Some(final_z), Some(final_e));
+        self.state.base_position = new_base_pos;
+
+        Ok(())
+    }
+
+    // G90: Absolute Coordinates
+    fn cmd_g90(&mut self, _cmd: &GCodeCommand) -> Result<(), CommandError> {
+        self.state.absolute_coord = true;
+        Ok(())
+    }
+
+    // G91: Relative Coordinates
+    fn cmd_g91(&mut self, _cmd: &GCodeCommand) -> Result<(), CommandError> {
+        self.state.absolute_coord = false;
+        Ok(())
+    }
+
+    // G92: Set Position
+    // G92 X10 Y20 ; set current X to 10, Y to 20
+    // G92 ; reset all axis offsets to zero (equivalent to G92 X0 Y0 Z0 E0 if current pos is 0,0,0,0)
+    // G92 E0 ; reset only extruder offset
+    fn cmd_g92(&mut self, cmd: &GCodeCommand) -> Result<(), CommandError> {
+        let mut new_offsets = self.state.gcode_offset;
+        let mut new_base_pos = self.state.base_position;
+
+        let current_mpos_x = self.state.last_position.x.unwrap_or(0.0);
+        let current_mpos_y = self.state.last_position.y.unwrap_or(0.0);
+        let current_mpos_z = self.state.last_position.z.unwrap_or(0.0);
+        let current_mpos_e = self.state.last_position.e.unwrap_or(0.0);
+
+        if cmd.params.is_empty() { // G92 without params resets all offsets
+            new_offsets = Coord::new(Some(0.0), Some(0.0), Some(0.0), Some(0.0));
+            new_base_pos = self.state.last_position; // base_pos becomes current machine pos
+        } else {
+            if let Some(x_val) = self.get_float_param_opt(&cmd.params, 'X') {
+                new_offsets.x = Some(current_mpos_x - x_val);
+                new_base_pos.x = Some(x_val);
+            }
+            if let Some(y_val) = self.get_float_param_opt(&cmd.params, 'Y') {
+                new_offsets.y = Some(current_mpos_y - y_val);
+                new_base_pos.y = Some(y_val);
+            }
+            if let Some(z_val) = self.get_float_param_opt(&cmd.params, 'Z') {
+                new_offsets.z = Some(current_mpos_z - z_val);
+                new_base_pos.z = Some(z_val);
+            }
+            if let Some(e_val) = self.get_float_param_opt(&cmd.params, 'E') {
+                new_offsets.e = Some(current_mpos_e - e_val);
+                new_base_pos.e = Some(e_val);
+            }
+        }
+        self.state.gcode_offset = new_offsets;
+        self.state.base_position = new_base_pos;
+        // Note: Klipper's ToolHead also has a set_position method which updates its internal commanded_pos.
+        // This might be needed here if G92 is to affect ToolHead's internal view of commanded_pos directly.
+        // For now, we only update GCode state. ToolHead's commanded_pos is updated by move_to.
+        // toolhead.set_position([new_base_pos.x.unwrap_or(0.0) - new_offsets.x.unwrap_or(0.0), ...])
+        Ok(())
+    }
+}
+
+// Basic error type for G-Code processing
+#[derive(Debug, PartialEq)]
+pub struct CommandError(String);
+
+impl std::fmt::Display for CommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for CommandError {}
+
+impl From<&str> for CommandError {
+    fn from(s: &str) -> Self {
+        CommandError(s.to_string())
+    }
+}
+impl From<String> for CommandError {
+    fn from(s: String) -> Self {
+        CommandError(s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::reactor::Reactor; // Mock or simple reactor needed for ToolHead
+    use crate::mcu::Mcu; // Mock Mcu
+    use crate::configfile::Configfile; // Mock Configfile
+
+
+    // Mock ToolHead for testing G-code commands that call it
+    struct MockToolHead {
+        last_move: Option<([f64; 4], f64)>,
+    }
+    impl MockToolHead {
+        fn new() -> Self { MockToolHead { last_move: None } }
+    }
+    // Implement a dummy ToolHead for the lifetime 'a if needed, or adjust GCode struct not to need it directly
+    // For now, let's assume ToolHead methods are simplified or don't require complex lifetime management for mocks
+    impl<'a> ToolHead<'a> {
+        // A simplified mock `move_to` for testing purposes.
+        // This is not a full mock of the actual ToolHead struct but a stand-in.
+        // To use this, you'd need to ensure the actual ToolHead struct can be created or mocked appropriately.
+        // This is a bit of a hack for now. A proper mock setup would be more involved.
+        #[allow(unused_variables)]
+        pub fn mock_move_to(&mut self, pos: [f64; 4], speed: f64) -> Result<(), String> {
+            // In a real mock, you might store pos and speed to assert later.
+            // For now, just print or do nothing.
+            // println!("MockToolHead: move_to {:?} at speed {}", pos, speed);
+            // To use with the GCode tests that need a mutable ToolHead:
+            // We can't easily swap out the real ToolHead::move_to with this one
+            // unless we use traits and dependency injection for ToolHead in GCode.
+            // The current GCode::cmd_g0_g1 directly calls toolhead.move_to.
+            Ok(())
+        }
+    }
+     // Minimal Reactor for ToolHead instantiation
+    struct MockReactor;
+    impl Reactor for MockReactor {
+        fn monotonic(&self) -> f64 { 0.0 }
+        fn register_timer(&mut self, _time: f64, _callback: Box<dyn FnMut(f64) -> Option<f64>>) -> usize { 0 }
+        fn register_fd(&mut self, _fd: i32, _callback: Box<dyn FnMut(f64)>) -> usize {0}
+        fn unregister_fd(&mut self, _handle_id: usize) {}
+        fn unregister_timer(&mut self, _handle_id: usize) {}
+        fn is_shutdown(&self) -> bool {false}
+        fn run(&mut self) {}
+        fn pause(&mut self, _waketime: f64) {}
+        fn _check_timers(&mut self, _eventtime: f64, _idle: bool) {}
+    }
+     // Minimal Mcu for ToolHead instantiation
+    struct MockMcu;
+    impl Mcu for MockMcu {
+        fn estimated_print_time(&self, _curtime: f64) -> f64 {0.0}
+        // Other methods as needed by ToolHead, or ensure ToolHead mock doesn't call them
+    }
+
+
+    fn create_test_gcode() -> GCode<'static> { // Use 'static for simplicity in test setup
+        GCode::new("TestPrinter".to_string())
+    }
+
+    // Helper to create a ToolHead instance for tests.
+    // This is very basic and likely needs more setup for real ToolHead functionality.
+    fn create_test_toolhead() -> ToolHead<'static> {
+        let mut config = Configfile::new(None); // Assuming a basic constructor
+        // Add minimal required config for ToolHead if any (e.g., max_velocity, max_accel)
+        config.add_section("printer");
+        config.set("printer", "max_velocity", "500");
+        config.set("printer", "max_accel", "3000");
+        // config.set("printer", "kinematics", "cartesian"); // This would trigger kinematic loading
+
+        let reactor = Box::new(MockReactor); // This needs to be a stable reference
+        let mcu = Box::new(MockMcu);
+
+        // Hack: Use Box::leak to get a 'static reference. This is not ideal for general code.
+        let static_reactor: &'static MockReactor = Box::leak(reactor);
+        let static_mcu: &'static MockMcu = Box::leak(mcu);
+
+
+        ToolHead::new(&config, static_reactor, vec![static_mcu]).unwrap()
+    }
+
+
+    #[test]
+    fn gcode_state_initialization() {
+        let state = GCodeState::new();
+        assert_eq!(state.absolute_coord, true);
+        assert_eq!(state.absolute_extrude, true);
+        assert_eq!(state.speed, 1500.0);
+        assert_eq!(state.base_position.x, Some(0.0));
+        assert_eq!(state.gcode_offset.x, Some(0.0));
+    }
+
+    #[test]
+    fn gcode_new_initialization() {
+        let gcode_parser = create_test_gcode();
+        assert_eq!(gcode_parser.printer_name, "TestPrinter");
+        assert_eq!(gcode_parser.state.absolute_coord, true);
+    }
+
+    #[test]
+    fn test_parse_line_simple_g1() {
+        let gcode = create_test_gcode();
+        let line = "G1 X10 Y20.5 Z0.2 F3000 E1.0";
+        let cmd = gcode.parse_line(line).unwrap();
+        assert_eq!(cmd.command_letter, 'G');
+        assert_eq!(cmd.command_number, 1.0);
+        assert_eq!(cmd.raw_line, line);
+        assert_eq!(cmd.params.get(&'X'), Some(&10.0));
+        assert_eq!(cmd.params.get(&'Y'), Some(&20.5));
+        assert_eq!(cmd.params.get(&'Z'), Some(&0.2));
+        assert_eq!(cmd.params.get(&'F'), Some(&3000.0));
+        assert_eq!(cmd.params.get(&'E'), Some(&1.0));
+    }
+
+    #[test]
+    fn test_parse_line_with_comment() {
+        let gcode = create_test_gcode();
+        let line = "G1 X10 Y20 ; this is a comment";
+        let cmd = gcode.parse_line(line).unwrap();
+        assert_eq!(cmd.command_letter, 'G');
+        assert_eq!(cmd.command_number, 1.0);
+        assert_eq!(cmd.params.get(&'X'), Some(&10.0));
+        assert_eq!(cmd.params.get(&'Y'), Some(&20.0));
+        assert!(cmd.params.get(&';').is_none());
+    }
+
+    #[test]
+    fn test_parse_line_lowercase_command() {
+        let gcode = create_test_gcode();
+        let line = "g1 x10";
+        let cmd = gcode.parse_line(line).unwrap();
+        assert_eq!(cmd.command_letter, 'G');
+        assert_eq!(cmd.command_number, 1.0);
+        assert_eq!(cmd.params.get(&'X'), Some(&10.0));
+    }
+
+    #[test]
+    fn test_parse_line_no_params() {
+        let gcode = create_test_gcode();
+        let line = "G28";
+        let cmd = gcode.parse_line(line).unwrap();
+        assert_eq!(cmd.command_letter, 'G');
+        assert_eq!(cmd.command_number, 28.0); // Defaulted to 0 by parser logic for G (no num)
+        assert!(cmd.params.is_empty());
+    }
+
+    #[test]
+    fn test_parse_line_param_flag() { // e.g. G28 X Y
+        let gcode = create_test_gcode();
+        let line = "G28 X Y";
+        let cmd = gcode.parse_line(line).unwrap();
+        assert_eq!(cmd.command_letter, 'G');
+        assert_eq!(cmd.command_number, 28.0);
+        assert!(cmd.params.get(&'X').unwrap().is_nan());
+        assert!(cmd.params.get(&'Y').unwrap().is_nan());
+        assert_eq!(cmd.params.len(), 2);
+    }
+
+
+    #[test]
+    fn test_parse_line_m_command() {
+        let gcode = create_test_gcode();
+        let line = "M104 S200";
+        let cmd = gcode.parse_line(line).unwrap();
+        assert_eq!(cmd.command_letter, 'M');
+        assert_eq!(cmd.command_number, 104.0);
+        assert_eq!(cmd.params.get(&'S'), Some(&200.0));
+    }
+
+    #[test]
+    fn test_parse_line_empty_line() {
+        let gcode = create_test_gcode();
+        let line = "";
+        assert_eq!(gcode.parse_line(line), Err(CommandError("Empty G-code line".to_string())));
+    }
+
+    #[test]
+    fn test_parse_line_comment_only() {
+        let gcode = create_test_gcode();
+        let line = "; just a comment";
+         assert_eq!(gcode.parse_line(line), Err(CommandError("Empty G-code line".to_string())));
+    }
+
+    #[test]
+    fn test_parse_line_invalid_command() {
+        let gcode = create_test_gcode();
+        let line = "X10 Y20"; // No command
+        assert!(gcode.parse_line(line).is_err());
+
+        let line = "1G X10"; // Starts with number
+        assert!(gcode.parse_line(line).is_err());
+    }
+
+    #[test]
+    fn test_parse_line_invalid_param_value() {
+        let gcode = create_test_gcode();
+        let line = "G1 X10Y20"; // Missing space, Y20 becomes value for X
+        // This should parse X as 10Y20 which is not a float.
+        assert!(gcode.parse_line(line).is_err());
+
+
+        let line = "G1 XABC";
+        assert_eq!(gcode.parse_line(line), Err(CommandError("Invalid parameter value for X: ABC".to_string())));
+    }
+     #[test]
+    fn test_parse_line_float_command_number() {
+        let gcode = create_test_gcode();
+        let line = "G1.0 X10"; // Marlin allows G1.0
+        let cmd = gcode.parse_line(line).unwrap();
+        assert_eq!(cmd.command_letter, 'G');
+        assert_eq!(cmd.command_number, 1.0);
+        assert_eq!(cmd.params.get(&'X'), Some(&10.0));
+
+        let line = "M115.2"; // Some firmwares might have M codes with decimals
+        let cmd = gcode.parse_line(line).unwrap();
+        assert_eq!(cmd.command_letter, 'M');
+        assert_eq!(cmd.command_number, 115.2);
+    }
+
+    #[test]
+    fn test_parse_g_command_with_dot() {
+        let gcode = create_test_gcode();
+        let line = "G0.1 X10";
+        let cmd = gcode.parse_line(line).unwrap();
+        assert_eq!(cmd.command_letter, 'G');
+        assert_eq!(cmd.command_number, 0.1);
+        assert_eq!(cmd.params.get(&'X'), Some(&10.0));
+    }
+
+    // Tests for G90/G91
+    #[test]
+    fn test_cmd_g90() {
+        let mut gcode = create_test_gcode();
+        let mut toolhead = create_test_toolhead();
+        gcode.state.absolute_coord = false; // Start relative
+        let cmd = gcode.parse_line("G90").unwrap();
+        gcode.process_command(&cmd, &mut toolhead).unwrap();
+        assert!(gcode.state.absolute_coord);
+    }
+
+    #[test]
+    fn test_cmd_g91() {
+        let mut gcode = create_test_gcode();
+        let mut toolhead = create_test_toolhead();
+        gcode.state.absolute_coord = true; // Start absolute
+        let cmd = gcode.parse_line("G91").unwrap();
+        gcode.process_command(&cmd, &mut toolhead).unwrap();
+        assert!(!gcode.state.absolute_coord);
+    }
+
+    // Tests for G0/G1
+    #[test]
+    fn test_cmd_g1_absolute() {
+        let mut gcode = create_test_gcode();
+        let mut toolhead = create_test_toolhead(); // Real toolhead for move_to
+        gcode.state.absolute_coord = true;
+        gcode.state.last_position = Coord::new(Some(0.0), Some(0.0), Some(0.0), Some(0.0));
+        gcode.state.base_position = Coord::new(Some(0.0), Some(0.0), Some(0.0), Some(0.0));
+        gcode.state.gcode_offset = Coord::new(Some(0.0), Some(0.0), Some(0.0), Some(0.0));
+
+
+        let cmd = gcode.parse_line("G1 X10 Y20 Z5 E1 F1200").unwrap();
+        gcode.process_command(&cmd, &mut toolhead).unwrap();
+
+        assert_eq!(gcode.state.speed, 1200.0);
+        assert_eq!(gcode.state.last_position, Coord::new(Some(10.0), Some(20.0), Some(5.0), Some(1.0)));
+        assert_eq!(gcode.state.base_position, Coord::new(Some(10.0), Some(20.0), Some(5.0), Some(1.0)));
+        // toolhead.last_move should be Some(([10.0, 20.0, 5.0, 1.0], 1200.0 / 60.0))
+    }
+
+    #[test]
+    fn test_cmd_g1_relative() {
+        let mut gcode = create_test_gcode();
+        let mut toolhead = create_test_toolhead();
+        gcode.state.absolute_coord = false; // Relative
+        gcode.state.last_position = Coord::new(Some(5.0), Some(5.0), Some(1.0), Some(0.5));
+        gcode.state.base_position = Coord::new(Some(5.0), Some(5.0), Some(1.0), Some(0.5));
+        gcode.state.gcode_offset = Coord::new(Some(0.0), Some(0.0), Some(0.0), Some(0.0));
+
+
+        let cmd = gcode.parse_line("G1 X2 Y3 Z1 E0.5 F600").unwrap();
+        gcode.process_command(&cmd, &mut toolhead).unwrap();
+
+        assert_eq!(gcode.state.speed, 600.0);
+        assert_eq!(gcode.state.last_position, Coord::new(Some(7.0), Some(8.0), Some(2.0), Some(1.0)));
+        assert_eq!(gcode.state.base_position, Coord::new(Some(7.0), Some(8.0), Some(2.0), Some(1.0)));
+    }
+
+    #[test]
+    fn test_cmd_g1_absolute_with_g92_offset() {
+        let mut gcode = create_test_gcode();
+        let mut toolhead = create_test_toolhead();
+        gcode.state.absolute_coord = true;
+        // Machine is at X5, Y5. G92 X0 Y0 was issued.
+        gcode.state.last_position = Coord::new(Some(5.0), Some(5.0), Some(0.0), Some(0.0)); // Actual machine pos
+        gcode.state.base_position = Coord::new(Some(0.0), Some(0.0), Some(0.0), Some(0.0)); // GCode pos
+        gcode.state.gcode_offset  = Coord::new(Some(5.0), Some(5.0), Some(0.0), Some(0.0)); // Offset = machine - gcode
+
+        // Move to GCode X10 Y10. Machine should move to X15 Y15.
+        let cmd = gcode.parse_line("G1 X10 Y10 F1000").unwrap();
+        gcode.process_command(&cmd, &mut toolhead).unwrap();
+
+        assert_eq!(gcode.state.last_position, Coord::new(Some(15.0), Some(15.0), Some(0.0), Some(0.0))); // Machine pos
+        assert_eq!(gcode.state.base_position, Coord::new(Some(10.0), Some(10.0), Some(0.0), Some(0.0))); // GCode pos
+    }
+
+
+    // Tests for G92
+    #[test]
+    fn test_cmd_g92_set_specific_axes() {
+        let mut gcode = create_test_gcode();
+        let mut toolhead = create_test_toolhead();
+        gcode.state.last_position = Coord::new(Some(10.0), Some(20.0), Some(5.0), Some(2.0)); // Current machine pos
+        gcode.state.base_position = Coord::new(Some(10.0), Some(20.0), Some(5.0), Some(2.0)); // Assume no prev G92
+        gcode.state.gcode_offset = Coord::new(Some(0.0), Some(0.0), Some(0.0), Some(0.0));
+
+        // Set current X to 100, Y to 50. Z and E are untouched by this G92.
+        // Machine X is 10, new GCode X is 100. Offset X = 10 - 100 = -90.
+        // Machine Y is 20, new GCode Y is 50.  Offset Y = 20 - 50 = -30.
+        let cmd = gcode.parse_line("G92 X100 Y50").unwrap();
+        gcode.process_command(&cmd, &mut toolhead).unwrap();
+
+        assert_eq!(gcode.state.gcode_offset, Coord::new(Some(-90.0), Some(-30.0), Some(0.0), Some(0.0)));
+        assert_eq!(gcode.state.base_position, Coord::new(Some(100.0), Some(50.0), Some(5.0), Some(2.0))); // Z, E from old base
+        assert_eq!(gcode.state.last_position, Coord::new(Some(10.0), Some(20.0), Some(5.0), Some(2.0))); // Unchanged by G92
+    }
+
+    #[test]
+    fn test_cmd_g92_reset_all_axes() {
+        let mut gcode = create_test_gcode();
+        let mut toolhead = create_test_toolhead();
+        gcode.state.last_position = Coord::new(Some(10.0), Some(20.0), Some(5.0), Some(2.0));
+        gcode.state.base_position = Coord::new(Some(100.0), Some(200.0), Some(50.0), Some(20.0)); // Previous G92 state
+        gcode.state.gcode_offset = Coord::new(Some(-90.0), Some(-180.0), Some(-45.0), Some(-18.0));
+
+        let cmd = gcode.parse_line("G92").unwrap(); // Reset all offsets
+        gcode.process_command(&cmd, &mut toolhead).unwrap();
+
+        assert_eq!(gcode.state.gcode_offset, Coord::new(Some(0.0), Some(0.0), Some(0.0), Some(0.0)));
+        // base_position should now reflect the actual machine coordinates
+        assert_eq!(gcode.state.base_position, Coord::new(Some(10.0), Some(20.0), Some(5.0), Some(2.0)));
+        assert_eq!(gcode.state.last_position, Coord::new(Some(10.0), Some(20.0), Some(5.0), Some(2.0))); // Unchanged
+    }
+
+    #[test]
+    fn test_cmd_g92_e_only() {
+        let mut gcode = create_test_gcode();
+        let mut toolhead = create_test_toolhead();
+        gcode.state.last_position = Coord::new(Some(10.0), Some(20.0), Some(5.0), Some(200.0));
+        gcode.state.base_position = Coord::new(Some(10.0), Some(20.0), Some(5.0), Some(200.0));
+        gcode.state.gcode_offset = Coord::new(Some(0.0), Some(0.0), Some(0.0), Some(0.0));
+
+        let cmd = gcode.parse_line("G92 E0").unwrap();
+        gcode.process_command(&cmd, &mut toolhead).unwrap();
+
+        // Machine E is 200. G92 E0. Offset E = 200 - 0 = 200.
+        assert_eq!(gcode.state.gcode_offset, Coord::new(Some(0.0), Some(0.0), Some(0.0), Some(200.0)));
+        assert_eq!(gcode.state.base_position, Coord::new(Some(10.0), Some(20.0), Some(5.0), Some(0.0)));
+    }
+}
