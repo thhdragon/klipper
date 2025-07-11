@@ -55,6 +55,10 @@ static mut USB_BUS: Option<UsbBusAllocator<UsbBus>> = None;
 static mut USB_SERIAL: Option<SerialPort<UsbBus>> = None;
 static mut USB_DEVICE: Option<UsbDevice<UsbBus>> = None;
 
+// Define a line buffer for incoming serial commands
+const MAX_LINE_LENGTH: usize = 256;
+static mut LINE_BUFFER: heapless::String<MAX_LINE_LENGTH> = heapless::String::new();
+
 #[entry]
 fn main() -> ! {
     // Setup peripherals
@@ -186,34 +190,32 @@ fn main() -> ! {
                     let mut read_buf = [0u8; 64]; // Buffer for reading serial data
                     match serial.read(&mut read_buf) {
                         Ok(count) if count > 0 => {
-                            // Data received. `count` bytes are in `read_buf[0..count]`.
-                            let received_data = &read_buf[0..count];
+                            let received_bytes = &read_buf[0..count];
+                            for &byte in received_bytes {
+                                if LINE_BUFFER.push(byte as char).is_err() {
+                                    // Line buffer is full before newline
+                                    let full_msg = b"Error: Line buffer full\r\n";
+                                    // Attempt to write error, ignore if it fails for now
+                                    let _ = serial.write(full_msg);
+                                    LINE_BUFFER.clear(); // Clear buffer and discard current line
+                                    break; // Stop processing this chunk of received_bytes
+                                }
 
-                            // Echo the data back
-                            // We need to handle potential partial writes if the output buffer is full,
-                            // but for a simple echo, we'll try a single write.
-                            let mut bytes_written = 0;
-                            while bytes_written < count {
-                                match serial.write(&received_data[bytes_written..]) {
-                                    Ok(len) if len > 0 => {
-                                        bytes_written += len;
-                                    }
-                                    Ok(_) => { // 0 bytes written, buffer likely full
-                                        break;
-                                    }
-                                    Err(UsbError::WouldBlock) => {
-                                        // Output buffer is full, try again later.
-                                        // This might require breaking the inner loop and polling USB again.
-                                        // For simple echo, we might just drop data or spin,
-                                        // but a better approach is to yield or manage buffer state.
-                                        // For now, we'll just break and try on the next main loop iteration.
-                                        break;
-                                    }
-                                    Err(_) => {
-                                        // Some other error, stop trying to write this chunk.
-                                        // log::error!("USB write error during echo");
-                                        break;
-                                    }
+                                if byte == b'\n' {
+                                    // Newline received, process the line
+                                    let line_prefix = b"LINE: ";
+                                    // Temporarily construct the message to send
+                                    // In a real app, avoid allocating like this in a loop if possible
+                                    // or use a pre-allocated buffer.
+                                    // For now, this is illustrative.
+
+                                    // Try to write the prefix
+                                    let _ = serial.write(line_prefix);
+                                    // Try to write the line content
+                                    let _ = serial.write(LINE_BUFFER.as_bytes());
+                                    // serial.write already sends \n if it's in LINE_BUFFER
+
+                                    LINE_BUFFER.clear(); // Clear buffer for the next line
                                 }
                             }
                         }
