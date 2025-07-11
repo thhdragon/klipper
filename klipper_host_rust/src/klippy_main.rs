@@ -98,11 +98,19 @@ pub fn klippy_main() {
         "M190 S70",                 // Set bed to 70 AND WAIT
         "M109 S200",                // Wait for extruder to reach 200 (should be quick if M104 was effective)
         "G1 X20 Y20 Z20 F1000",     // Another move after temps are stable
+        "G1 X250 F3000",            // Attempt to move X out of bounds (max 200) - AFTER HOMING
+        "G1 Y-10 F3000",            // Attempt to move Y out of bounds (min 0) - AFTER HOMING
+        "G1 Z181 F1000",            // Attempt to move Z out of bounds (max 180) - AFTER HOMING
         "INVALID GCODE",            // Test error handling
-        "G1 X10000",                // Test potential toolhead error (if limits were enforced)
+        // "G1 X10000",             // This was more of a placeholder, specific out-of-bounds are better.
     ];
 
-    for line_str in gcode_lines {
+    // Insert an unhomed move attempt before G28
+    let mut gcode_lines_with_unhomed_test = vec!["G1 X1 Y1 F3000"]; // Attempt move before homing
+    gcode_lines_with_unhomed_test.extend(gcode_lines);
+
+
+    for line_str in gcode_lines_with_unhomed_test {
         println!("\nProcessing G-code: '{}'", line_str);
         match gcode_processor.parse_line(line_str) {
             Ok(gcode_command) => {

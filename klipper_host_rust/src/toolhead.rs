@@ -41,6 +41,7 @@ use crate::mcu::Mcu;
 use crate::mcu::Mcu;
 use crate::reactor::Reactor;
 use crate::heaters::Heater; // Import the Heater struct
+use crate::kinematics::cartesian::CartesianKinematics; // Import CartesianKinematics
 // TODO: Add imports for Kinematics, TrapQ, etc. once their Rust structures are clearer.
 use crate::trapq::TrapQ; // Assuming trapq.rs provides this
 // use crate::kinematics::Kinematics; // Placeholder
@@ -460,8 +461,9 @@ pub struct ToolHead<'a> {
 
 // Basic trait definitions - these would likely be in their own modules
 pub trait Kinematics {
-    fn check_move(&self, move_params: &Move) -> Result<(), String>; // Using Result for error
-    // TODO: Add other methods like set_position, get_status etc.
+    fn check_move(&self, move_params: &mut Move) -> Result<(), String>; // Allow modifying move for Z limits
+    fn set_kinematics_position(&mut self, new_pos: &[f64; 3], homed_axes_mask: [bool; 3]);
+    // TODO: Add get_status, get_steppers etc.
 }
 
 pub trait ExtraAxis {
@@ -531,11 +533,31 @@ impl<'a> ToolHead<'a> {
         // This will require more infrastructure to be in place.
         // For now, create placeholder kinematics and extra_axes
         // In a real scenario, these would be loaded based on config.
-        struct PlaceholderKinematics;
-        impl Kinematics for PlaceholderKinematics {
-            fn check_move(&self, _move_params: &Move) -> Result<(), String> { Ok(()) }
-        }
-        toolhead.kin = Box::new(PlaceholderKinematics);
+
+        // Default rail configurations (would come from Configfile)
+        let x_rail_config = (vec!["stepper_x".to_string()], 0.0, 200.0, 0.0); // names, min, max, endstop
+        let y_rail_config = (vec!["stepper_y".to_string()], 0.0, 200.0, 0.0);
+        let z_rail_config = (vec!["stepper_z".to_string()], 0.0, 180.0, 0.0);
+
+        // Default Z motion parameters (would come from Configfile or printer section defaults)
+        let max_z_velocity_cfg = config.getfloat("max_z_velocity", 0.0, None).ok();
+        let max_z_accel_cfg = config.getfloat("max_z_accel", 0.0, None).ok();
+
+        // Use main printer velocity/accel as a fallback if specific Z ones are not in config
+        let default_z_velo = toolhead.max_velocity / 20.0; // Klipper's default for max_z_velocity is max_velocity if not set, but often it's much lower.
+        let default_z_accel = toolhead.max_accel / 20.0;   // Klipper's default for max_z_accel is max_accel.
+
+        let max_z_velocity = max_z_velocity_cfg.unwrap_or(default_z_velo);
+        let max_z_accel = max_z_accel_cfg.unwrap_or(default_z_accel);
+
+
+        toolhead.kin = Box::new(CartesianKinematics::new(
+            x_rail_config,
+            y_rail_config,
+            z_rail_config,
+            max_z_velocity,
+            max_z_accel,
+        ));
 
         struct PlaceholderExtraAxis;
         impl ExtraAxis for PlaceholderExtraAxis {
