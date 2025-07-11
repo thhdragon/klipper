@@ -31,9 +31,13 @@ heapless = "0.7.16"
 embedded-hal = "0.2.7"
 
 # RP2040 support
-rp2040-hal = "0.9.1" # Check for the latest version
+rp2040-hal = { version = "0.9.1", features = ["rp2040-usb"] } # Enable USB feature
 cortex-m = "0.7.7"
 cortex-m-rt = "0.7.3" # Check for the latest version, ensure compatibility with cortex-m
+
+# USB Support
+usb-device = "0.3.1" # Check for latest version
+usbd-serial = "0.2.0" # Check for latest version, ensure compatibility with usb-device
 
 # For no_std with alloc (needed by trapq.rs which uses Vec)
 # This requires nightly compiler and a global allocator definition.
