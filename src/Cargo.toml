@@ -3,16 +3,37 @@ name = "klipper_mcu_rust"
 version = "0.1.0"
 edition = "2021"
 
+# Define the library crate (src/lib.rs)
 [lib]
-crate-type = ["rlib"] # For firmware, rlib is appropriate
-path = "lib.rs"
+name = "klipper_mcu_lib" # Give the library a distinct name
+path = "src/lib.rs"
+# The library itself doesn't need rt usually, unless it provides the entry point.
+# For now, keep it minimal.
+
+[[bin]]
+name = "klipper_mcu_rust_firmware"
+path = "src/main.rs"
+# Required features for this binary to work on RP2040
+features = ["rp2040"] # This enables rp2040-hal/rt for the binary
 
 [dependencies]
-bitflags = "2.4.0" # Used in src/lib.rs
-heapless = "0.7.16" # Used for heapless::Deque in src/lib.rs
+# Dependencies for the library (and transitively for the binary)
+bitflags = "2.4.0"
+heapless = "0.7.16"
+# The klipper_mcu_lib itself is a dependency for the binary if main.rs uses items from lib.rs
+# This is implicitly handled if they are in the same crate root, or explicitly:
+# klipper_mcu_lib = { path = "." } # This line is not strictly needed if main and lib are part of the same crate definition
 
-# Optional: Add cortex-m if targeting ARM Cortex-M MCUs and using its features like interrupt::free
-# cortex-m = { version = "0.7.7", features = ["critical-section-single-core"] }
+# Dependencies only for the binary (e.g. main.rs) can go into a target-specific section if needed
+# or if they are not shared with the library.
+# For now, common dependencies are fine here.
+
+embedded-hal = "0.2.7"
+
+# RP2040 support
+rp2040-hal = "0.9.1" # Check for the latest version
+cortex-m = "0.7.7"
+cortex-m-rt = "0.7.3" # Check for the latest version, ensure compatibility with cortex-m
 
 # For no_std with alloc (needed by trapq.rs which uses Vec)
 # This requires nightly compiler and a global allocator definition.
@@ -24,6 +45,8 @@ heapless = "0.7.16" # Used for heapless::Deque in src/lib.rs
 [features]
 default = ["alloc"] # Make alloc a default feature
 alloc = []
+# Add a feature for the rp2040, could be useful for conditional compilation
+rp2040 = ["rp2040-hal/rt"] # The "rt" feature from rp2040-hal pulls in the linker script and runtime
 
 [dev-dependencies]
 # For tests, especially for float comparisons in trapq.rs and itersolve.rs
