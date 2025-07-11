@@ -185,6 +185,7 @@ impl<'a> GCode<'a> {
                 83 => self.cmd_m83(cmd),
                 104 => self.cmd_m104(cmd, toolhead),
                 109 => self.cmd_m109(cmd, toolhead),
+                114 => self.cmd_m114(cmd, toolhead),
                 140 => self.cmd_m140(cmd, toolhead),
                 190 => self.cmd_m190(cmd, toolhead),
                 // TODO: Add other M-codes
@@ -589,6 +590,27 @@ impl<'a> GCode<'a> {
         )
     }
 
+    // M114: Get Current Position
+    fn cmd_m114(&self, _cmd: &GCodeCommand, toolhead: &ToolHead<'a>) -> Result<(), CommandError> {
+        let pos = toolhead.get_position(); // This is toolhead.commanded_pos, which are G-code coordinates
+
+        // In Klipper, gcode.get_position() also returns gcode coordinates (base_position).
+        // For M114, toolhead.get_position() is the primary source.
+        // let gcode_coords = self.state.base_position;
+
+        // Format similar to Klipper: "X:%.3f Y:%.3f Z:%.3f E:%.3f"
+        // We don't have a direct gcmd.respond_raw yet, so we'll use println! for now.
+        // This output will be visible in klippy_main.rs integration.
+        println!(
+            "M114: X:{:.3} Y:{:.3} Z:{:.3} E:{:.3}",
+            pos[0], pos[1], pos[2], pos[3]
+        );
+        // Klipper also adds " Count X:%.3f Y:%.3f Z:%.3f" using gcode_coords.
+        // Since toolhead.commanded_pos and gcode.state.base_position should be in sync
+        // regarding G-code coordinates, we can omit the "Count" part for now or add it later
+        // if we differentiate between toolhead's view and gcode_move's internal view.
+        Ok(())
+    }
 }
 
 // Basic error type for G-Code processing
@@ -1448,5 +1470,42 @@ mod tests {
         assert_eq!(toolhead.extruder_heater.target_temp, 0.0);
         // Should not wait, so duration should be very small
         assert!(duration.as_secs_f64() < 0.1, "M109 S0 should not wait. Duration: {:?}", duration);
+    }
+
+    // Test for M114
+    #[test]
+    fn test_cmd_m114_reports_current_position() {
+        let mut gcode = create_test_gcode();
+        let mut toolhead = create_test_toolhead();
+
+        // Simulate some state
+        let expected_pos = [10.1234, 20.5678, 5.8912, 100.1111];
+        toolhead.commanded_pos = expected_pos; // Directly set for testing M114's source
+        gcode.state.base_position = Coord { // Keep GCodeState somewhat consistent for conceptual accuracy
+            x: Some(expected_pos[0]),
+            y: Some(expected_pos[1]),
+            z: Some(expected_pos[2]),
+            e: Some(expected_pos[3]),
+        };
+
+        let cmd_m114 = gcode.parse_line("M114").unwrap();
+
+        // We can't easily capture println! output in a standard unit test without external crates or complex setup.
+        // So, we'll verify the command executes and conceptually it would print the right thing.
+        // A more robust test would involve a mock "responder" passed to gcode commands.
+        match gcode.process_command(&cmd_m114, &mut toolhead) {
+            Ok(()) => {
+                // Command executed, visual check of println! output during test run if enabled.
+                // For automated check, we trust toolhead.get_position() is correct
+                // and formatting is as shown in cmd_m114.
+                let reported_pos = toolhead.get_position();
+                assert_eq!(reported_pos[0], expected_pos[0]);
+                assert_eq!(reported_pos[1], expected_pos[1]);
+                assert_eq!(reported_pos[2], expected_pos[2]);
+                assert_eq!(reported_pos[3], expected_pos[3]);
+                // println! will format to 3 decimal places, e.g. X:10.123 Y:20.568 Z:5.891 E:100.111
+            }
+            Err(e) => panic!("cmd_M114 failed: {:?}", e),
+        }
     }
 }

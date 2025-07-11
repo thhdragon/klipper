@@ -127,10 +127,13 @@ position_endstop: 0
         "M104 S200",                // Set extruder to 200 (don't wait)
         "M190 S70",                 // Set bed to 70 AND WAIT
         "M109 S200",                // Wait for extruder to reach 200 (should be quick if M104 was effective)
+        "M114",                     // Check position before next move
         "G1 X20 Y20 Z20 F1000",     // Another move after temps are stable
+        "M114",                     // Check position after move
         "G1 X250 F3000",            // Attempt to move X out of bounds (max 200) - AFTER HOMING
         "G1 Y-10 F3000",            // Attempt to move Y out of bounds (min 0) - AFTER HOMING
         "G1 Z181 F1000",            // Attempt to move Z out of bounds (max 180) - AFTER HOMING
+        "M114",                     // Check position after failed moves (should be same as last good G1)
         "INVALID GCODE",            // Test error handling
         // "G1 X10000",             // This was more of a placeholder, specific out-of-bounds are better.
     ];
