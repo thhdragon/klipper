@@ -184,7 +184,9 @@ impl<'a> GCode<'a> {
                 82 => self.cmd_m82(cmd),
                 83 => self.cmd_m83(cmd),
                 104 => self.cmd_m104(cmd, toolhead),
+                109 => self.cmd_m109(cmd, toolhead),
                 140 => self.cmd_m140(cmd, toolhead),
+                190 => self.cmd_m190(cmd, toolhead),
                 // TODO: Add other M-codes
                 _ => Err(CommandError(format!("Unknown M-code: M{}", cmd.command_number))),
             },
@@ -432,6 +434,136 @@ impl<'a> GCode<'a> {
         toolhead.bed_heater.set_target_temp(target_temp);
         Ok(())
     }
+
+    // Common logic for M109 and M190
+    fn wait_for_temperature(
+        &mut self,
+        heater: &mut Heater, // Mutable reference to the specific heater
+        toolhead_reactor: &mut dyn Reactor, // Reactor from ToolHead for pausing
+        target_temp: f64,
+        tolerance: f64, // e.g., PID_SETTLE_DELTA from Klipper
+        wait_interval_s: f64, // How often to check, e.g., 1.0 second
+    ) -> Result<(), CommandError> {
+        // Ensure target temp is set on the heater object itself
+        heater.set_target_temp(target_temp);
+
+        if target_temp <= 0.0 { // Don't wait if turning off
+            return Ok(());
+        }
+
+        println!(
+            "Waiting for {} to reach {:.1}°C (current: {:.1}°C)...",
+            heater.name, target_temp, heater.current_temp
+        );
+
+        loop {
+            if heater.check_target_reached(tolerance) {
+                println!("{} reached target temperature.", heater.name);
+                break;
+            }
+
+            // Simulate reactor pause and time passing
+            // In a real system, reactor.pause() would yield control.
+            // For this mock, we'll use thread::sleep.
+            // A real reactor.pause() would return the actual time paused.
+            // Here, we assume it paused for exactly wait_interval_s.
+            std::thread::sleep(std::time::Duration::from_millis((wait_interval_s * 1000.0) as u64));
+            // TODO: Replace sleep with actual reactor.pause(eventtime + wait_interval_s)
+            // and get eventtime from reactor to pass to update_current_temp.
+            // For now, using fixed interval for simulation.
+
+            heater.update_current_temp(wait_interval_s);
+
+            // Optional: Print current temperature during wait, similar to M105 output
+            // println!("{} current: {:.1}°C, target: {:.1}°C", heater.name, heater.current_temp, heater.target_temp);
+
+            // TODO: Add check for printer shutdown state from reactor: toolhead_reactor.is_shutdown()
+            // if toolhead_reactor.is_shutdown() {
+            //     return Err(CommandError(format!("Printer shutdown while waiting for {}", heater.name)));
+            // }
+        }
+        Ok(())
+    }
+
+    // M109: Wait for Extruder Temperature
+    fn cmd_m109(&mut self, cmd: &GCodeCommand, toolhead: &mut ToolHead<'a>) -> Result<(), CommandError> {
+        // Klipper's M109:
+        // - S<temp> sets target and waits.
+        // - R<temp> sets target (for cooling) and waits.
+        // - If no S or R, it waits for previously set M104 target.
+        // - Klipper default tolerance for PID is PID_SETTLE_DELTA = 1.0 degree.
+        let mut target_temp_opt: Option<f64> = None;
+
+        if let Some(s_val) = self.get_float_param_opt(&cmd.params, 'S') {
+            target_temp_opt = Some(s_val);
+        }
+        if let Some(r_val) = self.get_float_param_opt(&cmd.params, 'R') {
+            // If S was also present, R might override or be for a different condition (cooling).
+            // For simplicity, if S is set, we use S. If only R, use R.
+            // Klipper's logic is: if S, target is S. If R, target is R. If both, it's more complex (usually S for heat, R for cool).
+            // Let's assume if S is present, it's the primary target. If only R, R is target.
+            if target_temp_opt.is_none() {
+                target_temp_opt = Some(r_val);
+            } else {
+                // If S is already set, R might imply a different kind of wait (e.g. wait for temp to cool down to R *after* reaching S)
+                // This is more complex than typically handled by simple M109 R.
+                // Most firmwares: M109 Sxxx (heat and wait), M109 Rxxx (cool and wait).
+                // For now, if S is given, it takes precedence. If only R, R is used.
+                // If M109 T0 S200 R190 - Klipper waits for S200.
+                // If M109 T0 R100 - Klipper waits for R100 (cooling).
+                // Let's simplify: S param takes precedence. If no S, then R.
+                // This is handled by the order of ifs above.
+            }
+        }
+
+        let final_target_temp = match target_temp_opt {
+            Some(t) => t,
+            None => toolhead.extruder_heater.target_temp, // Wait for previously set M104 target
+        };
+
+        // TODO: Get tolerance from config, Klipper uses ~1-2 degrees for PID settle.
+        let tolerance = 1.0;
+        let wait_interval_s = 1.0; // Check every 1 second
+
+        self.wait_for_temperature(
+            &mut toolhead.extruder_heater,
+            toolhead.get_reactor_mut(), // Need a way to get reactor mutably
+            final_target_temp,
+            tolerance,
+            wait_interval_s,
+        )
+    }
+
+    // M190: Wait for Bed Temperature
+    fn cmd_m190(&mut self, cmd: &GCodeCommand, toolhead: &mut ToolHead<'a>) -> Result<(), CommandError> {
+        let mut target_temp_opt: Option<f64> = None;
+
+        if let Some(s_val) = self.get_float_param_opt(&cmd.params, 'S') {
+            target_temp_opt = Some(s_val);
+        }
+        if let Some(r_val) = self.get_float_param_opt(&cmd.params, 'R') {
+            if target_temp_opt.is_none() {
+                target_temp_opt = Some(r_val);
+            }
+        }
+
+        let final_target_temp = match target_temp_opt {
+            Some(t) => t,
+            None => toolhead.bed_heater.target_temp, // Wait for previously set M140 target
+        };
+
+        let tolerance = 2.0; // Bed might have a slightly larger tolerance
+        let wait_interval_s = 1.0;
+
+         self.wait_for_temperature(
+            &mut toolhead.bed_heater,
+            toolhead.get_reactor_mut(),
+            final_target_temp,
+            tolerance,
+            wait_interval_s,
+        )
+    }
+
 }
 
 // Basic error type for G-Code processing
@@ -1122,5 +1254,83 @@ mod tests {
         let result = gcode.process_command(&cmd_m140_no_s, &mut toolhead);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), CommandError("Missing S (temperature) parameter for M140".to_string()));
+    }
+
+    // Tests for M109 / M190
+    #[test]
+    fn test_cmd_m109_wait_for_extruder_temp_s_param() {
+        let mut gcode = create_test_gcode();
+        let mut toolhead = create_test_toolhead();
+        toolhead.extruder_heater.current_temp = 25.0; // Start at ambient
+
+        let cmd_m109 = gcode.parse_line("M109 S50").unwrap(); // Target 50C
+        // With heat rate 10C/s, and check interval 0.5s in cmd_m109, each step is 5C.
+        // 25 -> 30 (0.5s) -> 35 (1.0s) -> 40 (1.5s) -> 45 (2.0s) -> 50 (2.5s)
+        // Loop should run 5 times for updates, then 1 more time to check and exit.
+        let start_time = std::time::Instant::now();
+        gcode.process_command(&cmd_m109, &mut toolhead).unwrap();
+        let duration = start_time.elapsed();
+
+        assert_eq!(toolhead.extruder_heater.target_temp, 50.0);
+        assert!(toolhead.extruder_heater.check_target_reached(1.0)); // Tolerance is 1.0 in cmd_m109
+        // Expected duration: 5 updates * 0.5s/update = 2.5s. Allow some leeway.
+        assert!(duration.as_secs_f64() >= 2.5 && duration.as_secs_f64() < 3.0, "M109 S50 wait duration out of expected range: {:?}", duration);
+    }
+
+    #[test]
+    fn test_cmd_m190_wait_for_bed_temp_r_param() { // Using R for cooling target
+        let mut gcode = create_test_gcode();
+        let mut toolhead = create_test_toolhead();
+        toolhead.bed_heater.current_temp = 100.0; // Start hot
+        toolhead.bed_heater.target_temp = 100.0; // Assume it was set before
+
+        let cmd_m190 = gcode.parse_line("M190 R60").unwrap(); // Target 60C (cooling)
+        // Cool rate -5C/s, interval 0.5s. Each step is -2.5C.
+        // 100 -> 97.5 (0.5s) -> 95 (1.0s) ... down to 60.
+        // Diff = 40C. Steps = 40 / 2.5 = 16 steps.
+        // Duration = 16 * 0.5s = 8.0s
+        let start_time = std::time::Instant::now();
+        gcode.process_command(&cmd_m190, &mut toolhead).unwrap();
+        let duration = start_time.elapsed();
+
+        assert_eq!(toolhead.bed_heater.target_temp, 60.0);
+        assert!(toolhead.bed_heater.check_target_reached(2.0)); // Tolerance is 2.0 in cmd_m190
+        assert!(duration.as_secs_f64() >= 8.0 && duration.as_secs_f64() < 8.5, "M190 R60 wait duration out of expected range: {:?}", duration);
+    }
+
+    #[test]
+    fn test_cmd_m109_no_s_or_r_waits_for_m104_target() {
+        let mut gcode = create_test_gcode();
+        let mut toolhead = create_test_toolhead();
+        toolhead.extruder_heater.current_temp = 30.0;
+        toolhead.extruder_heater.set_target_temp(40.0); // Target previously set by M104
+
+        let cmd_m109 = gcode.parse_line("M109").unwrap(); // No S or R
+        // Heat rate 10C/s, interval 0.5s. Each step is 5C.
+        // 30 -> 35 (0.5s) -> 40 (1.0s)
+        let start_time = std::time::Instant::now();
+        gcode.process_command(&cmd_m109, &mut toolhead).unwrap();
+        let duration = start_time.elapsed();
+
+        assert_eq!(toolhead.extruder_heater.target_temp, 40.0); // Target remains from M104
+        assert!(toolhead.extruder_heater.check_target_reached(1.0));
+        assert!(duration.as_secs_f64() >= 1.0 && duration.as_secs_f64() < 1.5, "M109 (no params) wait duration out of expected range: {:?}", duration);
+    }
+
+    #[test]
+    fn test_cmd_m109_target_zero_no_wait() {
+        let mut gcode = create_test_gcode();
+        let mut toolhead = create_test_toolhead();
+        toolhead.extruder_heater.current_temp = 200.0;
+        toolhead.extruder_heater.set_target_temp(200.0);
+
+        let cmd_m109_s0 = gcode.parse_line("M109 S0").unwrap();
+        let start_time = std::time::Instant::now();
+        gcode.process_command(&cmd_m109_s0, &mut toolhead).unwrap();
+        let duration = start_time.elapsed();
+
+        assert_eq!(toolhead.extruder_heater.target_temp, 0.0);
+        // Should not wait, so duration should be very small
+        assert!(duration.as_secs_f64() < 0.1, "M109 S0 should not wait. Duration: {:?}", duration);
     }
 }

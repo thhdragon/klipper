@@ -667,6 +667,13 @@ impl<'a> ToolHead<'a> {
         self.printer.send_event("toolhead:set_position"); // Assuming printer object and event system
     }
 
+    // Allow GCode module to access the reactor, primarily for `is_shutdown` checks during waits.
+    // The actual pausing for M109/M190 will be done via std::thread::sleep in gcode.rs for now.
+    // A more integrated solution would have ToolHead provide a wait method that uses its reactor.
+    pub fn get_reactor(&self) -> &dyn Reactor {
+        self.reactor
+    }
+
 
     // Performs a homing move for a single axis.
     // axis_index: 0 for X, 1 for Y, 2 for Z.

@@ -94,6 +94,10 @@ pub fn klippy_main() {
         "G1 X10 Y10 Z10 F1200",     // Another move
         "M104 S0",                  // Turn off extruder
         "M140 S0",                  // Turn off bed
+        "M104 S200",                // Set extruder to 200 (don't wait)
+        "M190 S70",                 // Set bed to 70 AND WAIT
+        "M109 S200",                // Wait for extruder to reach 200 (should be quick if M104 was effective)
+        "G1 X20 Y20 Z20 F1000",     // Another move after temps are stable
         "INVALID GCODE",            // Test error handling
         "G1 X10000",                // Test potential toolhead error (if limits were enforced)
     ];
