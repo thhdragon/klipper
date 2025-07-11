@@ -272,18 +272,49 @@ fn TIMER_IRQ_1() { // For Scheduler's master_timer (Alarm1)
     });
 }
 
+// Command Parser
+use klipper_mcu_lib::command_parser::{parse_gcode_arguments, CommandArgValue, ArgParseError, ParsedArgs};
+
 // --- Command Processing & Helpers ---
 fn process_command(line: &str, serial: &mut SerialPort<UsbBus>) {
-    if line == "PING" { serial_write_line(serial, "PONG\r\n"); }
-    else if line == "ID" { serial_write_line(serial, "KlipperRustRP2040_GPIO_MGR_v1\r\n"); }
-    else if line.starts_with("ECHO ") {
-        if let Some(text_to_echo) = line.get("ECHO ".len()..) {
-            serial_write_line(serial, text_to_echo); serial_write_line(serial, "\r\n");
-        } else { serial_write_line(serial, "Error: Malformed ECHO command\r\n"); }
-    } else if line.starts_with("SET_PIN ") {
-        if let Some(args_str) = line.get("SET_PIN ".len()..) {
-            match parse_pin_value_args(args_str) {
-                Ok((Some(pin_num), Some(value))) => {
+    // Split command from arguments
+    let mut parts = line.trim().splitn(2, |c: char| c.is_whitespace());
+    let command = parts.next().unwrap_or("").to_ascii_uppercase();
+    let args_str = parts.next().unwrap_or("");
+
+    // Parse arguments if any
+    let parsed_args_result: Result<ParsedArgs, ArgParseError> = if !args_str.is_empty() {
+        parse_gcode_arguments(args_str)
+    } else {
+        Ok(ParsedArgs::new()) // No args, empty map
+    };
+
+    match parsed_args_result {
+        Ok(args) => {
+            // Handle commands
+            if command == "PING" {
+                serial_write_line(serial, "PONG\r\n");
+            } else if command == "ID" {
+                serial_write_line(serial, "KlipperRustRP2040_CmdParser_v1\r\n");
+            } else if command == "ECHO" {
+                // Simplified ECHO: echoes the raw argument string part
+                serial_write_line(serial, args_str); // Echo the original args_str
+                serial_write_line(serial, "\r\n");
+            } else if command == "SET_PIN" {
+                // Expected G-code style: SET_PIN P<pin_num> S<value>
+                // P for Pin, S for State/Value (0 or 1)
+                let pin_num_opt = args.get(&'P').and_then(|val| match val {
+                    CommandArgValue::UInteger(u) => Some(*u as u8),
+                    CommandArgValue::Integer(i) if *i >= 0 && *i <= 255 => Some(*i as u8),
+                    _ => None,
+                });
+                let value_opt = args.get(&'S').and_then(|val| match val {
+                    CommandArgValue::UInteger(u) => Some(*u == 1),
+                    CommandArgValue::Integer(i) => Some(*i == 1),
+                    _ => None,
+                });
+
+                if let (Some(pin_num), Some(value)) = (pin_num_opt, value_opt) {
                     interrupt_free(|cs| {
                         if let Some(manager) = GPIO_MANAGER.borrow(cs).borrow_mut().as_mut() {
                             if manager.configure_pin_as_output(pin_num).is_ok() {
@@ -293,21 +324,22 @@ fn process_command(line: &str, serial: &mut SerialPort<UsbBus>) {
                             } else { serial_write_line(serial, "Error: Failed to configure pin as output\r\n"); }
                         } else { serial_write_line(serial, "Error: GpioManager not initialized\r\n");}
                     });
+                } else {
+                    serial_write_line(serial, "Error: Missing or invalid P (pin) or S (value) for SET_PIN\r\n");
                 }
-                Ok((None, _)) => serial_write_line(serial, "Error: Missing PIN for SET_PIN\r\n"),
-                Ok((_, None)) => serial_write_line(serial, "Error: Missing VALUE for SET_PIN\r\n"),
-                Err(e) => { serial_write_line(serial, "Error parsing SET_PIN: "); serial_write_line(serial, e); serial_write_line(serial, "\r\n");}
-            }
-        } else { serial_write_line(serial, "Error: Malformed SET_PIN (no args)\r\n"); }
-    } else if line.starts_with("GET_PIN ") {
-        if let Some(args_str) = line.get("GET_PIN ".len()..) {
-            match parse_pin_value_args(args_str) {
-                Ok((Some(pin_num), None)) => { // VALUE should not be provided
+            } else if command == "GET_PIN" {
+                // Expected G-code style: GET_PIN P<pin_num>
+                let pin_num_opt = args.get(&'P').and_then(|val| match val {
+                    CommandArgValue::UInteger(u) => Some(*u as u8),
+                    CommandArgValue::Integer(i) if *i >= 0 && *i <= 255 => Some(*i as u8),
+                    _ => None,
+                });
+
+                if let Some(pin_num) = pin_num_opt {
                     interrupt_free(|cs| {
                         if let Some(manager) = GPIO_MANAGER.borrow(cs).borrow_mut().as_mut() {
-                            // For GET_PIN, let's use a default pull type, e.g., Floating or PullUp.
-                            // Klipper typically specifies pull mode in config. For now, default.
-                            if manager.configure_pin_as_input(pin_num, PullType::Floating).is_ok() { // Or PullType::Up
+                            // Defaulting to Floating input for GET_PIN for now
+                            if manager.configure_pin_as_input(pin_num, PullType::Floating).is_ok() {
                                 match manager.read_pin_input(pin_num) {
                                     Ok(is_high) => {
                                         let mut response = heapless::String::<32>::new();
@@ -320,17 +352,24 @@ fn process_command(line: &str, serial: &mut SerialPort<UsbBus>) {
                             } else { serial_write_line(serial, "Error: Failed to configure pin as input\r\n"); }
                         } else { serial_write_line(serial, "Error: GpioManager not initialized\r\n");}
                     });
+                } else {
+                    serial_write_line(serial, "Error: Missing or invalid P (pin) for GET_PIN\r\n");
                 }
-                Ok((None, _)) => serial_write_line(serial, "Error: Missing PIN for GET_PIN\r\n"),
-                Ok((_, Some(_))) => serial_write_line(serial, "Error: VALUE unexpected for GET_PIN\r\n"),
-                Err(e) => { serial_write_line(serial, "Error parsing GET_PIN: "); serial_write_line(serial, e); serial_write_line(serial, "\r\n");}
+            } else if command.is_empty() && args_str.is_empty() {
+                // Ignore completely empty lines
+            } else {
+                serial_write_line(serial, "Error: Unknown command '");
+                serial_write_line(serial, &command); // Use the parsed command
+                serial_write_line(serial, "'\r\n");
             }
-        } else { serial_write_line(serial, "Error: Malformed GET_PIN (no args)\r\n"); }
-    }
-    else if line.is_empty() { /* Ignore */ }
-    else {
-        serial_write_line(serial, "Error: Unknown command '");
-        serial_write_line(serial, line); serial_write_line(serial, "'\r\n");
+        }
+        Err(e) => {
+            // Send back parsing error
+            let mut err_msg = heapless::String::<64>::new();
+            use core::fmt::Write;
+            write!(err_msg, "Error parsing arguments: {:?}\r\n", Debug2Format(&e)).unwrap();
+            serial_write_line(serial, err_msg.as_str());
+        }
     }
 }
 
