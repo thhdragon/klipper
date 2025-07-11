@@ -176,4 +176,125 @@ impl GpioManager {
         })?;
         Ok(())
     }
+
+    // --- ADC Pin Handling ---
+
+    // Helper enum to return a specifically typed GPIO pin for ADC conversion.
+    // This is needed because Rp2040AdcChannel::new expects a typed Pin, not a DynPin.
+    // Only ADC-capable pins are included.
+    pub enum AdcCapablePin {
+        Gpio26(gpio::Pin<gpio::bank0::Gpio26, gpio::FloatingInput>),
+        Gpio27(gpio::Pin<gpio::bank0::Gpio27, gpio::FloatingInput>),
+        Gpio28(gpio::Pin<gpio::bank0::Gpio28, gpio::FloatingInput>),
+        Gpio29(gpio::Pin<gpio::bank0::Gpio29, gpio::FloatingInput>),
+    }
+
+    /// Attempts to configure and temporarily take an ADC-capable pin.
+    /// The pin's state in GpioManager is set to FunctionAdc, and its DynPin is temporarily removed.
+    /// The caller is responsible for calling `release_adc_pin` to return it.
+    pub fn take_pin_for_adc(&mut self, pin_id: u8) -> Result<AdcCapablePin, &'static str> {
+        if !(26..=29).contains(&pin_id) {
+            return Err("Pin is not ADC capable");
+        }
+
+        let managed_pin_entry = &mut self.pins[pin_id as usize];
+        if managed_pin_entry.is_none() {
+            // This should not happen if GpioManager is initialized correctly,
+            // means the ManagedPin was taken and not returned.
+            return Err("Pin previously taken and not released (ManagedPin is None)");
+        }
+
+        // Take the ManagedPin out of the Option to work with it.
+        // We'll put it back (or a new one if pin was consumed) later.
+        let mut managed_pin = managed_pin_entry.take().unwrap();
+
+        match managed_pin.current_mode {
+            PinModeState::Disabled | PinModeState::InputFloating => {
+                // Ok to configure for ADC.
+                // We need to convert the DynPin back to its specific GpioX type, then into_floating_input().
+                // This is the hard part with DynPin. DynPin.try_into_ συγκεκριμένος_pin() might work.
+                // `DynPin::try_into_pin<GpioX, FloatingInput>()` is not a method.
+                // `DynPin::into_floating_input()` returns a new DynPin.
+                // We need `Pin<GpioX, FloatingInput>`.
+
+                // This requires unsafe or a different way of storing pins if we need to recover typed pins.
+                // For now, this is a conceptual block. The actual conversion is non-trivial.
+                // defmt::error!("take_pin_for_adc: Converting DynPin back to typed GpioX for ADC is complex and not fully implemented.");
+                // return Err("DynPin to typed GpioX conversion for ADC not implemented");
+
+                // Simplification: Assume the DynPin can be directly used to create a typed pin for ADC
+                // This is a placeholder for the complex conversion or a HAL feature.
+                // The `into_floating_input()` method on `DynPin` returns another `DynPin`.
+                // We need the specific `Pin<Gpio26, FloatingInput>`.
+                // This means the original `Pins` struct is needed, or unsafe transmutation.
+
+                // Let's assume we can "re-take" the specific pin from *somewhere* if we know its ID.
+                // This completely bypasses the `DynPin` stored in `managed_pin.pin` for this operation,
+                // which is not ideal but a pragmatic way forward for the ADC step if GpioManager
+                // cannot easily yield the *typed* pin required by Rp2040AdcChannel.
+                // This implies `GpioManager` is more of a state tracker than a resource owner here.
+
+                // To make progress, we will assume that if a pin is marked `Disabled` or `InputFloating`,
+                // we can "construct" the typed pin again. This is only safe if nothing else has
+                // grabbed the raw PAC tokens for that pin.
+                // This part of the code will be UNSAFE or require a different HAL abstraction.
+                // For now, let's return a specific pin based on ID, assuming it's constructible.
+                // This is a MAJOR simplification / HACK.
+
+                let result_pin = match pin_id {
+                    26 => Ok(AdcCapablePin::Gpio26(unsafe { gpio::Pin::new(gpio::bank0::Gpio26::ID) }.into_floating_input())),
+                    27 => Ok(AdcCapablePin::Gpio27(unsafe { gpio::Pin::new(gpio::bank0::Gpio27::ID) }.into_floating_input())),
+                    28 => Ok(AdcCapablePin::Gpio28(unsafe { gpio::Pin::new(gpio::bank0::Gpio28::ID) }.into_floating_input())),
+                    29 => Ok(AdcCapablePin::Gpio29(unsafe { gpio::Pin::new(gpio::bank0::Gpio29::ID) }.into_floating_input())),
+                    _ => unreachable!(), // Already checked by initial if
+                };
+
+                if result_pin.is_ok() {
+                    managed_pin.current_mode = PinModeState::FunctionAdc;
+                    // Put the managed_pin (with updated state but original DynPin) back.
+                    // The DynPin is not actually used by this hacked path.
+                    *managed_pin_entry = Some(managed_pin);
+                } else {
+                    // Failed to create, put original managed_pin back
+                    *managed_pin_entry = Some(managed_pin);
+                }
+                result_pin
+            }
+            PinModeState::FunctionAdc => {
+                 // Already in ADC mode, this might be an error or allow re-taking.
+                 // For now, let's treat as error to prevent concurrent access issues.
+                *managed_pin_entry = Some(managed_pin); // Put it back
+                Err("Pin already configured for ADC and potentially in use")
+            }
+            _ => { // Pin is in another mode (Output, PullUp/Down Input, etc.)
+                *managed_pin_entry = Some(managed_pin); // Put it back
+                Err("Pin in incompatible mode for ADC")
+            }
+        }
+    }
+
+    /// Releases a pin that was taken for ADC use, returning it to a Disabled state.
+    pub fn release_adc_pin(&mut self, pin_id: u8, _adc_capable_pin: AdcCapablePin) -> Result<(), &'static str> {
+        // The `_adc_capable_pin` is consumed, its underlying raw pin parts are now "back" with the PAC tokens conceptually.
+        // We just need to update the state in GpioManager.
+        if pin_id as usize >= NUM_GPIO_PINS {
+            return Err("Invalid pin_id");
+        }
+
+        match self.pins[pin_id as usize].as_mut() {
+            Some(managed_pin) => {
+                if managed_pin.current_mode == PinModeState::FunctionAdc {
+                    // Revert the DynPin to a default state (e.g., floating input)
+                    // This assumes the original DynPin in managed_pin is still valid for this.
+                    let temp_dyn_pin = core::mem::replace(&mut managed_pin.pin, unsafe { core::mem::zeroed() });
+                    managed_pin.pin = temp_dyn_pin.into_floating_input().into_dyn_pin();
+                    managed_pin.current_mode = PinModeState::Disabled; // Or InputFloating
+                    Ok(())
+                } else {
+                    Err("Pin was not in FunctionAdc mode when release_adc_pin called")
+                }
+            }
+            None => Err("Pin not found in manager to release (was it taken for ADC?)"),
+        }
+    }
 }

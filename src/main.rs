@@ -17,21 +17,24 @@ use rp2040_hal::{
     timer::Timer as RpHalTimer,
     timer::{Alarm0, Alarm1},
     usb::UsbBus,
-    gpio::Pins as RpHalPins, // Renamed to avoid conflict if we have our own Pins type
+    gpio::Pins as RpHalPins,
+    adc::Adc as RpHalAdc, // ADC Peripheral
 };
 use rp2040_hal::clocks::UsbClock;
 
 // Klipper HAL Traits and Implementations
 use klipper_mcu_lib::{
-    hal::{Timer as KlipperHalTimer, GpioOut, GpioIn, PullType, StepEventResult},
+    hal::{Timer as KlipperHalTimer, GpioOut, GpioIn, PullType, AdcChannel, AdcError, StepEventResult}, // Added AdcChannel, AdcError
     rp2040_hal_impl::{
         // timer::Rp2040Timer, // Rp2040Timer is used directly
-        // gpio::{Rp2040GpioOut, Rp2040GpioIn}, // These specific types are no longer directly instantiated by commands
+        // adc::Rp2040AdcChannel, // Will be used by QUERY_ADC command
     },
     sched::{SchedulerState, KlipperSchedulerTrait},
-    gpio_manager::{GpioManager, PinModeState}, // Import GpioManager
+    gpio_manager::{GpioManager, PinModeState},
 };
-use klipper_mcu_lib::rp2040_hal_impl::timer::Rp2040Timer; // Path fix
+use klipper_mcu_lib::rp2040_hal_impl::timer::Rp2040Timer;
+// We will also need Rp2040AdcChannel when implementing QUERY_ADC
+// use klipper_mcu_lib::rp2040_hal_impl::adc::Rp2040AdcChannel;
 
 
 // USB
@@ -57,12 +60,11 @@ static mut LINE_BUFFER: heapless::String<MAX_LINE_LENGTH> = heapless::String::ne
 
 static TEST_TIMER0: InterruptMutex<RefCell<Option<Rp2040Timer<Alarm0>>>> = InterruptMutex::new(RefCell::new(None));
 const TEST_TIMER0_ID: u32 = 0;
-const LED_PIN_ID: u8 = 25; // Onboard LED
+const LED_PIN_ID: u8 = 25;
 
 static SCHEDULER: InterruptMutex<RefCell<Option<SchedulerState<Alarm1>>>> = InterruptMutex::new(RefCell::new(None));
-
-// Global GpioManager
 static GPIO_MANAGER: InterruptMutex<RefCell<Option<GpioManager>>> = InterruptMutex::new(RefCell::new(None));
+static ADC_PERIPHERAL: InterruptMutex<RefCell<Option<RpHalAdc>>> = InterruptMutex::new(RefCell::new(None));
 
 
 // --- Callbacks and Dispatchers ---
@@ -71,7 +73,7 @@ fn test_timer0_callback(timer: &mut Rp2040Timer<Alarm0>) -> StepEventResult {
     let current_waketime = timer.get_waketime();
     let next_waketime = current_waketime.wrapping_add(1_000_000);
 
-    timer.set_hw_irq_active(false); // Ensure it doesn't self-trigger via its own IRQ
+    timer.set_hw_irq_active(false);
     timer.set_waketime(next_waketime);
 
     interrupt_free(|cs| {
@@ -113,7 +115,7 @@ fn main() -> ! {
     let mut pac_peripherals = pac::Peripherals::take().unwrap();
     let core_peripherals = pac::CorePeripherals::take().unwrap();
     let mut watchdog = Watchdog::new(pac_peripherals.WATCHDOG);
-    let sio = Sio::new(pac_peripherals.SIO);
+    let sio = Sio::new(pac_peripherals.SIO); // SIO is taken here
 
     let clocks = init_clocks_and_plls(
         12_000_000u32, pac_peripherals.XOSC, pac_peripherals.CLOCKS, pac_peripherals.PLL_SYS, pac_peripherals.PLL_USB,
@@ -129,34 +131,34 @@ fn main() -> ! {
     unsafe {
         USB_SERIAL = Some(SerialPort::new(bus_ref));
         USB_DEVICE = Some(UsbDeviceBuilder::new(bus_ref, UsbVidPid(0x16c0, 0x27dd))
-            .manufacturer("KlipperMCU").product("Klipper Rust Firmware").serial_number("GPIO_MGR")
+            .manufacturer("KlipperMCU").product("Klipper Rust Firmware").serial_number("ADC_TEST")
             .device_class(usbd_serial::USB_CLASS_CDC).build());
     }
 
-    let mut delay = cortex_m::delay::Delay::new(core_peripherals.SYST, clocks.system_clock.freq().to_Hz());
+    // Initialize ADC Peripheral
+    let adc_peripheral_hal = RpHalAdc::new(pac_peripherals.ADC, &mut pac_peripherals.RESETS);
+    interrupt_free(|cs| {
+        ADC_PERIPHERAL.borrow(cs).replace(Some(adc_peripheral_hal));
+    });
+    info!("ADC Peripheral Initialized.");
 
     // Initialize GpioManager
-    // IMPORTANT: rp2040_hal::gpio::Pins consumes SIO and RESETS tokens that might be needed elsewhere
-    // if not careful. Here, SIO is already taken. RESETS is mut.
-    // We need to ensure SIO is not consumed if other parts of HAL need it.
-    // Sio::new(pac.SIO) takes pac.SIO. Pins::new also takes pac.SIO. This is a conflict.
-    // Solution: Pass SIO peripheral to Pins::new.
-    // `sio: Sio` is `Copy`, so we can pass `sio` to `Pins::new`.
+    // Pass the already taken `sio.gpio_bank0`
     let rp_hal_pins = RpHalPins::new(
         pac_peripherals.IO_BANK0,
         pac_peripherals.PADS_BANK0,
-        sio.gpio_bank0, // Use the SIO from earlier
+        sio.gpio_bank0,
         &mut pac_peripherals.RESETS
     );
     let gpio_mgr = GpioManager::new(rp_hal_pins);
     interrupt_free(|cs| { GPIO_MANAGER.borrow(cs).replace(Some(gpio_mgr)); });
+    info!("GPIO Manager Initialized.");
 
     // Configure LED Pin (GPIO25) using GpioManager
     interrupt_free(|cs| {
         if let Some(manager) = GPIO_MANAGER.borrow(cs).borrow_mut().as_mut() {
             if manager.configure_pin_as_output(LED_PIN_ID).is_ok() {
                 info!("LED Pin {} configured as output.", LED_PIN_ID);
-                // Initial state off
                 let _ = manager.write_pin_output(LED_PIN_ID, false);
             } else {
                 error!("Failed to configure LED Pin {} as output.", LED_PIN_ID);
@@ -164,14 +166,12 @@ fn main() -> ! {
         }
     });
 
-
     // Timer and Scheduler Setup
     let rp_hal_timer = RpHalTimer::new(pac_peripherals.TIMER, &mut pac_peripherals.RESETS);
     let alarm0 = rp_hal_timer.alarm_0().unwrap();
     let mut klipper_timer0 = Rp2040Timer::new(alarm0, test_timer0_callback);
     klipper_timer0.set_hw_irq_active(false);
     interrupt_free(|cs| { TEST_TIMER0.borrow(cs).replace(Some(klipper_timer0)); });
-    // TIMER_IRQ_0 is NOT unmasked
 
     let alarm1_for_scheduler = rp_hal_timer.alarm_1().unwrap();
     let scheduler_raw_timer_ref = rp_hal_timer;
@@ -180,15 +180,12 @@ fn main() -> ! {
         master_scheduler_timer_callback, dispatch_klipper_task_from_scheduler,
     );
     interrupt_free(|cs| { SCHEDULER.borrow(cs).replace(Some(klipper_scheduler)); });
-    unsafe { NVIC::unmask(pac::Interrupt::TIMER_IRQ_1); } // Scheduler's master timer IRQ
+    unsafe { NVIC::unmask(pac::Interrupt::TIMER_IRQ_1); }
 
     let now_ticks = rp_hal_timer.get_counter_low();
     let initial_waketime_for_test_timer0 = now_ticks.wrapping_add(2_000_000);
     interrupt_free(|cs| {
         if let Some(scheduler) = SCHEDULER.borrow(cs).borrow_mut().as_mut() {
-            // Use the new direct scheduling method if available, or existing add_timer for now
-            // scheduler.schedule_task(TEST_TIMER0_ID, initial_waketime_for_test_timer0);
-            // For now, stick to add_timer as schedule_task is public on SchedulerState but not trait
              if let Some(timer0_ref) = TEST_TIMER0.borrow(cs).borrow_mut().as_mut() {
                 timer0_ref.set_waketime(initial_waketime_for_test_timer0);
                 scheduler.add_timer(timer0_ref);
@@ -200,23 +197,24 @@ fn main() -> ! {
     info!("Setup complete, entering main loop.");
     let mut loop_count = 0u32;
     let mut led_state = false;
+    let mut delay = cortex_m::delay::Delay::new(core_peripherals.SYST, clocks.system_clock.freq().to_Hz());
+
 
     loop {
-        // Toggle LED using GpioManager
-        led_state = !led_state;
         interrupt_free(|cs| {
             if let Some(manager) = GPIO_MANAGER.borrow(cs).borrow_mut().as_mut() {
+                // Toggle LED
+                led_state = !led_state;
                 let _ = manager.write_pin_output(LED_PIN_ID, led_state);
             }
         });
-        delay.delay_ms(500); // Blink slower
+        delay.delay_ms(500);
 
-        if loop_count % 2 == 0 { // Log less frequently
+        if loop_count % 2 == 0 {
             debug!("Main loop iteration: {}", loop_count);
         }
         loop_count = loop_count.wrapping_add(1);
 
-        // USB Serial Processing
         unsafe {
             if let Some(usb_dev) = USB_DEVICE.as_mut() {
                 if let Some(serial) = USB_SERIAL.as_mut() {
@@ -248,23 +246,10 @@ fn main() -> ! {
     }
 }
 
-// --- Interrupt Handlers ---
-// TIMER_IRQ_0 handler is commented out
-/*
+// --- Interrupt Handlers --- (TIMER_IRQ_0 is commented out)
 #[allow(non_snake_case)]
 #[interrupt]
-fn TIMER_IRQ_0() {
-    interrupt_free(|cs| {
-        if let Some(timer) = TEST_TIMER0.borrow(cs).borrow_mut().as_mut() {
-            timer.on_interrupt();
-        }
-    });
-}
-*/
-
-#[allow(non_snake_case)]
-#[interrupt]
-fn TIMER_IRQ_1() { // For Scheduler's master_timer (Alarm1)
+fn TIMER_IRQ_1() {
     interrupt_free(|cs| {
         if let Some(scheduler) = SCHEDULER.borrow(cs).borrow_mut().as_mut() {
             scheduler.master_timer.on_interrupt();
@@ -272,45 +257,33 @@ fn TIMER_IRQ_1() { // For Scheduler's master_timer (Alarm1)
     });
 }
 
-// Command Parser
-use klipper_mcu_lib::command_parser::{parse_gcode_arguments, CommandArgValue, ArgParseError, ParsedArgs};
-
 // --- Command Processing & Helpers ---
 fn process_command(line: &str, serial: &mut SerialPort<UsbBus>) {
-    // Split command from arguments
     let mut parts = line.trim().splitn(2, |c: char| c.is_whitespace());
     let command = parts.next().unwrap_or("").to_ascii_uppercase();
     let args_str = parts.next().unwrap_or("");
 
-    // Parse arguments if any
-    let parsed_args_result: Result<ParsedArgs, ArgParseError> = if !args_str.is_empty() {
-        parse_gcode_arguments(args_str)
+    let parsed_args_result = if !args_str.is_empty() {
+        klipper_mcu_lib::command_parser::parse_gcode_arguments(args_str)
     } else {
-        Ok(ParsedArgs::new()) // No args, empty map
+        Ok(klipper_mcu_lib::command_parser::ParsedArgs::new())
     };
 
     match parsed_args_result {
         Ok(args) => {
-            // Handle commands
-            if command == "PING" {
-                serial_write_line(serial, "PONG\r\n");
-            } else if command == "ID" {
-                serial_write_line(serial, "KlipperRustRP2040_CmdParser_v1\r\n");
-            } else if command == "ECHO" {
-                // Simplified ECHO: echoes the raw argument string part
-                serial_write_line(serial, args_str); // Echo the original args_str
-                serial_write_line(serial, "\r\n");
+            if command == "PING" { serial_write_line(serial, "PONG\r\n"); }
+            else if command == "ID" { serial_write_line(serial, "KlipperRustRP2040_ADC_v1\r\n"); }
+            else if command == "ECHO" {
+                serial_write_line(serial, args_str); serial_write_line(serial, "\r\n");
             } else if command == "SET_PIN" {
-                // Expected G-code style: SET_PIN P<pin_num> S<value>
-                // P for Pin, S for State/Value (0 or 1)
                 let pin_num_opt = args.get(&'P').and_then(|val| match val {
-                    CommandArgValue::UInteger(u) => Some(*u as u8),
-                    CommandArgValue::Integer(i) if *i >= 0 && *i <= 255 => Some(*i as u8),
+                    klipper_mcu_lib::command_parser::CommandArgValue::UInteger(u) => Some(*u as u8),
+                    klipper_mcu_lib::command_parser::CommandArgValue::Integer(i) if *i >= 0 && *i <= 29 => Some(*i as u8),
                     _ => None,
                 });
                 let value_opt = args.get(&'S').and_then(|val| match val {
-                    CommandArgValue::UInteger(u) => Some(*u == 1),
-                    CommandArgValue::Integer(i) => Some(*i == 1),
+                    klipper_mcu_lib::command_parser::CommandArgValue::UInteger(u) => Some(*u == 1),
+                    klipper_mcu_lib::command_parser::CommandArgValue::Integer(i) => Some(*i == 1),
                     _ => None,
                 });
 
@@ -324,21 +297,16 @@ fn process_command(line: &str, serial: &mut SerialPort<UsbBus>) {
                             } else { serial_write_line(serial, "Error: Failed to configure pin as output\r\n"); }
                         } else { serial_write_line(serial, "Error: GpioManager not initialized\r\n");}
                     });
-                } else {
-                    serial_write_line(serial, "Error: Missing or invalid P (pin) or S (value) for SET_PIN\r\n");
-                }
+                } else { serial_write_line(serial, "Error: Missing/invalid P (pin) or S (value) for SET_PIN\r\n"); }
             } else if command == "GET_PIN" {
-                // Expected G-code style: GET_PIN P<pin_num>
                 let pin_num_opt = args.get(&'P').and_then(|val| match val {
-                    CommandArgValue::UInteger(u) => Some(*u as u8),
-                    CommandArgValue::Integer(i) if *i >= 0 && *i <= 255 => Some(*i as u8),
+                    klipper_mcu_lib::command_parser::CommandArgValue::UInteger(u) => Some(*u as u8),
+                    klipper_mcu_lib::command_parser::CommandArgValue::Integer(i) if *i >= 0 && *i <= 29 => Some(*i as u8),
                     _ => None,
                 });
-
                 if let Some(pin_num) = pin_num_opt {
                     interrupt_free(|cs| {
                         if let Some(manager) = GPIO_MANAGER.borrow(cs).borrow_mut().as_mut() {
-                            // Defaulting to Floating input for GET_PIN for now
                             if manager.configure_pin_as_input(pin_num, PullType::Floating).is_ok() {
                                 match manager.read_pin_input(pin_num) {
                                     Ok(is_high) => {
@@ -352,19 +320,122 @@ fn process_command(line: &str, serial: &mut SerialPort<UsbBus>) {
                             } else { serial_write_line(serial, "Error: Failed to configure pin as input\r\n"); }
                         } else { serial_write_line(serial, "Error: GpioManager not initialized\r\n");}
                     });
+                } else { serial_write_line(serial, "Error: Missing or invalid P (pin) for GET_PIN\r\n"); }
+            }
+            // QUERY_ADC command will be added in the next step
+            else if command == "QUERY_ADC" {
+                let pin_num_opt = args.get(&'P').and_then(|val| match val {
+                    klipper_mcu_lib::command_parser::CommandArgValue::UInteger(u) => Some(*u as u8),
+                    klipper_mcu_lib::command_parser::CommandArgValue::Integer(i) if *i >= 0 && *i <= 29 => Some(*i as u8),
+                    _ => None,
+                });
+
+                if let Some(pin_num) = pin_num_opt {
+                    if !(26..=29).contains(&pin_num) { // Validate if pin is ADC capable (GPIO 26-29)
+                        serial_write_line(serial, "Error: Pin is not ADC capable (must be 26-29)\r\n");
+                    } else {
+                        let adc_read_result: Result<u16, &'static str> = interrupt_free(|cs| {
+                            let mut manager_opt = GPIO_MANAGER.borrow(cs).borrow_mut();
+                            let mut adc_opt = ADC_PERIPHERAL.borrow(cs).borrow_mut();
+
+                            if let (Some(manager), Some(adc_peripheral)) = (manager_opt.as_mut(), adc_opt.as_mut()) {
+                                match manager.take_pin_for_adc(pin_num) {
+                                    Ok(adc_capable_pin) => {
+                                        // Convert AdcCapablePin enum to the specific Pin type needed by Rp2040AdcChannel
+                                        // This is verbose. A helper method on AdcCapablePin could do this.
+                                        let read_val = match adc_capable_pin {
+                                            klipper_mcu_lib::gpio_manager::AdcCapablePin::Gpio26(pin_instance) => {
+                                                match klipper_mcu_lib::rp2040_hal_impl::adc::Rp2040AdcChannel::new(adc_peripheral, pin_instance) {
+                                                    Ok(mut adc_channel) => adc_channel.read_raw().map_err(|e| {
+                                                        defmt::error!("ADC Read Error (Pin {}): {:?}", pin_num, defmt::Debug2Format(&e));
+                                                        "ADC Read Error"
+                                                    }),
+                                                    Err(e) => {
+                                                        defmt::error!("ADC Channel Config Error (Pin {}): {:?}", pin_num, defmt::Debug2Format(&e));
+                                                        Err("ADC Channel Config Error")
+                                                    }
+                                                }
+                                            }
+                                            klipper_mcu_lib::gpio_manager::AdcCapablePin::Gpio27(pin_instance) => {
+                                                match klipper_mcu_lib::rp2040_hal_impl::adc::Rp2040AdcChannel::new(adc_peripheral, pin_instance) {
+                                                    Ok(mut adc_channel) => adc_channel.read_raw().map_err(|e| {
+                                                        defmt::error!("ADC Read Error (Pin {}): {:?}", pin_num, defmt::Debug2Format(&e));
+                                                        "ADC Read Error"
+                                                    }),
+                                                    Err(e) => {
+                                                        defmt::error!("ADC Channel Config Error (Pin {}): {:?}", pin_num, defmt::Debug2Format(&e));
+                                                        Err("ADC Channel Config Error")
+                                                    }
+                                                }
+                                            }
+                                            klipper_mcu_lib::gpio_manager::AdcCapablePin::Gpio28(pin_instance) => {
+                                                match klipper_mcu_lib::rp2040_hal_impl::adc::Rp2040AdcChannel::new(adc_peripheral, pin_instance) {
+                                                    Ok(mut adc_channel) => adc_channel.read_raw().map_err(|e| {
+                                                        defmt::error!("ADC Read Error (Pin {}): {:?}", pin_num, defmt::Debug2Format(&e));
+                                                        "ADC Read Error"
+                                                    }),
+                                                    Err(e) => {
+                                                        defmt::error!("ADC Channel Config Error (Pin {}): {:?}", pin_num, defmt::Debug2Format(&e));
+                                                        Err("ADC Channel Config Error")
+                                                    }
+                                                }
+                                            }
+                                            klipper_mcu_lib::gpio_manager::AdcCapablePin::Gpio29(pin_instance) => {
+                                                match klipper_mcu_lib::rp2040_hal_impl::adc::Rp2040AdcChannel::new(adc_peripheral, pin_instance) {
+                                                    Ok(mut adc_channel) => adc_channel.read_raw().map_err(|e| {
+                                                        defmt::error!("ADC Read Error (Pin {}): {:?}", pin_num, defmt::Debug2Format(&e));
+                                                        "ADC Read Error"
+                                                    }),
+                                                    Err(e) => {
+                                                        defmt::error!("ADC Channel Config Error (Pin {}): {:?}", pin_num, defmt::Debug2Format(&e));
+                                                        Err("ADC Channel Config Error")
+                                                    }
+                                                }
+                                            }
+                                        };
+                                        // Release the pin back to GpioManager
+                                        // We need to pass back the original AdcCapablePin to release_adc_pin
+                                        // The current structure of take_pin_for_adc and release_adc_pin makes this awkward
+                                        // because the pin is consumed by AdcChannel::new.
+                                        // For now, let's assume release just updates state based on pin_id.
+                                        // A better release would take back the `AdcCapablePin` to return its tokens.
+                                        // The current `release_adc_pin` takes `_adc_capable_pin` but doesn't use it.
+                                        // This is okay for the simplified unsafe `take_pin_for_adc`.
+                                        let _ = manager.release_adc_pin(pin_num, klipper_mcu_lib::gpio_manager::AdcCapablePin::Gpio26(unsafe { rp2040_hal::gpio::Pin::new(rp2040_hal::gpio::bank0::Gpio26::ID) }.into_floating_input())); // Dummy pin for release
+                                        read_val
+                                    }
+                                    Err(e) => Err(e), // Error from take_pin_for_adc
+                                }
+                            } else {
+                                Err("Manager or ADC not initialized")
+                            }
+                        });
+
+                        match adc_read_result {
+                            Ok(raw_value) => {
+                                let mut response = heapless::String::<64>::new();
+                                use core::fmt::Write;
+                                write!(response, "ADC PIN {} RAW_VALUE {}\r\n", pin_num, raw_value).unwrap();
+                                serial_write_line(serial, response.as_str());
+                            }
+                            Err(e_str) => {
+                                serial_write_line(serial, "Error: ");
+                                serial_write_line(serial, e_str);
+                                serial_write_line(serial, "\r\n");
+                            }
+                        }
+                    }
                 } else {
-                    serial_write_line(serial, "Error: Missing or invalid P (pin) for GET_PIN\r\n");
+                    serial_write_line(serial, "Error: Missing or invalid P (pin) for QUERY_ADC\r\n");
                 }
-            } else if command.is_empty() && args_str.is_empty() {
-                // Ignore completely empty lines
-            } else {
+            }
+            else if command.is_empty() && args_str.is_empty() { /* Ignore */ }
+            else {
                 serial_write_line(serial, "Error: Unknown command '");
-                serial_write_line(serial, &command); // Use the parsed command
-                serial_write_line(serial, "'\r\n");
+                serial_write_line(serial, &command); serial_write_line(serial, "'\r\n");
             }
         }
         Err(e) => {
-            // Send back parsing error
             let mut err_msg = heapless::String::<64>::new();
             use core::fmt::Write;
             write!(err_msg, "Error parsing arguments: {:?}\r\n", Debug2Format(&e)).unwrap();

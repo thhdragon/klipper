@@ -55,3 +55,45 @@ pub trait Scheduler {
     fn get_clock_freq(&self) -> u32; // To be used by timer_from_us
     // timer_is_before can be implemented using direct comparison of u32 times
 }
+
+/// Errors that can occur during ADC operations.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, defmt::Format)]
+pub enum AdcError {
+    InvalidPin,         // The specified pin cannot be used for ADC or is invalid.
+    PinUnavailable,     // The pin is currently in use by another function.
+    ReadError,          // A hardware error occurred during ADC read.
+    ConfigurationError, // Error during ADC or pin configuration.
+}
+
+/// Trait for Analog to Digital Converter (ADC) pins.
+pub trait AdcChannel {
+    /// Associated error type for this ADC implementation.
+    type Error: core::fmt::Debug + defmt::Format; // Ensure error can be logged/formatted
+
+    // Constructor might be part of a higher-level AdcController trait,
+    // or each pin could be individually convertible.
+    // For now, let's assume a method to create an ADC channel from a pin ID.
+    // This is difficult to make generic here without knowing the ADC controller.
+    // Let's simplify: the AdcChannel is ALREADY an ADC pin.
+
+    /// Reads the raw ADC value from the channel.
+    /// Typically a 10-bit or 12-bit value depending on the MCU.
+    fn read_raw(&mut self) -> Result<u16, Self::Error>;
+
+    /// (Optional) Reads the voltage from the ADC channel.
+    /// `vref` is the reference voltage for the ADC (e.g., 3.3f32).
+    fn read_voltage(&mut self, vref: f32) -> Result<f32, Self::Error> {
+        // Default implementation assuming max raw value for 12-bit ADC.
+        // Implementers should override if their ADC has different resolution.
+        const ADC_MAX_RAW_12BIT: u32 = (1 << 12) - 1; // 4095
+        let raw = self.read_raw()? as u32;
+        Ok((raw as f32 / ADC_MAX_RAW_12BIT as f32) * vref)
+    }
+}
+
+// It might be better to have an AdcController trait that vends AdcChannel instances.
+// pub trait AdcController {
+//     type Channel: AdcChannel;
+//     fn acquire_channel(&mut self, pin_id: u8) -> Result<Self::Channel, AdcError>;
+// }
+// For now, AdcChannel itself is the main focus.
