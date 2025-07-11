@@ -435,22 +435,53 @@ pub trait ExtraAxis {
 impl<'a> ToolHead<'a> {
     pub fn new(
         config: &Configfile,
-        reactor_ref: &'a Reactor, // Keep as immutable ref
+        reactor_ref: &'a Reactor,
         printer_ref: &'a dyn PrinterUtility,
         mcus_list: Vec<&'a Mcu>,
     ) -> Result<Self, String> {
+        // Convert ConfigError to String for now, could be more specific later
+        let cfg_err = |e: configfile::ConfigError| e.to_string();
 
-        let max_velocity = config.getfloat("max_velocity", 0.0, None)?;
-        let max_accel = config.getfloat("max_accel", 0.0, None)?;
+        let max_velocity = config.getfloat("printer", "max_velocity", None, Some(0.0), None).map_err(cfg_err)?;
+        let max_accel = config.getfloat("printer", "max_accel", None, Some(0.0), None).map_err(cfg_err)?;
 
-        let mut min_cruise_ratio = 0.5;
-        if config.getfloat("minimum_cruise_ratio", 0.0, None).is_err() {
-            if let Ok(req_accel_to_decel) = config.getfloat("max_accel_to_decel", 0.0, None) {
+        let mut min_cruise_ratio = config.getfloat("printer", "minimum_cruise_ratio", Some(0.5), Some(0.0), Some(1.0))
+            .map_err(cfg_err)?;
+        // Klipper's logic for deprecated max_accel_to_decel
+        if config.get_str("printer", "minimum_cruise_ratio").is_err() { // if minimum_cruise_ratio was not set
+            if let Ok(req_accel_to_decel) = config.getfloat("printer", "max_accel_to_decel", None, Some(0.0), None) {
+                // TODO: printer_ref.deprecate("max_accel_to_decel")
                 min_cruise_ratio = 1.0 - (req_accel_to_decel / max_accel).min(1.0);
             }
         }
-        min_cruise_ratio = config.getfloat("minimum_cruise_ratio", min_cruise_ratio, Some(1.0))?;
-        let square_corner_velocity = config.getfloat("square_corner_velocity", 5.0, Some(0.0))?;
+        let square_corner_velocity = config.getfloat("printer", "square_corner_velocity", Some(5.0), Some(0.0), None).map_err(cfg_err)?;
+
+        // Kinematics parameters from config
+        let x_pos_min = config.getfloat("stepper_x", "position_min", Some(0.0), None, None).map_err(cfg_err)?;
+        let x_pos_max = config.getfloat("stepper_x", "position_max", None, Some(x_pos_min), None).map_err(cfg_err)?;
+        let x_pos_endstop = config.getfloat("stepper_x", "position_endstop", Some(0.0), None, None).map_err(cfg_err)?;
+        // TODO: Get stepper names if multiple steppers per rail, for now assume "stepper_x"
+        let x_rail_config = (vec!["stepper_x".to_string()], x_pos_min, x_pos_max, x_pos_endstop);
+
+        let y_pos_min = config.getfloat("stepper_y", "position_min", Some(0.0), None, None).map_err(cfg_err)?;
+        let y_pos_max = config.getfloat("stepper_y", "position_max", None, Some(y_pos_min), None).map_err(cfg_err)?;
+        let y_pos_endstop = config.getfloat("stepper_y", "position_endstop", Some(0.0), None, None).map_err(cfg_err)?;
+        let y_rail_config = (vec!["stepper_y".to_string()], y_pos_min, y_pos_max, y_pos_endstop);
+
+        let z_pos_min = config.getfloat("stepper_z", "position_min", Some(0.0), None, None).map_err(cfg_err)?;
+        let z_pos_max = config.getfloat("stepper_z", "position_max", None, Some(z_pos_min), None).map_err(cfg_err)?;
+        let z_pos_endstop = config.getfloat("stepper_z", "position_endstop", Some(0.0), None, None).map_err(cfg_err)?;
+        let z_rail_config = (vec!["stepper_z".to_string()], z_pos_min, z_pos_max, z_pos_endstop);
+
+        let default_z_velo = max_velocity / 20.0; // Default if not specified
+        let default_z_accel = max_accel / 20.0;   // Default if not specified
+        let max_z_velocity = config.getfloat("printer", "max_z_velocity", Some(default_z_velo), Some(0.0), Some(max_velocity)).map_err(cfg_err)?;
+        let max_z_accel = config.getfloat("printer", "max_z_accel", Some(default_z_accel), Some(0.0), Some(max_accel)).map_err(cfg_err)?;
+
+        // Heater names (could also come from config if sections are named differently)
+        let extruder_heater_name = config.get("extruder", "heater_name", Some("extruder")).unwrap_or_else(|_| "extruder".to_string());
+        let bed_heater_name = config.get("heater_bed", "heater_name", Some("heater_bed")).unwrap_or_else(|_| "heater_bed".to_string());
+
 
         let mut toolhead = ToolHead {
             reactor: reactor_ref,
@@ -475,31 +506,19 @@ impl<'a> ToolHead<'a> {
             clear_history_time: 0.0,
             kin_flush_delay: SDS_CHECK_TIME,
             kin_flush_times: Vec::new(),
-            // TODO: TrapQ initialization needs ffi_main, ffi_lib from chelper
-            trapq: TrapQ::new_for_test(), // Placeholder if TrapQ has a test constructor
-            flush_trapqs: vec![TrapQ::new_for_test()], // Placeholder
-            extruder_heater: Heater::new("extruder".to_string()),
-            bed_heater: Heater::new("heater_bed".to_string()),
-            x_endstop: Endstop::new("x_endstop".to_string(), X_MACHINE_POSITION_AT_ENDSTOP),
-            y_endstop: Endstop::new("y_endstop".to_string(), Y_MACHINE_POSITION_AT_ENDSTOP),
-            z_endstop: Endstop::new("z_endstop".to_string(), Z_MACHINE_POSITION_AT_ENDSTOP),
-            kin: Box::new(PlaceholderKinematics), // Will be replaced next
+            trapq: TrapQ::new_for_test(),
+            flush_trapqs: vec![TrapQ::new_for_test()],
+            extruder_heater: Heater::new(extruder_heater_name),
+            bed_heater: Heater::new(bed_heater_name),
+            x_endstop: Endstop::new("x_endstop".to_string(), x_pos_endstop), // Use configured endstop pos
+            y_endstop: Endstop::new("y_endstop".to_string(), y_pos_endstop),
+            z_endstop: Endstop::new("z_endstop".to_string(), z_pos_endstop),
+            kin: Box::new(CartesianKinematics::new( // Kinematics initialized below
+                x_rail_config.clone(), y_rail_config.clone(), z_rail_config.clone(), max_z_velocity, max_z_accel
+            )),
         };
 
         toolhead._calc_junction_deviation();
-
-        let x_rail_config = (vec!["stepper_x".to_string()], 0.0, 200.0, 0.0);
-        let y_rail_config = (vec!["stepper_y".to_string()], 0.0, 200.0, 0.0);
-        let z_rail_config = (vec!["stepper_z".to_string()], 0.0, 180.0, 0.0);
-
-        let max_z_velocity_cfg = config.getfloat("max_z_velocity", 0.0, None).ok();
-        let max_z_accel_cfg = config.getfloat("max_z_accel", 0.0, None).ok();
-
-        let default_z_velo = toolhead.max_velocity / 20.0;
-        let default_z_accel = toolhead.max_accel / 20.0;
-
-        let max_z_velocity = max_z_velocity_cfg.unwrap_or(default_z_velo);
-        let max_z_accel = max_z_accel_cfg.unwrap_or(default_z_accel);
 
         toolhead.kin = Box::new(CartesianKinematics::new(
             x_rail_config,
@@ -509,10 +528,11 @@ impl<'a> ToolHead<'a> {
             max_z_accel,
         ));
 
-        // PlaceholderKinematics struct definition removed from here.
-        // It should be defined in the tests module if needed for other tests,
-        // or removed entirely if CartesianKinematics is always used.
-
+        // Placeholder for ExtraAxis (e.g. extruder)
+        // Klipper's ToolHead initializes self.extra_axes = [extruder.DummyExtruder(self.printer)]
+        // then loads actual extruder from config:
+        // self.printer.load_object(config, 'extruder')
+        // For now, keep it simple:
         struct PlaceholderExtraAxis;
         impl ExtraAxis for PlaceholderExtraAxis {
             fn check_move(&self, _move_params: &Move, _axis_index: usize) -> Result<(), String> { Ok(()) }

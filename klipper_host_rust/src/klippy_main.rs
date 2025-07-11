@@ -36,13 +36,43 @@ impl Mcu for MainMcu {
 pub fn klippy_main() {
     println!("Klipper Host (Rust) Integration Test Starting...");
 
-    // 1. Initialize Configfile (mocked for now)
-    let mut config = Configfile::new(None);
-    config.add_section("printer");
-    config.set("printer", "max_velocity", "500");
-    config.set("printer", "max_accel", "3000");
-    config.set("printer", "square_corner_velocity", "5.0"); // Needed by ToolHead for junction_deviation
-    // config.set("printer", "kinematics", "cartesian"); // Placeholder
+    // 1. Define and parse sample configuration
+    let sample_config_content = r#"
+[printer]
+max_velocity: 300
+max_accel: 2000
+square_corner_velocity: 5.0
+max_z_velocity: 25
+max_z_accel: 300
+
+[stepper_x]
+position_min: 0
+position_max: 210
+position_endstop: 0
+
+[stepper_y]
+position_min: 0
+position_max: 220
+position_endstop: 0
+
+[stepper_z]
+position_min: 0
+position_max: 190
+position_endstop: 0
+
+[extruder]
+# placeholder for extruder specific settings like nozzle_diameter, sensor_type, etc.
+
+[heater_bed]
+# placeholder for bed specific settings like sensor_type, etc.
+"#;
+
+    let mut config = Configfile::new(Some("memory_config.cfg".to_string()));
+    if let Err(e) = config.parse(sample_config_content) {
+        eprintln!("Failed to parse sample config: {}", e);
+        return;
+    }
+    println!("Successfully parsed sample configuration.");
 
     // 2. Initialize Reactor and MCU (mocked)
     // These need to be 'static for the current ToolHead constructor if not using more advanced lifetime management.
