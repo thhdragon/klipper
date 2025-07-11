@@ -17,9 +17,23 @@ pub struct Rp2040Timer<A: Alarm> {
 
     /// The currently scheduled waketime (raw timer value).
     pub(super) scheduled_waketime: u32,
+    /// Flag to control if this timer's own hardware interrupt should be enabled when armed.
+    /// If false, it's expected to be driven by an external scheduler.
+    pub(super) hw_irq_enabled: bool,
 }
 
 impl<A: Alarm> Rp2040Timer<A> {
+    /// Sets whether this timer's dedicated hardware interrupt should be active.
+    /// If `false`, the timer relies on an external scheduler to call its callback.
+    pub fn set_hw_irq_active(&mut self, active: bool) {
+        self.hw_irq_enabled = active;
+        if !active {
+            // If disabling, immediately try to disable the hardware interrupt too.
+            self.alarm.disable_interrupt();
+        }
+        // If enabling, arm_hardware_alarm will handle enabling it when next scheduled.
+    }
+
     /// Retrieves the stored callback function pointer.
     /// This is intended for use by a scheduler that needs to invoke the callback directly.
     pub fn get_callback(&self) -> Option<fn(&mut Self) -> StepEventResult> {
@@ -32,9 +46,14 @@ impl<A: Alarm> Rp2040Timer<A> {
         self.alarm.clear_interrupt();
         match self.alarm.schedule(waketime) {
             Ok(()) => {
-                self.alarm.enable_interrupt();
+                if self.hw_irq_enabled {
+                    self.alarm.enable_interrupt();
+                    // defmt::trace!("Rp2040Timer: Armed HW alarm (IRQ enabled) for {}", waketime);
+                } else {
+                    self.alarm.disable_interrupt(); // Ensure it's disabled if not active
+                    // defmt::trace!("Rp2040Timer: Armed HW alarm (IRQ disabled) for {}", waketime);
+                }
                 self.scheduled_waketime = waketime;
-                // defmt::trace!("Rp2040Timer: Armed hardware alarm for waketime: {}", waketime);
             }
             Err(_e) => {
                 // If schedule fails (e.g. time in past, though rp2040-hal might handle this),
@@ -78,6 +97,7 @@ impl<A: Alarm> HalTimer for Rp2040Timer<A> {
             alarm,
             callback: Some(callback),
             scheduled_waketime: 0,
+            hw_irq_enabled: true, // Default to hardware IRQ being active
         }
     }
 

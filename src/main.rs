@@ -137,9 +137,10 @@ fn main() -> ! {
     let rp_hal_timer = RpHalTimer::new(pac.TIMER, &mut pac.RESETS);
 
     let alarm0 = rp_hal_timer.alarm_0().unwrap();
-    let klipper_timer0 = Rp2040Timer::new(alarm0, test_timer0_callback);
+    let mut klipper_timer0 = Rp2040Timer::new(alarm0, test_timer0_callback);
+    klipper_timer0.set_hw_irq_active(false); // TEST_TIMER0 will be driven by scheduler, not its own IRQ
     interrupt_free(|cs| { TEST_TIMER0.borrow(cs).replace(Some(klipper_timer0)); });
-    unsafe { NVIC::unmask(pac::Interrupt::TIMER_IRQ_0); } // Keep this for now, will be subject of next step
+    // unsafe { NVIC::unmask(pac::Interrupt::TIMER_IRQ_0); } // DO NOT UNMASK - Scheduler handles it
 
     let alarm1_for_scheduler = rp_hal_timer.alarm_1().unwrap();
     let scheduler_raw_timer_ref = rp_hal_timer;
@@ -203,19 +204,25 @@ fn main() -> ! {
     }
 }
 
-#[allow(non_snake_case)]
-#[interrupt]
-fn TIMER_IRQ_0() {
-    interrupt_free(|cs| {
-        if let Some(timer) = TEST_TIMER0.borrow(cs).borrow_mut().as_mut() {
-            timer.on_interrupt();
-        }
-    });
-}
+// // The TIMER_IRQ_0 is no longer explicitly unmasked if TEST_TIMER0 is scheduler-driven.
+// // If it were, Rp2040Timer.on_interrupt() would still correctly call the callback.
+// // But the goal is for the scheduler to be the sole logical trigger for scheduled tasks.
+// #[allow(non_snake_case)]
+// #[interrupt]
+// fn TIMER_IRQ_0() {
+//     interrupt_free(|cs| {
+//         if let Some(timer) = TEST_TIMER0.borrow(cs).borrow_mut().as_mut() {
+//             // This path should ideally not be taken if scheduler is managing this timer
+//             // and hw_irq_enabled is false for it.
+//             defmt::warn!("TIMER_IRQ_0 fired unexpectedly for scheduler-managed timer!");
+//             timer.on_interrupt();
+//         }
+//     });
+// }
 
 #[allow(non_snake_case)]
 #[interrupt]
-fn TIMER_IRQ_1() {
+fn TIMER_IRQ_1() { // For Scheduler's master_timer (Alarm1)
     interrupt_free(|cs| {
         if let Some(scheduler) = SCHEDULER.borrow(cs).borrow_mut().as_mut() {
             scheduler.master_timer.on_interrupt();
