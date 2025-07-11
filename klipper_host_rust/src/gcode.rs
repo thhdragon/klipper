@@ -184,6 +184,8 @@ impl<'a> GCode<'a> {
                 82 => self.cmd_m82(cmd),
                 83 => self.cmd_m83(cmd),
                 104 => self.cmd_m104(cmd, toolhead),
+                106 => self.cmd_m106(cmd, toolhead), // Single entry
+                107 => self.cmd_m107(cmd, toolhead), // Single entry
                 106 => self.cmd_m106(cmd, toolhead),
                 107 => self.cmd_m107(cmd, toolhead),
                 109 => self.cmd_m109(cmd, toolhead),

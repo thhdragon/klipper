@@ -73,10 +73,16 @@ microsteps: 16
 heater_name: my_extruder_heater # Example of using a custom name
 min_temp: 0
 max_temp: 280
-# placeholder for extruder specific settings like nozzle_diameter, sensor_type, etc.
 
 [heater_bed]
-# placeholder for bed specific settings like sensor_type, etc.
+min_temp: 0
+max_temp: 120
+
+[fan]
+name: my_part_fan # Example, ToolHead::new defaults to part_cooling_fan if name not found
+max_power: 0.8
+off_below: 0.1 # Equivalent to S25.5. So S25 should be off, S26 should be on (0.1019 * 0.8)
+kick_start_time: 0.2
 "#;
 
     let mut config = Configfile::new(Some("memory_config.cfg".to_string()));
@@ -150,10 +156,16 @@ max_temp: 280
         "M106 S128",                // Set fan to 50%
         "G1 X20 Y20 Z20 F1000",     // Another move after temps are stable
         "M114",                     // Check position after move
+        "M106 S255",                // Fan full (0.8 due to max_power)
+        "G1 X22 Y22 Z22 F1000",     // Move with fan on
+        "M106 S20",                 // Fan low (should be off due to off_below 0.1 for S25.5)
+        "G1 X23 Y23 Z23 F1000",     // Move with fan off
+        "M106 S30",                 // Fan just above off_below (0.117 * 0.8 = 0.094)
+        "G1 X24 Y24 Z24 F1000",     // Move with fan on low
         "M107",                     // Turn fan off
-        "G1 X250 F3000",            // Attempt to move X out of bounds (max 200) - AFTER HOMING
-        "G1 Y-10 F3000",            // Attempt to move Y out of bounds (min 0) - AFTER HOMING
-        "G1 Z181 F1000",            // Attempt to move Z out of bounds (max 180) - AFTER HOMING
+        "G1 X250 F3000",            // Attempt to move X out of bounds (max 210 from config)
+        "G1 Y-10 F3000",            // Attempt to move Y out of bounds (min 0 from config)
+        "G1 Z191 F1000",            // Attempt to move Z out of bounds (max 190 from config)
         "M114",                     // Check position after failed moves (should be same as last good G1)
         "INVALID GCODE",            // Test error handling
         // "G1 X10000",             // This was more of a placeholder, specific out-of-bounds are better.
