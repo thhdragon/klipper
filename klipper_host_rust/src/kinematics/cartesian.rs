@@ -22,28 +22,42 @@ pub const DEFAULT_MICROSTEPS: u32 = 16;
 pub struct Stepper {
     name: String,
     pub rotation_distance: f64,
-    pub steps_per_rotation: u32, // Effective steps per rotation (full_steps * microsteps * gear_ratio)
+    pub full_steps_per_rotation: u32,
+    pub microsteps: u32,
+    pub gear_ratio: f64,
+    pub steps_per_rotation: u32, // Effective total steps for one motor rotation (full * micro * gear_inv)
     pub step_distance: f64,      // Calculated: rotation_distance / steps_per_rotation
     position_steps: i64,      // Current position in microsteps from mcu_position_offset origin
     mcu_position_offset: f64, // Offset in mm to align step counter with G-code zero
 }
 
 impl Stepper {
-    pub fn new(name: String, rotation_distance: f64, steps_per_rotation: u32) -> Self {
-        let step_distance = if steps_per_rotation == 0 {
-            // Avoid division by zero, though steps_per_rotation should always be > 0
-            // In Klipper, this would be an error during config parsing.
-            // For now, set a very large step_distance (effectively zero movement per step)
-            // or consider panicking or returning Result.
-            eprintln!("Warning: steps_per_rotation is 0 for stepper {}, step_distance will be incorrect.", name);
-            f64::MAX
-        } else {
-            rotation_distance / (steps_per_rotation as f64)
-        };
+    pub fn new(
+        name: String,
+        rotation_distance: f64,
+        full_steps_per_rotation: u32,
+        microsteps: u32,
+        gear_ratio: f64, // Simplified: product of gear ratios. Klipper: list of num:den
+    ) -> Self {
+        let effective_gearing = if gear_ratio == 0.0 { 1.0 } else { gear_ratio }; // Avoid div by zero if gear_ratio is misconfigured as 0
+        let steps_per_rotation_calc = (full_steps_per_rotation * microsteps) as f64 * effective_gearing;
+
+        if steps_per_rotation_calc < 1.0 { // Must be at least 1 effective step
+             eprintln!("Warning: Calculated steps_per_rotation is less than 1 for stepper {}. Clamping to 1.", name);
+        }
+        // Ensure steps_per_rotation is at least 1 to avoid division by zero or nonsensical step_distance
+        let steps_per_rotation = (steps_per_rotation_calc.max(1.0)) as u32;
+
+
+        let step_distance = rotation_distance / (steps_per_rotation as f64);
+
         Stepper {
             name,
             rotation_distance,
-            steps_per_rotation,
+            full_steps_per_rotation,
+            microsteps,
+            gear_ratio: effective_gearing, // Store the used gear_ratio
+            steps_per_rotation, // Store calculated effective steps
             step_distance,
             position_steps: 0,
             mcu_position_offset: 0.0,
@@ -100,15 +114,15 @@ pub struct Rail {
 impl Rail {
     pub fn new(
         name: String,
-        // Vec of (stepper_name, rotation_distance, total_steps_per_rotation)
-        stepper_configs: Vec<(String, f64, u32)>,
+        // Vec of (stepper_name, rotation_dist, full_steps, microsteps, gear_ratio)
+        stepper_configs: Vec<(String, f64, u32, u32, f64)>,
         position_min: f64,
         position_max: f64,
         position_endstop: f64,
     ) -> Self {
         let steppers = stepper_configs
             .into_iter()
-            .map(|(s_name, rot_dist, steps_per_rot)| Stepper::new(s_name, rot_dist, steps_per_rot))
+            .map(|(s_name, rot_dist, f_steps, m_steps, gr)| Stepper::new(s_name, rot_dist, f_steps, m_steps, gr))
             .collect();
         Rail {
             name,
@@ -168,10 +182,10 @@ pub struct CartesianKinematics {
 
 impl CartesianKinematics {
     pub fn new(
-        // Each tuple: (Vec<(stepper_name, rotation_dist, steps_per_rotation)>, min_pos, max_pos, endstop_pos)
-        x_rail_config: (Vec<(String, f64, u32)>, f64, f64, f64),
-        y_rail_config: (Vec<(String, f64, u32)>, f64, f64, f64),
-        z_rail_config: (Vec<(String, f64, u32)>, f64, f64, f64),
+        // Each tuple: (Vec<(stepper_name, rot_dist, full_steps, microsteps, gear_ratio)>, min_pos, max_pos, endstop_pos)
+        x_rail_config: (Vec<(String, f64, u32, u32, f64)>, f64, f64, f64),
+        y_rail_config: (Vec<(String, f64, u32, u32, f64)>, f64, f64, f64),
+        z_rail_config: (Vec<(String, f64, u32, u32, f64)>, f64, f64, f64),
         max_z_velocity: f64,
         max_z_accel: f64,
     ) -> Self {
@@ -300,9 +314,16 @@ mod tests {
 
     #[test]
     fn rail_creation_and_stepper_init() {
+        let stepper_configs = vec![(
+            "stepper_x".to_string(),
+            DEFAULT_ROTATION_DISTANCE,
+            DEFAULT_FULL_STEPS_PER_ROTATION,
+            DEFAULT_MICROSTEPS,
+            1.0 // gear_ratio
+        )];
         let rail_x = Rail::new(
             "x_rail".to_string(),
-            vec![("stepper_x".to_string(), 0.0125)],
+            stepper_configs,
             0.0, 200.0, 0.0
         );
         assert_eq!(rail_x.name, "x_rail");
@@ -311,17 +332,45 @@ mod tests {
         assert_eq!(rail_x.position_endstop, 0.0);
         assert_eq!(rail_x.steppers.len(), 1);
         assert_eq!(rail_x.steppers[0].get_name(), "stepper_x");
-        assert_eq!(rail_x.steppers[0].step_distance, 0.0125);
+        assert_eq!(rail_x.steppers[0].rotation_distance, DEFAULT_ROTATION_DISTANCE);
+        assert_eq!(rail_x.steppers[0].full_steps_per_rotation, DEFAULT_FULL_STEPS_PER_ROTATION);
+        assert_eq!(rail_x.steppers[0].microsteps, DEFAULT_MICROSTEPS);
+        assert_eq!(rail_x.steppers[0].gear_ratio, 1.0);
+        let expected_steps_per_rotation = DEFAULT_FULL_STEPS_PER_ROTATION * DEFAULT_MICROSTEPS;
+        assert_eq!(rail_x.steppers[0].steps_per_rotation, expected_steps_per_rotation);
+        assert!((rail_x.steppers[0].step_distance - (DEFAULT_ROTATION_DISTANCE / expected_steps_per_rotation as f64)).abs() < 1e-9);
         assert_eq!(rail_x.steppers[0].position_steps, 0);
         assert_eq!(rail_x.steppers[0].mcu_position_offset, 0.0);
     }
 
     #[test]
+    fn stepper_creation_calculates_step_distance() {
+        let stepper1 = Stepper::new("s1".to_string(), 40.0, 200, 16, 1.0); // rot_dist, full_steps, microsteps, gear_ratio
+        assert_eq!(stepper1.steps_per_rotation, 3200); // 200 * 16 * 1.0
+        assert!((stepper1.step_distance - (40.0 / 3200.0)).abs() < 1e-9); // 0.0125
+
+        let stepper2 = Stepper::new("s2".to_string(), 40.0, 200, 16, 2.0); // Double gear ratio
+        assert_eq!(stepper2.steps_per_rotation, 6400); // 200 * 16 * 2.0
+        assert!((stepper2.step_distance - (40.0 / 6400.0)).abs() < 1e-9); // 0.00625
+
+        let stepper3 = Stepper::new("s3".to_string(), 8.0, 400, 32, 0.5); // 0.9deg motor, different gear
+        assert_eq!(stepper3.steps_per_rotation, (400*32) as u32 / 2); // 400 * 32 * 0.5 = 6400
+        assert!((stepper3.step_distance - (8.0 / ((400*32) as f64 * 0.5))).abs() < 1e-9);
+
+        // Test clamping of steps_per_rotation to 1 if calculation is less
+        let stepper4 = Stepper::new("s4_low_steps".to_string(), 40.0, 1, 1, 0.5); // effective 0.5 steps, clamped to 1
+        assert_eq!(stepper4.steps_per_rotation, 1);
+        assert_eq!(stepper4.step_distance, 40.0);
+    }
+
+
+    #[test]
     fn stepper_position_methods() {
-        let mut stepper = Stepper::new("test_stepper".to_string(), 0.01); // 1 step = 0.01mm
+        let mut stepper = Stepper::new("test_stepper".to_string(), DEFAULT_ROTATION_DISTANCE, DEFAULT_FULL_STEPS_PER_ROTATION, DEFAULT_MICROSTEPS, 1.0);
+        assert!((stepper.step_distance - DEFAULT_STEP_DISTANCE).abs() < 1e-9);
 
         // Initial state
-        assert_eq!(stepper.get_commanded_position_mm(), 0.0); // 0 * 0.01 - 0 = 0
+        assert_eq!(stepper.get_commanded_position_mm(), 0.0); // 0 * step_dist - 0 = 0
 
         // Simulate MCU reports stepper is at 1000 steps
         stepper.set_position_steps(1000);
@@ -370,7 +419,13 @@ mod tests {
 
 
     fn create_test_kinematics_with_step_dist() -> CartesianKinematics {
-        let stepper_config = || vec![("stepper".to_string(), DEFAULT_STEP_DISTANCE)];
+        let stepper_config = || vec![(
+            "stepper".to_string(),
+            DEFAULT_ROTATION_DISTANCE,
+            DEFAULT_FULL_STEPS_PER_ROTATION,
+            DEFAULT_MICROSTEPS,
+            1.0 // gear_ratio
+        )];
         CartesianKinematics::new(
             (stepper_config(), 0.0, 200.0, 0.0), // X rail
             (stepper_config(), 0.0, 200.0, 0.0), // Y rail
