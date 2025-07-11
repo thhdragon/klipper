@@ -473,10 +473,20 @@ impl<'a> ToolHead<'a> {
         let max_z_velocity = config.getfloat("printer", "max_z_velocity", Some(default_z_velo), Some(0.0), Some(max_velocity)).map_err(cfg_err)?;
         let max_z_accel = config.getfloat("printer", "max_z_accel", Some(default_z_accel), Some(0.0), Some(max_accel)).map_err(cfg_err)?;
 
-        let extruder_heater_name = config.get("extruder", "heater_name", Some("extruder")).unwrap_or_else(|_| "extruder".to_string());
-        let bed_heater_name = config.get("heater_bed", "heater_name", Some("heater_bed")).unwrap_or_else(|_| "heater_bed".to_string());
+        let extruder_heater_name = config.get("extruder", "heater_name", Some("extruder".to_string())).unwrap_or_else(|_| "extruder".to_string());
+        let bed_heater_name = config.get("heater_bed", "heater_name", Some("heater_bed".to_string())).unwrap_or_else(|_| "heater_bed".to_string());
 
-        let fan_name = config.get("fan", "name", Some("part_cooling_fan")).unwrap_or_else(|_| "part_cooling_fan".to_string());
+        // Fan configuration
+        let fan_section_name = "fan"; // Assuming the primary part cooling fan is under [fan]
+        let fan_name = config.get(fan_section_name, "name", Some("part_cooling_fan".to_string()))
+            .unwrap_or_else(|_| "part_cooling_fan".to_string());
+        let fan_max_power = config.getfloat(fan_section_name, "max_power", Some(1.0), Some(0.0), Some(1.0))
+            .map_err(cfg_err)? as f32;
+        let fan_off_below = config.getfloat(fan_section_name, "off_below", Some(0.0), Some(0.0), Some(1.0))
+            .map_err(cfg_err)? as f32;
+        let fan_kick_start_time = config.getfloat(fan_section_name, "kick_start_time", Some(0.1), Some(0.0), None)
+            .map_err(cfg_err)? as f32;
+
 
         let mut toolhead = ToolHead {
             reactor: reactor_ref,
@@ -503,12 +513,12 @@ impl<'a> ToolHead<'a> {
             kin_flush_times: Vec::new(),
             trapq: TrapQ::new_for_test(),
             flush_trapqs: vec![TrapQ::new_for_test()],
-            extruder_heater: Heater::new(extruder_heater_name),
-            bed_heater: Heater::new(bed_heater_name),
+            extruder_heater: Heater::new(extruder_heater_name), // TODO: Pass min/max temp from config
+            bed_heater: Heater::new(bed_heater_name),     // TODO: Pass min/max temp from config
             x_endstop: Endstop::new("x_endstop".to_string(), x_pos_endstop),
             y_endstop: Endstop::new("y_endstop".to_string(), y_pos_endstop),
             z_endstop: Endstop::new("z_endstop".to_string(), z_pos_endstop),
-            part_cooling_fan: Fan::new(fan_name),
+            part_cooling_fan: Fan::new(fan_name, fan_max_power, fan_off_below, fan_kick_start_time),
             kin: Box::new(CartesianKinematics::new(
                 x_rail_config.clone(), y_rail_config.clone(), z_rail_config.clone(), max_z_velocity, max_z_accel
             )),

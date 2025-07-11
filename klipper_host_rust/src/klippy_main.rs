@@ -113,6 +113,13 @@ max_temp: 280
     let gcode_lines = vec![
         "G28",                      // Home all axes
         "G90",                      // Absolute positioning
+        "M114",                     // Initial position after homing
+        "M104 S100",                // Set extruder temp to 100 (don't wait yet)
+        "M140 S50",                 // Set bed temp to 50 (don't wait yet)
+        "M190 S50",                 // Wait for bed to reach 50C
+        "M114",                     // Position after bed wait
+        "M109 S100",                // Wait for extruder to reach 100C
+        "M114",                     // Position after extruder wait
         "G1 X10 Y20 Z5 F3000",      // Move to X10 Y20 Z5
         "M82",                      // Absolute extrusion mode
         "G1 E10",                   // Extrude to E=10
