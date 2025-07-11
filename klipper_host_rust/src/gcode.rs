@@ -306,10 +306,35 @@ impl<'a> GCode<'a> {
         }
         self.state.gcode_offset = new_offsets;
         self.state.base_position = new_base_pos;
-        // Note: Klipper's ToolHead also has a set_position method which updates its internal commanded_pos.
-        // This might be needed here if G92 is to affect ToolHead's internal view of commanded_pos directly.
-        // For now, we only update GCode state. ToolHead's commanded_pos is updated by move_to.
-        // toolhead.set_position([new_base_pos.x.unwrap_or(0.0) - new_offsets.x.unwrap_or(0.0), ...])
+
+        // Determine which axes were explicitly mentioned in G92 for updating kinematics limits
+        let mut homed_axes_mask = [false; 3];
+        let mut g92_had_xyz_params = false;
+        if cmd.params.contains_key(&'X') { homed_axes_mask[0] = true; g92_had_xyz_params = true; }
+        if cmd.params.contains_key(&'Y') { homed_axes_mask[1] = true; g92_had_xyz_params = true; }
+        if cmd.params.contains_key(&'Z') { homed_axes_mask[2] = true; g92_had_xyz_params = true; }
+
+        // If G92 had no X, Y, or Z params, it resets all offsets.
+        // In this case, all axes are effectively having their coordinate system defined
+        // relative to the current machine position. So, mark all as "homed" for kinematics limits.
+        if !g92_had_xyz_params && cmd.params.is_empty() { // Check cmd.params.is_empty() to ensure it was a plain G92
+            homed_axes_mask = [true, true, true];
+        }
+        // If G92 E0 was issued, g92_had_xyz_params would be false, but cmd.params wouldn't be empty.
+        // In that case, we don't want to mark X,Y,Z as homed. So the mask remains [false,false,false].
+        // This seems correct: G92 E0 should not affect XYZ homed status.
+
+        // Prepare the full new G-code position for ToolHead
+        let th_new_pos = [
+            self.state.base_position.x.unwrap_or(0.0), // Default to 0 if not set, though G92 usually sets them
+            self.state.base_position.y.unwrap_or(0.0),
+            self.state.base_position.z.unwrap_or(0.0),
+            self.state.base_position.e.unwrap_or(0.0),
+        ];
+
+        // Inform ToolHead and Kinematics about the new G-code coordinate system definition
+        toolhead.set_position(th_new_pos, Some(homed_axes_mask));
+
         Ok(())
     }
 
@@ -1039,6 +1064,87 @@ mod tests {
         assert_eq!(th_pos[1], toolhead::Y_GCODE_POSITION_AFTER_HOMING);
         assert_eq!(th_pos[2], 5.0);  // Z unchanged
     }
+
+    #[test]
+    fn test_cmd_g92_updates_kinematics_limits() {
+        let mut gcode = create_test_gcode();
+        let mut toolhead = create_test_toolhead();
+
+        // Initial state: machine and gcode pos are 10,10,10. No offsets. Kinematics unhomed.
+        gcode.state.last_position = Coord::new(Some(10.0), Some(10.0), Some(10.0), Some(0.0));
+        gcode.state.base_position = Coord::new(Some(10.0), Some(10.0), Some(10.0), Some(0.0));
+        gcode.state.gcode_offset = Coord::new(Some(0.0), Some(0.0), Some(0.0), Some(0.0));
+
+        // Verify initial kinematics limits are unhomed
+        // Accessing kin directly for test inspection. This is a bit of a hack.
+        // In a real scenario, we might have a get_kinematics_status method.
+        let initial_kin_limits = {
+            let kin_ref = toolhead.get_kinematics_ref_for_test(); // Needs a temporary getter
+            [kin_ref.limits[0], kin_ref.limits[1], kin_ref.limits[2]]
+        };
+        assert_eq!(initial_kin_limits[0], (1.0, -1.0));
+
+
+        // G92 X0 Y0: current machine pos (10,10) is now g-code (0,0)
+        // X offset = 10 - 0 = 10. Y offset = 10 - 0 = 10. Z offset unchanged.
+        // X and Y kinematics limits should be set to full range. Z should remain unhomed.
+        let cmd_g92_xy = gcode.parse_line("G92 X0 Y0").unwrap();
+        gcode.process_command(&cmd_g92_xy, &mut toolhead).unwrap();
+
+        assert_eq!(gcode.state.gcode_offset.x, Some(10.0));
+        assert_eq!(gcode.state.gcode_offset.y, Some(10.0));
+        assert_eq!(gcode.state.gcode_offset.z, Some(0.0)); // Z offset unchanged
+        assert_eq!(gcode.state.base_position.x, Some(0.0));
+        assert_eq!(gcode.state.base_position.y, Some(0.0));
+        assert_eq!(gcode.state.base_position.z, Some(10.0)); // Z base_pos unchanged
+
+        let kin_limits_after_g92xy = {
+            let kin_ref = toolhead.get_kinematics_ref_for_test();
+            [kin_ref.limits[0], kin_ref.limits[1], kin_ref.limits[2]]
+        };
+        assert_eq!(kin_limits_after_g92xy[0], (0.0, 200.0)); // X homed/defined
+        assert_eq!(kin_limits_after_g92xy[1], (0.0, 200.0)); // Y homed/defined
+        assert_eq!(kin_limits_after_g92xy[2], (1.0, -1.0));  // Z still unhomed
+
+
+        // G92 (no params): Reset all offsets. Current machine pos (10,10,10) becomes g-code (10,10,10).
+        // All axes (X,Y,Z) should now have their kinematics limits set to full range.
+        let cmd_g92_none = gcode.parse_line("G92").unwrap();
+        gcode.process_command(&cmd_g92_none, &mut toolhead).unwrap();
+
+        assert_eq!(gcode.state.gcode_offset, Coord::new(Some(0.0),Some(0.0),Some(0.0),Some(0.0))); // All offsets 0
+        assert_eq!(gcode.state.base_position, gcode.state.last_position); // Base = machine pos
+
+        let kin_limits_after_g92_none = {
+            let kin_ref = toolhead.get_kinematics_ref_for_test();
+            [kin_ref.limits[0], kin_ref.limits[1], kin_ref.limits[2]]
+        };
+        assert_eq!(kin_limits_after_g92_none[0], (0.0, 200.0));
+        assert_eq!(kin_limits_after_g92_none[1], (0.0, 200.0));
+        assert_eq!(kin_limits_after_g92_none[2], (0.0, 180.0)); // Z now also defined
+
+
+        // G92 E0: Only E offset should change. X,Y,Z kin limits should remain as they were.
+        gcode.state.last_position.e = Some(50.0); // Simulate machine E pos
+        gcode.state.base_position.e = Some(50.0);  // Gcode E pos
+        gcode.state.gcode_offset.e = Some(0.0);   // E offset
+
+        let cmd_g92_e0 = gcode.parse_line("G92 E0").unwrap();
+        gcode.process_command(&cmd_g92_e0, &mut toolhead).unwrap();
+
+        assert_eq!(gcode.state.gcode_offset.e, Some(50.0)); // E offset = 50 - 0 = 50
+        assert_eq!(gcode.state.base_position.e, Some(0.0));
+
+        let kin_limits_after_g92_e0 = {
+            let kin_ref = toolhead.get_kinematics_ref_for_test();
+            [kin_ref.limits[0], kin_ref.limits[1], kin_ref.limits[2]]
+        };
+        // Kinematics limits for X,Y,Z should be unchanged by G92 E0
+        assert_eq!(kin_limits_after_g92_e0[0], (0.0, 200.0));
+        assert_eq!(kin_limits_after_g92_e0[1], (0.0, 200.0));
+        assert_eq!(kin_limits_after_g92_e0[2], (0.0, 180.0));
+    }
+
 
     // Tests for M82/M83
     #[test]
