@@ -183,6 +183,8 @@ impl<'a> GCode<'a> {
             'M' => match cmd.command_number as i32 {
                 82 => self.cmd_m82(cmd),
                 83 => self.cmd_m83(cmd),
+                104 => self.cmd_m104(cmd, toolhead),
+                140 => self.cmd_m140(cmd, toolhead),
                 // TODO: Add other M-codes
                 _ => Err(CommandError(format!("Unknown M-code: M{}", cmd.command_number))),
             },
@@ -408,6 +410,26 @@ impl<'a> GCode<'a> {
         let delay_s = delay_ms / 1000.0;
 
         toolhead.dwell(delay_s).map_err(|e| CommandError(e))?; // Assuming toolhead.dwell might return Result in future
+        Ok(())
+    }
+
+    // M104: Set Extruder Temperature (and continue)
+    fn cmd_m104(&mut self, cmd: &GCodeCommand, toolhead: &mut ToolHead<'a>) -> Result<(), CommandError> {
+        let target_temp = self.get_float_param_opt(&cmd.params, 'S')
+            .ok_or_else(|| CommandError("Missing S (temperature) parameter for M104".to_string()))?;
+
+        // TODO: Handle T parameter for selecting extruder if multiple extruders are supported.
+        // For now, assume the primary extruder.
+        toolhead.extruder_heater.set_target_temp(target_temp);
+        Ok(())
+    }
+
+    // M140: Set Bed Temperature (and continue)
+    fn cmd_m140(&mut self, cmd: &GCodeCommand, toolhead: &mut ToolHead<'a>) -> Result<(), CommandError> {
+        let target_temp = self.get_float_param_opt(&cmd.params, 'S')
+            .ok_or_else(|| CommandError("Missing S (temperature) parameter for M140".to_string()))?;
+
+        toolhead.bed_heater.set_target_temp(target_temp);
         Ok(())
     }
 }
@@ -1049,5 +1071,56 @@ mod tests {
          assert!((toolhead.get_last_move_time() - expected_print_time).abs() < 1e-9,
                 "Toolhead print_time should advance by 0.05s for G4 P50 S2. Expected {}, got {}",
                 expected_print_time, toolhead.get_last_move_time());
+    }
+
+    // Tests for M104 / M140
+    #[test]
+    fn test_cmd_m104_set_extruder_temp() {
+        let mut gcode = create_test_gcode();
+        let mut toolhead = create_test_toolhead();
+
+        let cmd_m104 = gcode.parse_line("M104 S210.5").unwrap();
+        gcode.process_command(&cmd_m104, &mut toolhead).unwrap();
+        assert_eq!(toolhead.extruder_heater.target_temp, 210.5);
+
+        // Test setting to 0
+        let cmd_m104_off = gcode.parse_line("M104 S0").unwrap();
+        gcode.process_command(&cmd_m104_off, &mut toolhead).unwrap();
+        assert_eq!(toolhead.extruder_heater.target_temp, 0.0);
+    }
+
+    #[test]
+    fn test_cmd_m104_missing_s_param() {
+        let mut gcode = create_test_gcode();
+        let mut toolhead = create_test_toolhead();
+        let cmd_m104_no_s = gcode.parse_line("M104").unwrap();
+        let result = gcode.process_command(&cmd_m104_no_s, &mut toolhead);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), CommandError("Missing S (temperature) parameter for M104".to_string()));
+    }
+
+    #[test]
+    fn test_cmd_m140_set_bed_temp() {
+        let mut gcode = create_test_gcode();
+        let mut toolhead = create_test_toolhead();
+
+        let cmd_m140 = gcode.parse_line("M140 S100.0").unwrap();
+        gcode.process_command(&cmd_m140, &mut toolhead).unwrap();
+        assert_eq!(toolhead.bed_heater.target_temp, 100.0);
+
+        // Test setting to 0
+        let cmd_m140_off = gcode.parse_line("M140 S0").unwrap();
+        gcode.process_command(&cmd_m140_off, &mut toolhead).unwrap();
+        assert_eq!(toolhead.bed_heater.target_temp, 0.0);
+    }
+
+    #[test]
+    fn test_cmd_m140_missing_s_param() {
+        let mut gcode = create_test_gcode();
+        let mut toolhead = create_test_toolhead();
+        let cmd_m140_no_s = gcode.parse_line("M140").unwrap();
+        let result = gcode.process_command(&cmd_m140_no_s, &mut toolhead);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), CommandError("Missing S (temperature) parameter for M140".to_string()));
     }
 }

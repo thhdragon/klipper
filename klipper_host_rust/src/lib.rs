@@ -24,6 +24,7 @@ pub mod msgproto;
 // pub mod trapq; // Added trapq module - Commented out due to compilation errors
 pub mod itersolve; // Added itersolve module
 pub mod stepcompress; // Added stepcompress module
+pub mod heaters;      // Added heaters module
 
 // Declare module for the kinematics subdirectory
 pub mod kinematics;

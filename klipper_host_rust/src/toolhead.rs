@@ -4,6 +4,7 @@
 use crate::configfile::Configfile;
 use crate::mcu::Mcu;
 use crate::reactor::Reactor;
+use crate::heaters::Heater; // Import the Heater struct
 // TODO: Add imports for Kinematics, TrapQ, etc. once their Rust structures are clearer.
 use crate::trapq::TrapQ; // Assuming trapq.rs provides this
 // use crate::kinematics::Kinematics; // Placeholder
@@ -409,6 +410,10 @@ pub struct ToolHead<'a> {
 
     kin: Box<dyn Kinematics>,
     extra_axes: Vec<Box<dyn ExtraAxis>>,
+
+    // Heaters
+    pub extruder_heater: Heater, // Assuming one extruder for now
+    pub bed_heater: Heater,
 }
 
 // Basic trait definitions - these would likely be in their own modules
@@ -470,6 +475,8 @@ impl<'a> ToolHead<'a> {
             clear_history_time: 0.0,
             kin_flush_delay: 0.001, // SDS_CHECK_TIME
             kin_flush_times: Vec::new(),
+            extruder_heater: Heater::new("extruder".to_string()), // Initialize extruder heater
+            bed_heater: Heater::new("heater_bed".to_string()),     // Initialize bed heater
             // Initialize other fields, possibly with defaults or placeholders
         };
 

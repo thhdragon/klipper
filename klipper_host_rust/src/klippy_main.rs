@@ -89,6 +89,11 @@ pub fn klippy_main() {
         "G28 Y",                    // Re-home Y
         "G1 Y15",                   // Move Y to 15 (should be machine 15, gcode 15)
         "G4 P100",                  // Dwell for 100 milliseconds
+        "M104 S205",                // Set extruder temp to 205C
+        "M140 S60",                 // Set bed temp to 60C
+        "G1 X10 Y10 Z10 F1200",     // Another move
+        "M104 S0",                  // Turn off extruder
+        "M140 S0",                  // Turn off bed
         "INVALID GCODE",            // Test error handling
         "G1 X10000",                // Test potential toolhead error (if limits were enforced)
     ];
@@ -103,6 +108,9 @@ pub fn klippy_main() {
                         println!("Command executed successfully.");
                         println!("Current GCode State: {:?}", gcode_processor.state);
                         println!("ToolHead Position: {:?}", toolhead.get_position());
+                        println!("Extruder Target Temp: {:.1}°C, Bed Target Temp: {:.1}°C",
+                                 toolhead.extruder_heater.target_temp,
+                                 toolhead.bed_heater.target_temp);
                     }
                     Err(e) => {
                         eprintln!("Error executing command '{}': {}", line_str, e);
