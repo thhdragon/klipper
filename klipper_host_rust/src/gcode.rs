@@ -184,6 +184,8 @@ impl<'a> GCode<'a> {
                 82 => self.cmd_m82(cmd),
                 83 => self.cmd_m83(cmd),
                 104 => self.cmd_m104(cmd, toolhead),
+                106 => self.cmd_m106(cmd, toolhead),
+                107 => self.cmd_m107(cmd, toolhead),
                 109 => self.cmd_m109(cmd, toolhead),
                 114 => self.cmd_m114(cmd, toolhead),
                 140 => self.cmd_m140(cmd, toolhead),
@@ -609,6 +611,29 @@ impl<'a> GCode<'a> {
         // Since toolhead.commanded_pos and gcode.state.base_position should be in sync
         // regarding G-code coordinates, we can omit the "Count" part for now or add it later
         // if we differentiate between toolhead's view and gcode_move's internal view.
+        Ok(())
+    }
+
+    // M106: Set Fan Speed
+    fn cmd_m106(&mut self, cmd: &GCodeCommand, toolhead: &mut ToolHead<'a>) -> Result<(), CommandError> {
+        // Klipper's M106 S<value> uses value from 0-255. Default is 255 if S is not specified.
+        let s_value = self.get_float_param_opt(&cmd.params, 'S').unwrap_or(255.0);
+
+        if s_value < 0.0 || s_value > 255.0 {
+            return Err(CommandError(format!(
+                "M106 S value {:.1} out of range (0-255)",
+                s_value
+            )));
+        }
+
+        let speed_ratio = s_value / 255.0;
+        toolhead.part_cooling_fan.set_speed(speed_ratio as f32);
+        Ok(())
+    }
+
+    // M107: Fan Off
+    fn cmd_m107(&mut self, _cmd: &GCodeCommand, toolhead: &mut ToolHead<'a>) -> Result<(), CommandError> {
+        toolhead.part_cooling_fan.turn_off();
         Ok(())
     }
 }

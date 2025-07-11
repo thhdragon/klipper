@@ -416,6 +416,9 @@ pub struct ToolHead<'a> {
     x_endstop: Endstop,
     y_endstop: Endstop,
     z_endstop: Endstop,
+
+    // Fans
+    pub part_cooling_fan: Fan,
 }
 
 pub trait Kinematics {
@@ -513,13 +516,21 @@ impl<'a> ToolHead<'a> {
             x_endstop: Endstop::new("x_endstop".to_string(), x_pos_endstop), // Use configured endstop pos
             y_endstop: Endstop::new("y_endstop".to_string(), y_pos_endstop),
             z_endstop: Endstop::new("z_endstop".to_string(), z_pos_endstop),
-            kin: Box::new(CartesianKinematics::new( // Kinematics initialized below
+            part_cooling_fan: Fan::new(
+                config.get("fan", "name", Some("part_cooling_fan"))
+                    .unwrap_or_else(|_| "part_cooling_fan".to_string())
+            ),
+            kin: Box::new(CartesianKinematics::new(
                 x_rail_config.clone(), y_rail_config.clone(), z_rail_config.clone(), max_z_velocity, max_z_accel
             )),
         };
 
         toolhead._calc_junction_deviation();
 
+        // Re-assign kin with the fully configured one.
+        // The one in struct init was to satisfy the compiler for default_z_velo/accel.
+        // This is a bit awkward, could be refactored by deferring toolhead field assignments
+        // or passing more to CartesianKinematics::new directly from config.
         toolhead.kin = Box::new(CartesianKinematics::new(
             x_rail_config,
             y_rail_config,

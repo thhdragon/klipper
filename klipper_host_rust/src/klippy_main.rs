@@ -128,8 +128,10 @@ position_endstop: 0
         "M190 S70",                 // Set bed to 70 AND WAIT
         "M109 S200",                // Wait for extruder to reach 200 (should be quick if M104 was effective)
         "M114",                     // Check position before next move
+        "M106 S128",                // Set fan to 50%
         "G1 X20 Y20 Z20 F1000",     // Another move after temps are stable
         "M114",                     // Check position after move
+        "M107",                     // Turn fan off
         "G1 X250 F3000",            // Attempt to move X out of bounds (max 200) - AFTER HOMING
         "G1 Y-10 F3000",            // Attempt to move Y out of bounds (min 0) - AFTER HOMING
         "G1 Z181 F1000",            // Attempt to move Z out of bounds (max 180) - AFTER HOMING
@@ -156,6 +158,7 @@ position_endstop: 0
                         println!("Extruder Target Temp: {:.1}°C, Bed Target Temp: {:.1}°C",
                                  toolhead.extruder_heater.target_temp,
                                  toolhead.bed_heater.target_temp);
+                        println!("Part Cooling Fan Speed: {:.2}", toolhead.part_cooling_fan.speed);
                     }
                     Err(e) => {
                         eprintln!("Error executing command '{}': {}", line_str, e);
