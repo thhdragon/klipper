@@ -5,6 +5,7 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import math, logging
 import stepper, mathutil
+import chelper # For get_effector_normal
 
 # Slow moves once the ratio of tower to XY movement exceeds SLOW_RATIO
 SLOW_RATIO = 3.
@@ -242,7 +243,8 @@ class DeltaKinematics:
 
         carriage_heights = []
         for i in range(3):
-            sk = self.rails[i].get_steppers()[0].get_sk()
+            stepper_obj = self.rails[i].get_steppers()[0]
+            sk = stepper_obj._stepper_kinematics # Corrected attribute name
             h = ffi_lib.itersolve_calc_position_from_coord(
                 sk, nozzle_x, nozzle_y, nozzle_z
             )
@@ -323,6 +325,7 @@ class DeltaCalibration:
             self.radius_offsets = [0.0, 0.0, 0.0]
         else:
             self.radius_offsets = radius_offsets # List of 3 radius offsets
+        self.effector_joint_radius = effector_joint_radius # Store this attribute
 
         # Calculate the XY cartesian coordinates of the delta towers
         self.towers = []

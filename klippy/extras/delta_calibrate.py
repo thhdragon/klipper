@@ -154,13 +154,65 @@ class DeltaCalibrate:
                            "%.3f,%.3f,%.3f" % tuple(spos2))
     def probe_finalize(self, offsets, positions):
         # Convert positions into (z_offset, stable_position) pairs
-        z_offset = offsets[2]
-        kin = self.printer.lookup_object('toolhead').get_kinematics()
-        delta_params = kin.get_calibration()
-        probe_positions = [(z_offset, delta_params.calc_stable_position(p))
-                           for p in positions]
+        # offsets = (probe_x_offset, probe_y_offset, probe_z_offset_from_config)
+        # positions = list of (uncorrected_probe_tip_x, uncorrected_probe_tip_y, bed_z_at_that_xy)
+
+        probe_x_offset, probe_y_offset, probe_z_offset_config = offsets
+        toolhead = self.printer.lookup_object('toolhead')
+        kin = toolhead.get_kinematics()
+        delta_params = kin.get_calibration() # Current delta parameters
+
+        corrected_probe_positions_for_stable_calc = []
+        logging.info("Probe tilt compensation: Applying corrections...")
+
+        for i, (px_uncorrected, py_uncorrected, pz_bed) in enumerate(positions):
+            # Estimate nozzle XYZ at the moment of probe trigger
+            noz_x_at_trigger = px_uncorrected - probe_x_offset
+            noz_y_at_trigger = py_uncorrected - probe_y_offset
+            noz_z_at_trigger = pz_bed + probe_z_offset_config
+
+            nx, ny, nz = kin.get_effector_normal(noz_x_at_trigger, noz_y_at_trigger, noz_z_at_trigger)
+
+            x_displacement, y_displacement = 0.0, 0.0 # Initialize here
+            apply_tilt_xy_correction = True
+            # If probe_z_offset_config is very small (e.g. manual probing), skip XY correction part of tilt.
+            if abs(probe_z_offset_config) < 0.5: # Threshold for "negligible" Z offset, e.g., 0.5mm
+                apply_tilt_xy_correction = False
+                logging.debug(
+                    "Point %d: Probe Z offset (%.3f) is small, XY tilt correction heuristically skipped."
+                    % (i, probe_z_offset_config))
+
+            if apply_tilt_xy_correction and abs(nz) < 1e-6:
+                logging.warning("Probe tilt: Effector normal Z component is near zero (nz=%.3e) at point %d. Skipping XY tilt correction for this point." % (nz, i))
+                apply_tilt_xy_correction = False
+
+            if apply_tilt_xy_correction:
+                physical_probe_extension = -probe_z_offset_config
+                x_displacement = physical_probe_extension * (nx / nz)
+                y_displacement = physical_probe_extension * (ny / nz)
+                corrected_px = (noz_x_at_trigger + probe_x_offset) + x_displacement
+                corrected_py = (noz_y_at_trigger + probe_y_offset) + y_displacement
+            else:
+                # No XY correction applied (either due to small z_offset or vertical effector normal)
+                corrected_px = px_uncorrected
+                corrected_py = py_uncorrected
+
+                logging.debug(
+                    "Point %d: Nozzle(%.3f,%.3f,%.3f) UncorrectedProbe(%.3f,%.3f) Normal(%.3f,%.3f,%.3f) Disp(%.4f,%.4f) CorrectedProbe(%.3f,%.3f)" %
+                    (i, noz_x_at_trigger, noz_y_at_trigger, noz_z_at_trigger,
+                     px_uncorrected, py_uncorrected, nx, ny, nz,
+                     x_displacement, y_displacement, corrected_px, corrected_py))
+
+            corrected_probe_positions_for_stable_calc.append( (corrected_px, corrected_py, pz_bed) )
+
+        final_probe_data_for_calc = []
+        for (cpx, cpy, cpz_bed) in corrected_probe_positions_for_stable_calc:
+            stable_pos = delta_params.calc_stable_position( (cpx, cpy, cpz_bed) )
+            final_probe_data_for_calc.append( (cpz_bed, stable_pos) )
+
         # Perform analysis
-        self.calculate_params(probe_positions, self.last_distances)
+        self.calculate_params(final_probe_data_for_calc, self.last_distances)
+
     def calculate_params(self, probe_positions, distances):
         height_positions = self.manual_heights + probe_positions
         if not height_positions:
@@ -224,7 +276,7 @@ class DeltaCalibrate:
                     total_error += distance_error_sum
 
                 return total_error
-            except (ValueError, math.domain) as e: # Catch math errors if points are unreachable
+            except ValueError as e: # Catch math errors (like sqrt of negative) if points are unreachable
                 logging.debug("Math error in delta_errorfunc: %s with params %s" % (str(e), current_iter_params))
                 return float('inf') # Return a large error if params are invalid
             except Exception as e: # Catch any other unexpected error
