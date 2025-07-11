@@ -1,5 +1,5 @@
-#ifndef __GENERIC_GPIO_H
-#define __GENERIC_GPIO_H
+#ifndef __BOARD_GPIO_H
+#define __BOARD_GPIO_H
 
 #include <stdint.h> // uint8_t
 

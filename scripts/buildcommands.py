@@ -262,8 +262,10 @@ class HandleCommandGeneration:
         }
     def decl_command(self, req):
         funcname, flags, msgname = req.split()[1:4]
+        logging.debug("Processing DECL_COMMAND for msgname: '%s', funcname: '%s'", msgname, funcname)
         if msgname in self.commands:
-            error("Multiple definitions for command '%s'" % msgname)
+            logging.error("Existing commands before error: %s", str(self.commands))
+            error("Multiple definitions for command '%s'. Already registered by %s." % (msgname, self.commands[msgname][0]))
         self.commands[msgname] = (funcname, flags, msgname)
         msg = req.split(None, 3)[3]
         m = self.messages_by_name.get(msgname)
