@@ -6,11 +6,8 @@ use crate::configfile::Configfile;
 #[derive(Debug, Clone)]
 pub struct Endstop {
     pub name: String,
-    // pub pin_name: String, // For future hardware integration
-    pub triggered: bool,    // Conceptual state
-    pub trigger_position_machine: f64, // Machine coordinate where this endstop triggers
-    // pub pullup: bool, // For future hardware integration
-    // pub invert: bool, // For future hardware integration
+    pub triggered: bool,
+    pub trigger_position_machine: f64,
 }
 
 impl Endstop {
@@ -22,11 +19,7 @@ impl Endstop {
         }
     }
 
-    // Method to check if the endstop is triggered based on current machine position.
-    // In a real system, this would query hardware.
-    // For simulation, we compare current_machine_pos to trigger_position_machine.
-    // homing_positive_dir: true if homing towards positive coordinates for this axis.
-    #[allow(dead_code)] // Will be used by perform_homing_move
+    #[allow(dead_code)]
     fn is_triggered_by_pos(&self, current_machine_pos: f64, homing_positive_dir: bool) -> bool {
         if homing_positive_dir {
             current_machine_pos >= self.trigger_position_machine
@@ -36,42 +29,32 @@ impl Endstop {
     }
 }
 
-
 use crate::mcu::Mcu;
 use crate::reactor::Reactor;
-use crate::heaters::Heater; // Import the Heater struct
-use crate::kinematics::cartesian::CartesianKinematics; // Import CartesianKinematics
+use crate::heaters::Heater;
+use crate::kinematics::cartesian::CartesianKinematics;
 use crate::trapq::TrapQ;
-use crate::extras::fan::Fan; // Import Fan
+use crate::extras::fan::Fan;
 
-// Constants for default homing parameters
-// These would normally come from the config file.
-pub const DEFAULT_HOMING_SPEED: f64 = 25.0; // mm/s
-// Machine position where endstop triggers
+pub const DEFAULT_HOMING_SPEED: f64 = 25.0;
 pub const X_MACHINE_POSITION_AT_ENDSTOP: f64 = 0.0;
 pub const Y_MACHINE_POSITION_AT_ENDSTOP: f64 = 0.0;
 pub const Z_MACHINE_POSITION_AT_ENDSTOP: f64 = 0.0;
-// G-code position to set after homing (via G92 logic)
 pub const X_GCODE_POSITION_AFTER_HOMING: f64 = 0.0;
 pub const Y_GCODE_POSITION_AFTER_HOMING: f64 = 0.0;
 pub const Z_GCODE_POSITION_AFTER_HOMING: f64 = 0.0;
 
-
-// Common suffixes: _d is distance (in mm), _v is velocity (in
-//   mm/second), _v2 is velocity squared (mm^2/s^2), _t is time (in
-//   seconds), _r is ratio (scalar between 0.0 and 1.0)
-
 #[derive(Debug, Clone)]
 pub struct Move {
-    pub start_pos: [f64; 4], // [x, y, z, e]
-    pub end_pos: [f64; 4],   // [x, y, z, e]
+    pub start_pos: [f64; 4],
+    pub end_pos: [f64; 4],
     pub accel: f64,
     pub junction_deviation: f64,
     pub is_kinematic_move: bool,
-    pub axes_d: [f64; 4], // [dx, dy, dz, de]
-    pub move_d: f64,      // distance of XYZ move
-    pub axes_r: [f64; 4], // unit vector of move [rx, ry, rz, re]
-    pub min_move_t: f64,  // minimum time to complete this move
+    pub axes_d: [f64; 4],
+    pub move_d: f64,
+    pub axes_r: [f64; 4],
+    pub min_move_t: f64,
 
     pub max_start_v2: f64,
     pub max_cruise_v2: f64,
@@ -377,8 +360,8 @@ const SDS_CHECK_TIME: f64 = 0.001;
 const MOVE_HISTORY_EXPIRE: f64 = 30.0;
 
 pub struct ToolHead<'a> {
-    reactor: &'a Reactor, // Made reactor immutable as ToolHead doesn't own/mutate Reactor's list of timers/fds
-    printer: &'a dyn PrinterUtility, // Reference to printer for error handling, event sending
+    reactor: &'a Reactor,
+    printer: &'a dyn PrinterUtility,
     all_mcus: Vec<&'a Mcu>,
     mcu: &'a Mcu,
     pub lookahead: LookAheadQueue,
@@ -407,7 +390,7 @@ pub struct ToolHead<'a> {
     trapq: TrapQ,
     flush_trapqs: Vec<TrapQ>,
 
-    pub kin: Box<dyn Kinematics>, // Changed to pub for test access
+    pub kin: Box<dyn Kinematics>,
     extra_axes: Vec<Box<dyn ExtraAxis>>,
 
     pub extruder_heater: Heater,
@@ -424,6 +407,8 @@ pub struct ToolHead<'a> {
 pub trait Kinematics {
     fn check_move(&self, move_params: &mut Move) -> Result<(), String>;
     fn set_kinematics_position(&mut self, new_pos: &[f64; 3], homed_axes_mask: [bool; 3]);
+    fn calc_position_from_steppers(&self) -> Result<[f64; 3], String>;
+    fn set_steppers_to_gcode_target(&mut self, target_gcode_pos: [f64;3]) -> Result<(), String>; // Added for simulation
     #[cfg(test)]
     fn get_axis_limits_for_test(&self) -> [(f64, f64); 3];
 }
@@ -442,7 +427,6 @@ impl<'a> ToolHead<'a> {
         printer_ref: &'a dyn PrinterUtility,
         mcus_list: Vec<&'a Mcu>,
     ) -> Result<Self, String> {
-        // Convert ConfigError to String for now, could be more specific later
         let cfg_err = |e: configfile::ConfigError| e.to_string();
 
         let max_velocity = config.getfloat("printer", "max_velocity", None, Some(0.0), None).map_err(cfg_err)?;
@@ -450,41 +434,49 @@ impl<'a> ToolHead<'a> {
 
         let mut min_cruise_ratio = config.getfloat("printer", "minimum_cruise_ratio", Some(0.5), Some(0.0), Some(1.0))
             .map_err(cfg_err)?;
-        // Klipper's logic for deprecated max_accel_to_decel
-        if config.get_str("printer", "minimum_cruise_ratio").is_err() { // if minimum_cruise_ratio was not set
+        if config.get_str("printer", "minimum_cruise_ratio").is_err() {
             if let Ok(req_accel_to_decel) = config.getfloat("printer", "max_accel_to_decel", None, Some(0.0), None) {
-                // TODO: printer_ref.deprecate("max_accel_to_decel")
                 min_cruise_ratio = 1.0 - (req_accel_to_decel / max_accel).min(1.0);
             }
         }
         let square_corner_velocity = config.getfloat("printer", "square_corner_velocity", Some(5.0), Some(0.0), None).map_err(cfg_err)?;
 
-        // Kinematics parameters from config
         let x_pos_min = config.getfloat("stepper_x", "position_min", Some(0.0), None, None).map_err(cfg_err)?;
         let x_pos_max = config.getfloat("stepper_x", "position_max", None, Some(x_pos_min), None).map_err(cfg_err)?;
         let x_pos_endstop = config.getfloat("stepper_x", "position_endstop", Some(0.0), None, None).map_err(cfg_err)?;
-        // TODO: Get stepper names if multiple steppers per rail, for now assume "stepper_x"
-        let x_rail_config = (vec!["stepper_x".to_string()], x_pos_min, x_pos_max, x_pos_endstop);
+        let x_rail_stepper_configs = vec![(
+            config.get("stepper_x", "name", Some("stepper_x".to_string())).unwrap_or_else(|_| "stepper_x".to_string()),
+            config.getfloat("stepper_x", "step_distance", Some(DEFAULT_STEP_DISTANCE), Some(0.0), None).map_err(cfg_err)?
+        )];
+        let x_rail_config = (x_rail_stepper_configs, x_pos_min, x_pos_max, x_pos_endstop);
 
         let y_pos_min = config.getfloat("stepper_y", "position_min", Some(0.0), None, None).map_err(cfg_err)?;
         let y_pos_max = config.getfloat("stepper_y", "position_max", None, Some(y_pos_min), None).map_err(cfg_err)?;
         let y_pos_endstop = config.getfloat("stepper_y", "position_endstop", Some(0.0), None, None).map_err(cfg_err)?;
-        let y_rail_config = (vec!["stepper_y".to_string()], y_pos_min, y_pos_max, y_pos_endstop);
+        let y_rail_stepper_configs = vec![(
+            config.get("stepper_y", "name", Some("stepper_y".to_string())).unwrap_or_else(|_| "stepper_y".to_string()),
+            config.getfloat("stepper_y", "step_distance", Some(DEFAULT_STEP_DISTANCE), Some(0.0), None).map_err(cfg_err)?
+        )];
+        let y_rail_config = (y_rail_stepper_configs, y_pos_min, y_pos_max, y_pos_endstop);
 
         let z_pos_min = config.getfloat("stepper_z", "position_min", Some(0.0), None, None).map_err(cfg_err)?;
         let z_pos_max = config.getfloat("stepper_z", "position_max", None, Some(z_pos_min), None).map_err(cfg_err)?;
         let z_pos_endstop = config.getfloat("stepper_z", "position_endstop", Some(0.0), None, None).map_err(cfg_err)?;
-        let z_rail_config = (vec!["stepper_z".to_string()], z_pos_min, z_pos_max, z_pos_endstop);
+        let z_rail_stepper_configs = vec![(
+            config.get("stepper_z", "name", Some("stepper_z".to_string())).unwrap_or_else(|_| "stepper_z".to_string()),
+            config.getfloat("stepper_z", "step_distance", Some(DEFAULT_STEP_DISTANCE), Some(0.0), None).map_err(cfg_err)?
+        )];
+        let z_rail_config = (z_rail_stepper_configs, z_pos_min, z_pos_max, z_pos_endstop);
 
-        let default_z_velo = max_velocity / 20.0; // Default if not specified
-        let default_z_accel = max_accel / 20.0;   // Default if not specified
+        let default_z_velo = max_velocity / 20.0;
+        let default_z_accel = max_accel / 20.0;
         let max_z_velocity = config.getfloat("printer", "max_z_velocity", Some(default_z_velo), Some(0.0), Some(max_velocity)).map_err(cfg_err)?;
         let max_z_accel = config.getfloat("printer", "max_z_accel", Some(default_z_accel), Some(0.0), Some(max_accel)).map_err(cfg_err)?;
 
-        // Heater names (could also come from config if sections are named differently)
         let extruder_heater_name = config.get("extruder", "heater_name", Some("extruder")).unwrap_or_else(|_| "extruder".to_string());
         let bed_heater_name = config.get("heater_bed", "heater_name", Some("heater_bed")).unwrap_or_else(|_| "heater_bed".to_string());
 
+        let fan_name = config.get("fan", "name", Some("part_cooling_fan")).unwrap_or_else(|_| "part_cooling_fan".to_string());
 
         let mut toolhead = ToolHead {
             reactor: reactor_ref,
@@ -513,13 +505,10 @@ impl<'a> ToolHead<'a> {
             flush_trapqs: vec![TrapQ::new_for_test()],
             extruder_heater: Heater::new(extruder_heater_name),
             bed_heater: Heater::new(bed_heater_name),
-            x_endstop: Endstop::new("x_endstop".to_string(), x_pos_endstop), // Use configured endstop pos
+            x_endstop: Endstop::new("x_endstop".to_string(), x_pos_endstop),
             y_endstop: Endstop::new("y_endstop".to_string(), y_pos_endstop),
             z_endstop: Endstop::new("z_endstop".to_string(), z_pos_endstop),
-            part_cooling_fan: Fan::new(
-                config.get("fan", "name", Some("part_cooling_fan"))
-                    .unwrap_or_else(|_| "part_cooling_fan".to_string())
-            ),
+            part_cooling_fan: Fan::new(fan_name),
             kin: Box::new(CartesianKinematics::new(
                 x_rail_config.clone(), y_rail_config.clone(), z_rail_config.clone(), max_z_velocity, max_z_accel
             )),
@@ -527,10 +516,6 @@ impl<'a> ToolHead<'a> {
 
         toolhead._calc_junction_deviation();
 
-        // Re-assign kin with the fully configured one.
-        // The one in struct init was to satisfy the compiler for default_z_velo/accel.
-        // This is a bit awkward, could be refactored by deferring toolhead field assignments
-        // or passing more to CartesianKinematics::new directly from config.
         toolhead.kin = Box::new(CartesianKinematics::new(
             x_rail_config,
             y_rail_config,
@@ -539,11 +524,6 @@ impl<'a> ToolHead<'a> {
             max_z_accel,
         ));
 
-        // Placeholder for ExtraAxis (e.g. extruder)
-        // Klipper's ToolHead initializes self.extra_axes = [extruder.DummyExtruder(self.printer)]
-        // then loads actual extruder from config:
-        // self.printer.load_object(config, 'extruder')
-        // For now, keep it simple:
         struct PlaceholderExtraAxis;
         impl ExtraAxis for PlaceholderExtraAxis {
             fn check_move(&self, _move_params: &Move, _axis_index: usize) -> Result<(), String> { Ok(()) }
@@ -719,7 +699,7 @@ impl<'a> ToolHead<'a> {
     }
 
     pub fn move_to(&mut self, newpos: [f64; 4], speed: f64) -> Result<(), String> {
-        let mut move_instance = Move::new( // Make mutable to pass to check_move
+        let mut move_instance = Move::new(
             self.max_accel,
             self.junction_deviation,
             self.max_velocity,
@@ -734,7 +714,7 @@ impl<'a> ToolHead<'a> {
         }
 
         if move_instance.is_kinematic_move {
-            self.kin.check_move(&mut move_instance)?; // Pass mutable
+            self.kin.check_move(&mut move_instance)?;
         }
 
         for (e_index, ea) in self.extra_axes.iter().enumerate() {
@@ -755,58 +735,50 @@ impl<'a> ToolHead<'a> {
     pub fn dwell(&mut self, delay: f64) -> Result<(), String> {
         let next_print_time = self.get_last_move_time() + delay.max(0.0);
         self._advance_move_time(next_print_time);
-        // self._check_pause(); // _check_pause is complex, deferring full port
         Ok(())
     }
 
     pub fn wait_moves(&mut self) {
         self._flush_lookahead();
-        // let eventtime = self.reactor.monotonic();
-        // while (not self.special_queuing_state
-        //        or self.print_time >= self.mcu.estimated_print_time(eventtime)):
-        //     if not self.can_pause:
-        //         break
-        //     eventtime = self.reactor.pause(eventtime + 0.100)
-        // Simplified wait: Klipper's wait_moves ensures command queue is empty.
-        // For simulation, flushing lookahead is the main part.
-        // True MCU queue wait would involve reactor and mcu.estimated_print_time.
         println!("ToolHead: wait_moves called (lookahead flushed).");
     }
 
-    // Placeholder for printer object interaction
-    // This would live in a Printer struct that owns ToolHead
-    // For now, ToolHead needs a way to signal events or errors.
-    // We pass in a trait object for this.
-    // pub fn send_event(&self, event: &str) {
-    //     self.printer.send_event(event);
-    // }
-    // pub fn command_error(&self, msg: &str) -> String {
-    //    self.printer.command_error(msg)
-    // }
+    // Temporary method for testing/verification in klippy_main.rs
+    pub fn get_kinematics_calculated_position(&self) -> Result<[f64; 3], String> {
+        self.kin.calc_position_from_steppers()
+    }
+
+    // Temporary method for testing/verification to simulate steppers reaching a G-code target
+    pub fn move_kinematics_steppers_to_gcode_target(&mut self, target_gcode_pos: [f64;3]) -> Result<(), String> {
+        // This method requires CartesianKinematics to have set_steppers_to_gcode_target
+        // We need to downcast or add it to the trait. For now, let's assume it's on the trait
+        // or handle the downcast here if self.kin was &mut dyn Kinematics.
+        // Since self.kin is Box<dyn Kinematics>, we need to be careful.
+        // For simplicity, if we know it's Cartesian, we could downcast.
+        // However, a cleaner way would be for the Kinematics trait to have this.
+        // Let's assume we add `set_steppers_to_gcode_target` to the Kinematics trait for now.
+        self.kin.set_steppers_to_gcode_target(target_gcode_pos)
+    }
 }
 
-// Define a trait for printer utility functions ToolHead might need
 pub trait PrinterUtility {
-    fn send_event(&self, event: &str, עוד_params: String); // Simplified
-    // fn command_error(&self, msg: &str) -> String; // This might be better handled by Result types
+    fn send_event(&self, event: &str, params_str: String);
 }
 
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::configfile::Configfile; // Ensure Configfile is in scope for tests
-    use crate::reactor::Reactor;       // Ensure Reactor is in scope
-    use crate::mcu::Mcu;               // Ensure Mcu is in scope
+    use crate::configfile::Configfile;
+    use crate::reactor::Reactor;
+    use crate::mcu::Mcu;
 
-    // Mock PrinterUtility for ToolHead tests
     struct MockPrinterUtility;
     impl PrinterUtility for MockPrinterUtility {
         fn send_event(&self, event: &str, _params: String) {
             println!("MockPrinterUtility: Event: {}", event);
         }
     }
-     // Minimal Reactor for ToolHead instantiation
     struct MockReactor;
     impl Reactor for MockReactor {
         fn monotonic(&self) -> f64 { 0.0 }
@@ -814,24 +786,20 @@ mod tests {
         fn register_fd(&mut self, _fd: i32, _callback: Box<dyn FnMut(f64)>) -> usize {0}
         fn unregister_fd(&mut self, _handle_id: usize) {}
         fn unregister_timer(&mut self, _handle_id: usize) {}
-        fn is_shutdown(&self) -> bool {false} // Important for M109/M190 tests
+        fn is_shutdown(&self) -> bool {false}
         fn run(&mut self) {}
-        fn pause(&mut self, _waketime: f64) {} // Not used by current tests directly in toolhead
+        fn pause(&mut self, _waketime: f64) {}
         fn _check_timers(&mut self, _eventtime: f64, _idle: bool) {}
     }
-     // Minimal Mcu for ToolHead instantiation
     struct MockMcu;
     impl Mcu for MockMcu {
         fn estimated_print_time(&self, _curtime: f64) -> f64 {0.0}
     }
 
-
-    // Helper for float comparisons
     fn approx_eq(a: f64, b: f64, epsilon: f64) -> bool {
         (a - b).abs() < epsilon
     }
 
-    // Mock ExtraAxis for testing Move::calc_junction if needed later
     struct MockExtraAxis;
     impl ExtraAxis for MockExtraAxis {
         fn check_move(&self, _move_params: &Move, _axis_index: usize) -> Result<(), String> { Ok(()) }
@@ -846,13 +814,33 @@ mod tests {
     const DEFAULT_MAX_VELOCITY: f64 = 500.0;
     const DEFAULT_MAX_ACCEL_TO_DECEL: f64 = DEFAULT_MAX_ACCEL / 2.0;
 
-    // Helper to create ToolHead for tests
     fn create_test_toolhead_with_reactor_printer() -> (ToolHead<'static>, Box<MockReactor>, Box<MockPrinterUtility>) {
         let mut config = Configfile::new(None);
         config.add_section("printer");
         config.set("printer", "max_velocity", &DEFAULT_MAX_VELOCITY.to_string());
         config.set("printer", "max_accel", &DEFAULT_MAX_ACCEL.to_string());
         config.set("printer", "square_corner_velocity", &"5.0".to_string());
+        // Add stepper configs for kinematics initialization
+        config.add_section("stepper_x");
+        config.set("stepper_x", "position_min", "0");
+        config.set("stepper_x", "position_max", "200");
+        config.set("stepper_x", "position_endstop", "0");
+        config.set("stepper_x", "step_distance", "0.0125");
+
+
+        config.add_section("stepper_y");
+        config.set("stepper_y", "position_min", "0");
+        config.set("stepper_y", "position_max", "200");
+        config.set("stepper_y", "position_endstop", "0");
+        config.set("stepper_y", "step_distance", "0.0125");
+
+
+        config.add_section("stepper_z");
+        config.set("stepper_z", "position_min", "0");
+        config.set("stepper_z", "position_max", "180");
+        config.set("stepper_z", "position_endstop", "0");
+        config.set("stepper_z", "step_distance", "0.0025");
+
 
         let reactor = Box::new(MockReactor);
         let printer_util = Box::new(MockPrinterUtility);
@@ -864,10 +852,6 @@ mod tests {
 
         let th = ToolHead::new(&config, static_reactor, static_printer_util, vec![static_mcu]).unwrap();
 
-        // Return owned reactor and printer_util so they live as long as toolhead if needed,
-        // though for these tests ToolHead only has refs. This is more for pattern.
-        // For this test setup, static_reactor and static_printer_util are 'static.
-        // The returned Boxes are just to show ownership transfer if they weren't leaked.
         (th, Box::new(MockReactor), Box::new(MockPrinterUtility))
     }
 
@@ -895,7 +879,7 @@ mod tests {
     #[test]
     fn test_move_new_extrude_only_move() {
         let start_pos = [10.0, 0.0, 0.0, 0.0];
-        let end_pos = [10.0, 0.0, 0.0, 5.0]; // Only E moves
+        let end_pos = [10.0, 0.0, 0.0, 5.0];
         let speed = 20.0;
         let m = Move::new(
             DEFAULT_MAX_ACCEL, DEFAULT_JUNCTION_DEV, DEFAULT_MAX_VELOCITY, DEFAULT_MAX_ACCEL_TO_DECEL,
@@ -1047,5 +1031,7 @@ mod tests {
         assert!(flushed_moves[1].start_v > 0.0 || flushed_moves[1].cruise_t > 0.0);
     }
 }
+
+[end of klipper_host_rust/src/toolhead.rs]
 
 [end of klipper_host_rust/src/toolhead.rs]

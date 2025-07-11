@@ -6,22 +6,66 @@ use std::collections::HashMap;
 // use crate::core_traits::{Kinematics};
 use crate::toolhead::{Kinematics, Move}; // Kinematics trait is in toolhead.rs for now
 
+// Default step distance, e.g., for a 200 steps/rev motor, 16 microsteps, 2mm pitch leadscrew / GT2 belt with 20T pulley
+// rotation_distance = 40 (for 20T pulley and GT2 belt)
+// full_steps_per_rotation = 200
+// microsteps = 16
+// step_distance = 40 / (200 * 16) = 40 / 3200 = 0.0125 mm/step
+const DEFAULT_STEP_DISTANCE: f64 = 0.0125;
+
 
 // Simplified Stepper representation for host-side kinematics
 #[derive(Debug, Clone)]
 pub struct Stepper {
     name: String,
-    // Future fields: step_dist, units_in_radians, etc.
+    step_distance: f64,
+    position_steps: i64,      // Current position in microsteps from mcu_position_offset origin
+    mcu_position_offset: f64, // Offset in mm to align step counter with G-code zero
 }
 
 impl Stepper {
-    pub fn new(name: String) -> Self {
-        Stepper { name }
+    pub fn new(name: String, step_distance: f64) -> Self {
+        Stepper {
+            name,
+            step_distance,
+            position_steps: 0, // Assume starts at step 0 relative to its mcu_position_offset origin
+            mcu_position_offset: 0.0,
+        }
     }
 
     #[allow(dead_code)]
     pub fn get_name(&self) -> &str {
         &self.name
+    }
+
+    /// Sets the G-code coordinate system origin for this stepper.
+    /// After this, get_commanded_position_mm() will report gcode_coord_mm
+    /// if position_steps is unchanged.
+    pub fn set_commanded_position_mm(&mut self, gcode_coord_mm: f64) {
+        self.mcu_position_offset = (self.position_steps as f64 * self.step_distance) - gcode_coord_mm;
+        // println!("Stepper {}: set_commanded_pos_mm: gcode_coord={}, steps={}, new_offset={}",
+        //    self.name, gcode_coord_mm, self.position_steps, self.mcu_position_offset);
+    }
+
+    /// Gets the current G-code position of this stepper in mm.
+    pub fn get_commanded_position_mm(&self) -> f64 {
+        (self.position_steps as f64 * self.step_distance) - self.mcu_position_offset
+    }
+
+    /// Directly sets the (simulated) hardware step counter for this stepper.
+    /// Used to simulate the result of a move.
+    pub fn set_position_steps(&mut self, steps: i64) {
+        // println!("Stepper {}: set_position_steps from {} to {}", self.name, self.position_steps, steps);
+        self.position_steps = steps;
+    }
+
+    #[allow(dead_code)]
+    pub fn get_position_steps(&self) -> i64 {
+        self.position_steps
+    }
+
+    pub fn get_step_distance(&self) -> f64 {
+        self.step_distance
     }
 }
 
@@ -34,18 +78,20 @@ pub struct Rail {
     pub position_min: f64,
     pub position_max: f64,
     pub position_endstop: f64, // Machine coordinate of the endstop for this rail
-    // Future fields: homing_speed, homing_retract_dist, etc.
 }
 
 impl Rail {
     pub fn new(
         name: String,
-        stepper_names: Vec<String>,
+        stepper_configs: Vec<(String, f64)>, // Vec of (stepper_name, step_distance)
         position_min: f64,
         position_max: f64,
         position_endstop: f64,
     ) -> Self {
-        let steppers = stepper_names.into_iter().map(Stepper::new).collect();
+        let steppers = stepper_configs
+            .into_iter()
+            .map(|(s_name, s_dist)| Stepper::new(s_name, s_dist))
+            .collect();
         Rail {
             name,
             steppers,
@@ -64,17 +110,36 @@ impl Rail {
         &self.steppers
     }
 
-    // In Klipper, Rail.set_position updates the logical position of its steppers.
-    // For now, this is a placeholder as our Stepper struct is simple.
-    #[allow(dead_code)]
-    pub fn set_stepper_positions(&self, _gcode_coord: f64) {
-        // TODO: When steppers store their own positions, update them here
-        // based on gcode_coord and the rail's step_distance etc.
-        // For cartesian, it's usually a direct mapping.
+    // For Cartesian, assume the first stepper defines the rail's position characteristics
+    fn primary_stepper(&self) -> Result<&Stepper, String> {
+        self.steppers.get(0).ok_or_else(|| format!("Rail {} has no steppers", self.name))
+    }
+
+    fn primary_stepper_mut(&mut self) -> Result<&mut Stepper, String> {
+        self.steppers.get_mut(0).ok_or_else(|| format!("Rail {} has no steppers", self.name))
+    }
+
+    /// Sets the G-code position for this rail, updating its primary stepper's offset.
+    pub fn set_rail_position_gcode(&mut self, gcode_coord: f64) -> Result<(), String> {
+        self.primary_stepper_mut()?.set_commanded_position_mm(gcode_coord);
+        Ok(())
+    }
+
+    /// Gets the current G-code position of this rail based on its primary stepper.
+    pub fn get_rail_position_gcode(&self) -> Result<f64, String> {
+        Ok(self.primary_stepper()?.get_commanded_position_mm())
+    }
+
+    /// Simulates moving the rail's steppers to a new G-code coordinate.
+    /// This directly updates the stepper's internal step count.
+    pub fn move_steppers_to_gcode_coord(&mut self, gcode_coord: f64) -> Result<(), String> {
+        let stepper = self.primary_stepper_mut()?;
+        let target_steps = ((gcode_coord + stepper.mcu_position_offset) / stepper.step_distance).round() as i64;
+        stepper.set_position_steps(target_steps);
+        Ok(())
     }
 }
 
-// CartesianKinematics struct will be defined next.
 
 pub struct CartesianKinematics {
     rails: [Rail; 3], // Index 0 for X, 1 for Y, 2 for Z
@@ -85,9 +150,9 @@ pub struct CartesianKinematics {
 
 impl CartesianKinematics {
     pub fn new(
-        x_rail_config: (Vec<String>, f64, f64, f64), // stepper_names, min, max, endstop_pos
-        y_rail_config: (Vec<String>, f64, f64, f64),
-        z_rail_config: (Vec<String>, f64, f64, f64),
+        x_rail_config: (Vec<(String,f64)>, f64, f64, f64), // stepper_configs, min, max, endstop_pos
+        y_rail_config: (Vec<(String,f64)>, f64, f64, f64),
+        z_rail_config: (Vec<(String,f64)>, f64, f64, f64),
         max_z_velocity: f64,
         max_z_accel: f64,
     ) -> Self {
@@ -99,13 +164,31 @@ impl CartesianKinematics {
             rails: [rail_x, rail_y, rail_z],
             max_z_velocity,
             max_z_accel,
-            // Initialize limits to "un-homed" state (min > max)
-            // These will be updated by set_position after homing.
-            limits: [(1.0, -1.0), (1.0, -1.0), (1.0, -1.0)],
+            limits: [(1.0, -1.0), (1.0, -1.0), (1.0, -1.0)], // Unhomed
         }
     }
 
-    // Methods for Kinematics trait will be added next
+    /// Calculates current G-code position [X,Y,Z] from the rail/stepper states.
+    /// This method assumes that the `position_steps` in each stepper accurately reflects
+    /// its current physical state, and `mcu_position_offset` correctly maps this
+    /// to the G-code coordinate system.
+    pub fn calc_position_from_steppers(&self) -> Result<[f64; 3], String> {
+        Ok([
+            self.rails[0].get_rail_position_gcode()?,
+            self.rails[1].get_rail_position_gcode()?,
+            self.rails[2].get_rail_position_gcode()?,
+        ])
+    }
+
+    /// Simulates moving steppers to a G-code target.
+    /// This is for host-side simulation/state tracking, not actual motion planning.
+    #[allow(dead_code)] // May be used by ToolHead later
+    pub fn set_steppers_to_gcode_target(&mut self, target_gcode_pos: [f64;3]) -> Result<(), String> {
+        self.rails[0].move_steppers_to_gcode_coord(target_gcode_pos[0])?;
+        self.rails[1].move_steppers_to_gcode_coord(target_gcode_pos[1])?;
+        self.rails[2].move_steppers_to_gcode_coord(target_gcode_pos[2])?;
+        Ok(())
+    }
 }
 
 impl Kinematics for CartesianKinematics {
@@ -114,9 +197,8 @@ impl Kinematics for CartesianKinematics {
         let y_target = move_params.end_pos[1];
         let z_target = move_params.end_pos[2];
 
-        // Check X and Y limits first
         if x_target < self.limits[0].0 || x_target > self.limits[0].1 {
-            if self.limits[0].0 > self.limits[0].1 { // Unhomed state
+            if self.limits[0].0 > self.limits[0].1 {
                 return Err(move_params.move_error("X axis must be homed first"));
             }
             return Err(move_params.move_error(&format!(
@@ -125,7 +207,7 @@ impl Kinematics for CartesianKinematics {
             )));
         }
         if y_target < self.limits[1].0 || y_target > self.limits[1].1 {
-            if self.limits[1].0 > self.limits[1].1 { // Unhomed state
+            if self.limits[1].0 > self.limits[1].1 {
                 return Err(move_params.move_error("Y axis must be homed first"));
             }
             return Err(move_params.move_error(&format!(
@@ -134,10 +216,9 @@ impl Kinematics for CartesianKinematics {
             )));
         }
 
-        // If there's Z movement, check Z limits and apply Z-specific speed/accel
-        if move_params.axes_d[2].abs() > f64::EPSILON { // axes_d[2] is dz
+        if move_params.axes_d[2].abs() > f64::EPSILON {
             if z_target < self.limits[2].0 || z_target > self.limits[2].1 {
-                if self.limits[2].0 > self.limits[2].1 { // Unhomed state
+                if self.limits[2].0 > self.limits[2].1 {
                     return Err(move_params.move_error("Z axis must be homed first"));
                 }
                 return Err(move_params.move_error(&format!(
@@ -145,10 +226,6 @@ impl Kinematics for CartesianKinematics {
                     z_target, self.limits[2].0, self.limits[2].1
                 )));
             }
-
-            // Apply Z-specific speed/accel limits
-            // Klipper: z_ratio = move.move_d / abs(move.axes_d[2])
-            // move.limit_speed(self.max_z_velocity * z_ratio, self.max_z_accel * z_ratio)
             if move_params.move_d > f64::EPSILON && move_params.axes_d[2].abs() > f64::EPSILON {
                 let z_ratio = move_params.move_d / move_params.axes_d[2].abs();
                 move_params.limit_speed(
@@ -161,25 +238,22 @@ impl Kinematics for CartesianKinematics {
     }
 
     fn set_kinematics_position(&mut self, new_pos_gcode: &[f64; 3], homed_axes_mask: [bool; 3]) {
-        // new_pos_gcode contains the G-CODE coordinates for X, Y, Z that the machine is now at
-        // after a G92 or homing operation for the axes specified in homed_axes_mask.
-
         for axis_idx in 0..3 {
             if homed_axes_mask[axis_idx] {
-                // Mark axis as homed by setting its limits to the rail's full range
                 self.limits[axis_idx] = self.rails[axis_idx].get_range();
-
-                // Klipper's rail.set_position(newpos) updates the rail's steppers' internal positions.
-                // This is important for `calc_position` if it were to be used.
-                // For now, our Rail.set_stepper_positions is a placeholder.
-                self.rails[axis_idx].set_stepper_positions(new_pos_gcode[axis_idx]);
+                // Update the rail's (and its stepper's) understanding of the new G-code coordinate
+                if let Err(e) = self.rails[axis_idx].set_rail_position_gcode(new_pos_gcode[axis_idx]) {
+                    // This should ideally not fail if rail has steppers. Log or handle error.
+                    eprintln!("Error setting rail position for axis {}: {}", ['X','Y','Z'][axis_idx], e);
+                }
 
                 println!(
-                    "CartesianKinematics: Axis {} homed. Limits set to: ({:.3}, {:.3}). G-code pos: {:.3}",
+                    "CartesianKinematics: Axis {} homed/set. Limits: ({:.3}, {:.3}). G-code pos: {:.3}. Stepper G-code pos: {:.3}",
                     ['X', 'Y', 'Z'][axis_idx],
                     self.limits[axis_idx].0,
                     self.limits[axis_idx].1,
-                    new_pos_gcode[axis_idx]
+                    new_pos_gcode[axis_idx],
+                    self.rails[axis_idx].get_rail_position_gcode().unwrap_or(f64::NAN)
                 );
             }
         }
@@ -189,50 +263,174 @@ impl Kinematics for CartesianKinematics {
     fn get_axis_limits_for_test(&self) -> [(f64, f64); 3] {
         self.limits
     }
+
+    fn set_steppers_to_gcode_target(&mut self, target_gcode_pos: [f64;3]) -> Result<(), String> {
+        self.rails[0].move_steppers_to_gcode_coord(target_gcode_pos[0])?;
+        self.rails[1].move_steppers_to_gcode_coord(target_gcode_pos[1])?;
+        self.rails[2].move_steppers_to_gcode_coord(target_gcode_pos[2])?;
+        Ok(())
+    }
 }
 
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Import Move specifically for tests if it's not already visible
-    // For this test, Move is in crate::toolhead so it should be found if toolhead is a dependency of kinematics.
-    // However, to be explicit or if cartesian.rs is compiled as part of a test binary differently:
     use crate::toolhead::Move;
 
 
     #[test]
-    fn rail_creation() {
-        let rail_x = Rail::new("x_rail".to_string(), vec!["stepper_x".to_string()], 0.0, 200.0, 0.0);
+    fn rail_creation_and_stepper_init() {
+        let rail_x = Rail::new(
+            "x_rail".to_string(),
+            vec![("stepper_x".to_string(), 0.0125)],
+            0.0, 200.0, 0.0
+        );
         assert_eq!(rail_x.name, "x_rail");
         assert_eq!(rail_x.position_min, 0.0);
         assert_eq!(rail_x.position_max, 200.0);
         assert_eq!(rail_x.position_endstop, 0.0);
         assert_eq!(rail_x.steppers.len(), 1);
         assert_eq!(rail_x.steppers[0].get_name(), "stepper_x");
+        assert_eq!(rail_x.steppers[0].step_distance, 0.0125);
+        assert_eq!(rail_x.steppers[0].position_steps, 0);
+        assert_eq!(rail_x.steppers[0].mcu_position_offset, 0.0);
     }
 
-    fn create_test_kinematics() -> CartesianKinematics {
+    #[test]
+    fn stepper_position_methods() {
+        let mut stepper = Stepper::new("test_stepper".to_string(), 0.01); // 1 step = 0.01mm
+
+        // Initial state
+        assert_eq!(stepper.get_commanded_position_mm(), 0.0); // 0 * 0.01 - 0 = 0
+
+        // Simulate MCU reports stepper is at 1000 steps
+        stepper.set_position_steps(1000);
+        assert_eq!(stepper.get_commanded_position_mm(), 10.0); // 1000 * 0.01 - 0 = 10.0
+
+        // Set G-code position to 5.0mm (G92 X5)
+        // Current machine pos in mm is 10.0 (from steps). New G-code pos is 5.0.
+        // Offset = 10.0 - 5.0 = 5.0
+        stepper.set_commanded_position_mm(5.0);
+        assert_eq!(stepper.mcu_position_offset, 5.0);
+        assert_eq!(stepper.get_commanded_position_mm(), 5.0); // (1000 * 0.01) - 5.0 = 5.0
+
+        // Simulate a move: G-code target 15.0mm
+        // Target steps = (G-code_target + offset) / step_dist = (15.0 + 5.0) / 0.01 = 20.0 / 0.01 = 2000 steps
+        let target_gcode_pos = 15.0;
+        let target_steps = ((target_gcode_pos + stepper.mcu_position_offset) / stepper.step_distance).round() as i64;
+        stepper.set_position_steps(target_steps);
+        assert_eq!(stepper.position_steps, 2000);
+        assert_eq!(stepper.get_commanded_position_mm(), 15.0); // (2000 * 0.01) - 5.0 = 15.0
+    }
+
+    #[test]
+    fn rail_position_methods() {
+        let mut rail = Rail::new(
+            "x_rail".to_string(),
+            vec![("stepper_x".to_string(), DEFAULT_STEP_DISTANCE)],
+            0.0, 200.0, 0.0
+        );
+        // Initial G-code position should be 0
+        assert_eq!(rail.get_rail_position_gcode().unwrap(), 0.0);
+
+        // Simulate G92 X10
+        rail.set_rail_position_gcode(10.0).unwrap();
+        assert_eq!(rail.get_rail_position_gcode().unwrap(), 10.0);
+        // Check internal stepper state
+        let stepper = rail.primary_stepper().unwrap();
+        assert_eq!(stepper.position_steps, 0); // Steps haven't changed yet
+        assert_eq!(stepper.mcu_position_offset, -10.0); // Offset = (0 * step_dist) - 10.0
+
+        // Simulate moving the rail to G-code position 50.0
+        rail.move_steppers_to_gcode_coord(50.0).unwrap();
+        assert_eq!(rail.get_rail_position_gcode().unwrap(), 50.0);
+        let expected_steps = ((50.0 + stepper.mcu_position_offset) / stepper.step_distance).round() as i64;
+        assert_eq!(rail.primary_stepper().unwrap().position_steps, expected_steps);
+    }
+
+
+    fn create_test_kinematics_with_step_dist() -> CartesianKinematics {
+        let stepper_config = || vec![("stepper".to_string(), DEFAULT_STEP_DISTANCE)];
         CartesianKinematics::new(
-            (vec!["stepper_x".to_string()], 0.0, 200.0, 0.0), // X rail
-            (vec!["stepper_y".to_string()], 0.0, 200.0, 0.0), // Y rail
-            (vec!["stepper_z".to_string()], 0.0, 180.0, 0.0), // Z rail
+            (stepper_config(), 0.0, 200.0, 0.0), // X rail
+            (stepper_config(), 0.0, 200.0, 0.0), // Y rail
+            (stepper_config(), 0.0, 180.0, 0.0), // Z rail
             25.0, // max_z_velocity
             500.0, // max_z_accel
         )
     }
 
-    // Helper to create a basic Move struct for testing check_move
-    // Parameters for Move::new: max_accel, junction_deviation, max_velocity, max_accel_to_decel, start_pos, end_pos, speed
-    fn create_test_move(start_pos: [f64;4], end_pos: [f64;4], speed: f64) -> Move {
-        Move::new(3000.0, 0.013, 300.0, 1500.0, start_pos, end_pos, speed)
+    #[test]
+    fn test_cartesian_kinematics_calc_position() {
+        let mut kin = create_test_kinematics_with_step_dist();
+        // Home all axes to G-code 0,0,0. This sets their stepper offsets.
+        // Assume steppers are at 0 steps initially.
+        // For X: offset = (0 * step_dist) - 0 = 0.
+        kin.set_kinematics_position(&[0.0,0.0,0.0], [true,true,true]);
+        assert_eq!(kin.calc_position_from_steppers().unwrap(), [0.0, 0.0, 0.0]);
+
+        // Simulate steppers moving
+        // X moves to 10mm / step_dist steps
+        let x_steps = (10.0 / DEFAULT_STEP_DISTANCE).round() as i64;
+        kin.rails[0].primary_stepper_mut().unwrap().set_position_steps(x_steps);
+
+        // Y moves to 20mm / step_dist steps
+        let y_steps = (20.0 / DEFAULT_STEP_DISTANCE).round() as i64;
+        kin.rails[1].primary_stepper_mut().unwrap().set_position_steps(y_steps);
+
+        // Z moves to 5mm / step_dist steps
+        let z_steps = (5.0 / DEFAULT_STEP_DISTANCE).round() as i64;
+        kin.rails[2].primary_stepper_mut().unwrap().set_position_steps(z_steps);
+
+        let calculated_pos = kin.calc_position_from_steppers().unwrap();
+        assert!((calculated_pos[0] - 10.0).abs() < 1e-9);
+        assert!((calculated_pos[1] - 20.0).abs() < 1e-9);
+        assert!((calculated_pos[2] - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_set_kinematics_position_updates_stepper_offsets_and_limits() {
+        let mut kin = create_test_kinematics_with_step_dist();
+
+        // Simulate X stepper is physically at 1000 steps.
+        // 1000 steps * 0.0125 mm/step = 12.5 mm (machine position)
+        kin.rails[0].primary_stepper_mut().unwrap().set_position_steps(1000);
+
+        // Home X, setting current G-code position to 0.0
+        kin.set_kinematics_position(&[0.0, 0.0, 0.0], [true, false, false]);
+
+        // Check X rail/stepper state
+        let x_rail = &kin.rails[0];
+        let x_stepper = x_rail.primary_stepper().unwrap();
+        assert_eq!(x_stepper.position_steps, 1000); // Physical steps unchanged by G92/homing logic
+        // Offset = (steps * step_dist) - gcode_pos = (1000 * 0.0125) - 0.0 = 12.5
+        assert!((x_stepper.mcu_position_offset - 12.5).abs() < 1e-9);
+        assert!((x_rail.get_rail_position_gcode().unwrap() - 0.0).abs() < 1e-9); // G-code pos is 0
+        assert_eq!(kin.limits[0], (0.0, 200.0)); // X limits updated
+
+        // Y and Z should still be unhomed
+        assert_eq!(kin.limits[1], (1.0, -1.0));
+        assert_eq!(kin.limits[2], (1.0, -1.0));
+        assert_eq!(kin.rails[1].primary_stepper().unwrap().mcu_position_offset, 0.0); // Y offset still 0
+    }
+
+
+    fn create_test_kinematics() -> CartesianKinematics { // Old helper, ensure it's not used or update it
+        let stepper_config = || vec![("stepper".to_string(), DEFAULT_STEP_DISTANCE)];
+        CartesianKinematics::new(
+            (stepper_config(), 0.0, 200.0, 0.0),
+            (stepper_config(), 0.0, 200.0, 0.0),
+            (stepper_config(), 0.0, 180.0, 0.0),
+            25.0,
+            500.0,
+        )
     }
 
 
     #[test]
     fn test_check_move_valid() {
-        let mut kin = create_test_kinematics();
-        // Mark all axes as homed by setting valid limits
+        let mut kin = create_test_kinematics_with_step_dist();
         kin.set_kinematics_position(&[0.0,0.0,0.0], [true,true,true]);
 
         let mut move_valid = create_test_move([0.0,0.0,0.0,0.0], [10.0, 10.0, 10.0, 0.0], 100.0);
@@ -241,9 +439,9 @@ mod tests {
 
     #[test]
     fn test_check_move_out_of_bounds_x_max() {
-        let mut kin = create_test_kinematics();
+        let mut kin = create_test_kinematics_with_step_dist();
         kin.set_kinematics_position(&[0.0,0.0,0.0], [true,true,true]);
-        let mut move_invalid = create_test_move([0.0,0.0,0.0,0.0], [200.1, 10.0, 10.0, 0.0], 100.0); // X > 200.0
+        let mut move_invalid = create_test_move([0.0,0.0,0.0,0.0], [200.1, 10.0, 10.0, 0.0], 100.0);
         let result = kin.check_move(&mut move_invalid);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Move out of range: X 200.100"));
@@ -251,9 +449,9 @@ mod tests {
 
     #[test]
     fn test_check_move_out_of_bounds_y_min() {
-        let mut kin = create_test_kinematics();
+        let mut kin = create_test_kinematics_with_step_dist();
         kin.set_kinematics_position(&[0.0,0.0,0.0], [true,true,true]);
-        let mut move_invalid = create_test_move([0.0,0.0,0.0,0.0], [10.0, -0.1, 10.0, 0.0], 100.0); // Y < 0.0
+        let mut move_invalid = create_test_move([0.0,0.0,0.0,0.0], [10.0, -0.1, 10.0, 0.0], 100.0);
         let result = kin.check_move(&mut move_invalid);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Move out of range: Y -0.100"));
@@ -261,9 +459,9 @@ mod tests {
 
     #[test]
     fn test_check_move_out_of_bounds_z_max() {
-        let mut kin = create_test_kinematics();
+        let mut kin = create_test_kinematics_with_step_dist();
         kin.set_kinematics_position(&[0.0,0.0,0.0], [true,true,true]);
-        let mut move_invalid = create_test_move([0.0,0.0,0.0,0.0], [10.0, 10.0, 180.1, 0.0], 100.0); // Z > 180.0
+        let mut move_invalid = create_test_move([0.0,0.0,0.0,0.0], [10.0, 10.0, 180.1, 0.0], 100.0);
         let result = kin.check_move(&mut move_invalid);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Move out of range: Z 180.100"));
@@ -271,31 +469,26 @@ mod tests {
 
     #[test]
     fn test_check_move_unhomed_axis() {
-        let kin = create_test_kinematics(); // Limits are (1.0, -1.0) by default (unhomed)
+        let kin = create_test_kinematics_with_step_dist();
         let mut move_unhomed = create_test_move([0.0,0.0,0.0,0.0], [10.0, 10.0, 10.0, 0.0], 100.0);
         let result = kin.check_move(&mut move_unhomed);
         assert!(result.is_err());
-        // Depending on which axis is checked first if multiple are moving into unhomed territory.
-        // The current implementation checks X, then Y, then Z (if Z moves).
         assert!(result.unwrap_err().contains("X axis must be homed first"));
     }
 
     #[test]
     fn test_check_move_z_limits_speed_accel() {
-        let mut kin = create_test_kinematics();
-        kin.set_kinematics_position(&[0.0,0.0,0.0], [true,true,true]); // Home all
+        let mut kin = create_test_kinematics_with_step_dist();
+        kin.set_kinematics_position(&[0.0,0.0,0.0], [true,true,true]);
 
-        // Default Move::new params: max_accel=3000, max_velocity=300
         let mut move_z = create_test_move([0.0,0.0,0.0,0.0], [0.0, 0.0, 10.0, 0.0], 100.0);
-        let original_max_cruise_v2 = move_z.max_cruise_v2; // (100.0)^2
-        let original_accel = move_z.accel;           // 3000.0
+        let original_max_cruise_v2 = move_z.max_cruise_v2;
+        let original_accel = move_z.accel;
 
         kin.check_move(&mut move_z).unwrap();
 
-        // For this move_z: move_d = 10.0, axes_d[2] = 10.0. So, z_ratio = 1.0.
-        // kin.max_z_velocity = 25.0, kin.max_z_accel = 500.0
-        let expected_limited_speed = kin.max_z_velocity; // 25.0 * 1.0 = 25.0
-        let expected_limited_accel = kin.max_z_accel;    // 500.0 * 1.0 = 500.0
+        let expected_limited_speed = kin.max_z_velocity;
+        let expected_limited_accel = kin.max_z_accel;
 
         assert_ne!(move_z.max_cruise_v2, original_max_cruise_v2, "max_cruise_v2 should have been limited for Z move");
         assert_ne!(move_z.accel, original_accel, "accel should have been limited for Z move");
@@ -304,18 +497,26 @@ mod tests {
     }
 
      #[test]
-    fn test_set_kinematics_position_updates_limits() {
-        let mut kin = create_test_kinematics();
-        assert_eq!(kin.limits[0], (1.0, -1.0)); // Unhomed X
+    fn test_set_kinematics_position_updates_limits_and_stepper_offsets() { // Renamed for clarity
+        let mut kin = create_test_kinematics_with_step_dist();
 
-        kin.set_kinematics_position(&[0.0, 0.0, 0.0], [true, false, false]); // Home X
-        assert_eq!(kin.limits[0], (0.0, 200.0)); // X homed (range from rail_x)
-        assert_eq!(kin.limits[1], (1.0, -1.0));  // Y still unhomed
-        assert_eq!(kin.limits[2], (1.0, -1.0));  // Z still unhomed
+        // Simulate X stepper is physically at 1000 steps.
+        // 1000 steps * 0.0125 mm/step = 12.5 mm (machine position)
+        kin.rails[0].primary_stepper_mut().unwrap().set_position_steps(1000);
 
-        kin.set_kinematics_position(&[0.0, 0.0, 0.0], [false, true, true]); // Home Y and Z
-        assert_eq!(kin.limits[0], (0.0, 200.0));  // X still homed
-        assert_eq!(kin.limits[1], (0.0, 200.0));  // Y homed
-        assert_eq!(kin.limits[2], (0.0, 180.0));  // Z homed
+        // Home X, setting current G-code position to 0.0
+        kin.set_kinematics_position(&[0.0, 0.0, 0.0], [true, false, false]);
+
+        // Check X rail/stepper state
+        assert_eq!(kin.get_axis_limits_for_test()[0], (0.0, 200.0)); // X limits updated
+        let x_stepper = kin.rails[0].primary_stepper().unwrap();
+        assert_eq!(x_stepper.position_steps, 1000); // Physical steps unchanged
+        // Offset = (steps * step_dist) - gcode_pos = (1000 * 0.0125) - 0.0 = 12.5
+        assert!((x_stepper.mcu_position_offset - 12.5).abs() < 1e-9);
+        assert!((kin.rails[0].get_rail_position_gcode().unwrap() - 0.0).abs() < 1e-9); // G-code pos is 0
+
+        // Y and Z should still be unhomed
+        assert_eq!(kin.get_axis_limits_for_test()[1], (1.0, -1.0));
+        assert_eq!(kin.get_axis_limits_for_test()[2], (1.0, -1.0));
     }
 }

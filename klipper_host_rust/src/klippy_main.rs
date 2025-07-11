@@ -154,7 +154,26 @@ position_endstop: 0
                     Ok(()) => {
                         println!("Command executed successfully.");
                         println!("Current GCode State: {:?}", gcode_processor.state);
-                        println!("ToolHead Position: {:?}", toolhead.get_position());
+                        let th_pos = toolhead.get_position();
+                        println!("ToolHead Commanded Position (M114 source): X:{:.3} Y:{:.3} Z:{:.3} E:{:.3}", th_pos[0], th_pos[1], th_pos[2], th_pos[3]);
+
+                        // Simulate steppers moving to this commanded G-code position
+                        if gcode_command.command_letter == 'G' && (gcode_command.command_number == 0.0 || gcode_command.command_number == 1.0 || gcode_command.command_number == 28.0 ) ||
+                           (gcode_command.command_letter == 'G' && gcode_command.command_number == 92.0) {
+                            // For G0, G1, G28, G92, update simulated stepper positions
+                            // G28 already calls set_position which updates kinematics internal stepper G-code interpretation.
+                            // G92 also calls set_position.
+                            // G0/G1 update toolhead.commanded_pos. We simulate steppers reaching this.
+                            if let Err(sim_err) = toolhead.move_kinematics_steppers_to_gcode_target([th_pos[0], th_pos[1], th_pos[2]]) {
+                                eprintln!("Error simulating stepper move: {}", sim_err);
+                            }
+                        }
+
+                        match toolhead.get_kinematics_calculated_position() {
+                            Ok(calc_pos) => println!("Kinematics Calculated G-code Position: X:{:.3} Y:{:.3} Z:{:.3}", calc_pos[0], calc_pos[1], calc_pos[2]),
+                            Err(e) => eprintln!("Error calculating kinematics position: {}", e),
+                        }
+
                         println!("Extruder Target Temp: {:.1}°C, Bed Target Temp: {:.1}°C",
                                  toolhead.extruder_heater.target_temp,
                                  toolhead.bed_heater.target_temp);
