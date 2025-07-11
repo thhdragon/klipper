@@ -72,12 +72,19 @@ pub fn klippy_main() {
         "G28",                      // Home all axes
         "G90",                      // Absolute positioning
         "G1 X10 Y20 Z5 F3000",      // Move to X10 Y20 Z5
-        "G1 E10",                   // Extrude 10mm
-        "G91",                      // Relative positioning
-        "G1 X5 Y-5 E2",             // Move relatively X5 Y-5, extrude 2mm more
-        "G92 X0 Y0",                // Set current X and Y to 0 (creates an offset)
-        "G90",                      // Absolute positioning
-        "G1 X1 Z1",                 // Move to G-code X1 Z1 (actual machine pos will be different due to G92)
+        "M82",                      // Absolute extrusion mode
+        "G1 E10",                   // Extrude to E=10
+        "G1 E12",                   // Extrude to E=12 (2mm more)
+        "M83",                      // Relative extrusion mode
+        "G1 E2",                    // Extrude 2mm more (E becomes 14)
+        "G1 E-1 F1800",             // Retract 1mm (E becomes 13)
+        "G91",                      // Relative positioning for XYZ
+        "G1 X5 Y-5",                // Move relatively X5 Y-5 (E should remain 13)
+        "G92 X0 Y0 E0",             // Set current X, Y, and E to 0 (creates offsets)
+        "G90",                      // Absolute positioning for XYZ
+        "M82",                      // Absolute extrusion
+        "G1 X1 Z1 E5",              // Move to G-code X1 Z1, G-code E5
+                                    // (actual machine E will be E5 + E_offset from G92 E0)
         "G28 Y",                    // Re-home Y
         "G1 Y15",                   // Move Y to 15 (should be machine 15, gcode 15)
         "INVALID GCODE",            // Test error handling

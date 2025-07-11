@@ -179,10 +179,12 @@ impl<'a> GCode<'a> {
                 92 => self.cmd_g92(cmd),
                 _ => Err(CommandError(format!("Unknown G-code: G{}", cmd.command_number))),
             },
-            // 'M' => match cmd.command_number as i32 {
-            //     // TODO: M82, M83 for extruder absolute/relative
-            //     _ => Err(CommandError(format!("Unknown M-code: M{}", cmd.command_number))),
-            // },
+            'M' => match cmd.command_number as i32 {
+                82 => self.cmd_m82(cmd),
+                83 => self.cmd_m83(cmd),
+                // TODO: Add other M-codes
+                _ => Err(CommandError(format!("Unknown M-code: M{}", cmd.command_number))),
+            },
             _ => Err(CommandError(format!("Unsupported command type: {}{}", cmd.command_letter, cmd.command_number))),
         }
     }
@@ -380,6 +382,18 @@ impl<'a> GCode<'a> {
         // Ensure moves are flushed after homing
         // toolhead.flush_moves();
 
+        Ok(())
+    }
+
+    // M82: Use Absolute E distances
+    fn cmd_m82(&mut self, _cmd: &GCodeCommand) -> Result<(), CommandError> {
+        self.state.absolute_extrude = true;
+        Ok(())
+    }
+
+    // M83: Use Relative E distances
+    fn cmd_m83(&mut self, _cmd: &GCodeCommand) -> Result<(), CommandError> {
+        self.state.absolute_extrude = false;
         Ok(())
     }
 }
@@ -856,6 +870,102 @@ mod tests {
         assert_eq!(th_pos[0], 10.0); // X unchanged
         assert_eq!(th_pos[1], toolhead::Y_GCODE_POSITION_AFTER_HOMING);
         assert_eq!(th_pos[2], 5.0);  // Z unchanged
+    }
+
+    // Tests for M82/M83
+    #[test]
+    fn test_cmd_m82_sets_absolute_extrude() {
+        let mut gcode = create_test_gcode();
+        let mut toolhead = create_test_toolhead(); // Not strictly needed for M82/M83 but good practice for dispatcher
+        gcode.state.absolute_extrude = false; // Start relative
+
+        let cmd_m82 = gcode.parse_line("M82").unwrap();
+        gcode.process_command(&cmd_m82, &mut toolhead).unwrap();
+        assert!(gcode.state.absolute_extrude, "M82 should set absolute_extrude to true");
+    }
+
+    #[test]
+    fn test_cmd_m83_sets_relative_extrude() {
+        let mut gcode = create_test_gcode();
+        let mut toolhead = create_test_toolhead();
+        gcode.state.absolute_extrude = true; // Start absolute
+
+        let cmd_m83 = gcode.parse_line("M83").unwrap();
+        gcode.process_command(&cmd_m83, &mut toolhead).unwrap();
+        assert!(!gcode.state.absolute_extrude, "M83 should set absolute_extrude to false");
+    }
+
+    #[test]
+    fn test_g1_extrusion_absolute_mode_m82() {
+        let mut gcode = create_test_gcode();
+        let mut toolhead = create_test_toolhead();
+
+        // Initial state: E=0, absolute extrusion mode
+        gcode.state.last_position.e = Some(0.0);
+        gcode.state.base_position.e = Some(0.0);
+        gcode.state.gcode_offset.e = Some(0.0);
+        let cmd_m82 = gcode.parse_line("M82").unwrap(); // Ensure absolute extrusion
+        gcode.process_command(&cmd_m82, &mut toolhead).unwrap();
+
+        // Move E to 10.0
+        let cmd_g1_e10 = gcode.parse_line("G1 E10.0").unwrap();
+        gcode.process_command(&cmd_g1_e10, &mut toolhead).unwrap();
+        assert_eq!(gcode.state.last_position.e, Some(10.0));
+        assert_eq!(gcode.state.base_position.e, Some(10.0));
+
+        // Move E to 5.0 (retract)
+        let cmd_g1_e5 = gcode.parse_line("G1 E5.0").unwrap();
+        gcode.process_command(&cmd_g1_e5, &mut toolhead).unwrap();
+        assert_eq!(gcode.state.last_position.e, Some(5.0));
+        assert_eq!(gcode.state.base_position.e, Some(5.0));
+    }
+
+    #[test]
+    fn test_g1_extrusion_relative_mode_m83() {
+        let mut gcode = create_test_gcode();
+        let mut toolhead = create_test_toolhead();
+
+        // Initial state: E=0, relative extrusion mode
+        gcode.state.last_position.e = Some(0.0);
+        gcode.state.base_position.e = Some(0.0);
+        gcode.state.gcode_offset.e = Some(0.0); // G92 E offset should not affect relative E moves
+        let cmd_m83 = gcode.parse_line("M83").unwrap(); // Ensure relative extrusion
+        gcode.process_command(&cmd_m83, &mut toolhead).unwrap();
+
+        // Extrude 10.0mm
+        let cmd_g1_e10 = gcode.parse_line("G1 E10.0").unwrap();
+        gcode.process_command(&cmd_g1_e10, &mut toolhead).unwrap();
+        assert_eq!(gcode.state.last_position.e, Some(10.0)); // 0 + 10 = 10
+        assert_eq!(gcode.state.base_position.e, Some(10.0));
+
+        // Retract 2.0mm
+        let cmd_g1_e_neg2 = gcode.parse_line("G1 E-2.0").unwrap();
+        gcode.process_command(&cmd_g1_e_neg2, &mut toolhead).unwrap();
+        assert_eq!(gcode.state.last_position.e, Some(8.0)); // 10 - 2 = 8
+        assert_eq!(gcode.state.base_position.e, Some(8.0));
+    }
+
+    #[test]
+    fn test_g1_extrusion_absolute_mode_with_g92_e_offset() {
+        let mut gcode = create_test_gcode();
+        let mut toolhead = create_test_toolhead();
+
+        // Initial state: Machine E is at 100. G92 E50 was issued. So G-code E is 50.
+        gcode.state.last_position.e = Some(100.0); // Machine E
+        gcode.state.base_position.e = Some(50.0);  // G-code E
+        gcode.state.gcode_offset.e = Some(50.0); // Offset = Machine - G-code = 100 - 50 = 50
+
+        let cmd_m82 = gcode.parse_line("M82").unwrap(); // Absolute extrusion
+        gcode.process_command(&cmd_m82, &mut toolhead).unwrap();
+
+        // Command G1 E60 (absolute G-code value)
+        // Target machine E should be G-code E + offset = 60 + 50 = 110
+        let cmd_g1_e60 = gcode.parse_line("G1 E60.0").unwrap();
+        gcode.process_command(&cmd_g1_e60, &mut toolhead).unwrap();
+
+        assert_eq!(gcode.state.last_position.e, Some(110.0), "Machine E position check"); // 100 (start) + 10 (gcode diff 60-50) = 110
+        assert_eq!(gcode.state.base_position.e, Some(60.0), "G-code E base position check");
+        assert_eq!(gcode.state.gcode_offset.e, Some(50.0), "G92 E offset should remain unchanged");
     }
 
 }
