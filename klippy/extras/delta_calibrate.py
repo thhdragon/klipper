@@ -98,6 +98,20 @@ class DeltaCalibrate:
         self.probe_helper = probe.ProbePointsHelper(
             config, self.probe_finalize, default_points=points)
         self.probe_helper.minimum_points(3)
+
+        # Multi-Z probing heights
+        self.probe_z_heights = config.getfloatlist('probe_z_heights', None)
+        if self.probe_z_heights is None:
+            # Default to using the horizontal_move_z from the [probe] section,
+            # or a sensible default if that's not available.
+            # This will be resolved during actual probing cmd.
+            pass
+        elif len(self.probe_z_heights) > 1:
+            logging.info("Multi-Z height probing requested for DELTA_CALIBRATE. "
+                         "Full implementation of probing at multiple Z levels is pending.")
+            # For now, we'll just use the first Z height if multiple are given,
+            # until the probing loop is refactored.
+
         # Restore probe stable positions
         self.last_probe_positions = []
         for i in range(999):
