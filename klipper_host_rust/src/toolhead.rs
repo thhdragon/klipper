@@ -8,14 +8,27 @@ pub struct Endstop {
     pub name: String,
     pub triggered: bool,
     pub trigger_position_machine: f64,
+    // New fields for homing parameters
+    pub homing_speed: f64,
+    pub homing_retract_dist: f64,
+    pub second_homing_speed: f64,
 }
 
 impl Endstop {
-    fn new(name: String, trigger_position_machine: f64) -> Self {
+    fn new(
+        name: String,
+        trigger_position_machine: f64,
+        homing_speed: f64,
+        homing_retract_dist: f64,
+        second_homing_speed: f64,
+    ) -> Self {
         Endstop {
             name,
             triggered: false,
             trigger_position_machine,
+            homing_speed,
+            homing_retract_dist,
+            second_homing_speed,
         }
     }
 
@@ -29,20 +42,27 @@ impl Endstop {
     }
 }
 
+
 use crate::mcu::Mcu;
 use crate::reactor::Reactor;
 use crate::heaters::Heater;
-use crate::kinematics::cartesian::CartesianKinematics;
+use crate::kinematics::cartesian::{CartesianKinematics, DEFAULT_ROTATION_DISTANCE, DEFAULT_FULL_STEPS_PER_ROTATION, DEFAULT_MICROSTEPS};
 use crate::trapq::TrapQ;
 use crate::extras::fan::Fan;
 
-pub const DEFAULT_HOMING_SPEED: f64 = 25.0;
+pub const DEFAULT_HOMING_SPEED: f64 = 5.0; // Default from Klipper stepper.py GenericPrinterRail
+pub const DEFAULT_SECOND_HOMING_SPEED_RATIO: f64 = 0.5; // Klipper defaults second_homing_speed to homing_speed / 2.0
+pub const DEFAULT_HOMING_RETRACT_DIST: f64 = 5.0; // Default from Klipper stepper.py GenericPrinterRail
+
+// Machine position where endstop triggers (these are defaults if not in config)
 pub const X_MACHINE_POSITION_AT_ENDSTOP: f64 = 0.0;
 pub const Y_MACHINE_POSITION_AT_ENDSTOP: f64 = 0.0;
 pub const Z_MACHINE_POSITION_AT_ENDSTOP: f64 = 0.0;
+// G-code position to set after homing (via G92 logic)
 pub const X_GCODE_POSITION_AFTER_HOMING: f64 = 0.0;
 pub const Y_GCODE_POSITION_AFTER_HOMING: f64 = 0.0;
 pub const Z_GCODE_POSITION_AFTER_HOMING: f64 = 0.0;
+
 
 #[derive(Debug, Clone)]
 pub struct Move {
@@ -400,7 +420,6 @@ pub struct ToolHead<'a> {
     y_endstop: Endstop,
     z_endstop: Endstop,
 
-    // Fans
     pub part_cooling_fan: Fan,
 }
 
@@ -408,7 +427,7 @@ pub trait Kinematics {
     fn check_move(&self, move_params: &mut Move) -> Result<(), String>;
     fn set_kinematics_position(&mut self, new_pos: &[f64; 3], homed_axes_mask: [bool; 3]);
     fn calc_position_from_steppers(&self) -> Result<[f64; 3], String>;
-    fn set_steppers_to_gcode_target(&mut self, target_gcode_pos: [f64;3]) -> Result<(), String>; // Added for simulation
+    fn set_steppers_to_gcode_target(&mut self, target_gcode_pos: [f64;3]) -> Result<(), String>;
     #[cfg(test)]
     fn get_axis_limits_for_test(&self) -> [(f64, f64); 3];
 }
@@ -441,43 +460,45 @@ impl<'a> ToolHead<'a> {
         }
         let square_corner_velocity = config.getfloat("printer", "square_corner_velocity", Some(5.0), Some(0.0), None).map_err(cfg_err)?;
 
-        let x_pos_min = config.getfloat("stepper_x", "position_min", Some(0.0), None, None).map_err(cfg_err)?;
-        let x_pos_max = config.getfloat("stepper_x", "position_max", None, Some(x_pos_min), None).map_err(cfg_err)?;
-        let x_pos_endstop = config.getfloat("stepper_x", "position_endstop", Some(0.0), None, None).map_err(cfg_err)?;
-        let x_rail_stepper_configs = vec![(
-            config.get("stepper_x", "name", Some("stepper_x".to_string())).unwrap_or_else(|_| "stepper_x".to_string()),
-            config.getfloat("stepper_x", "step_distance", Some(DEFAULT_STEP_DISTANCE), Some(0.0), None).map_err(cfg_err)?
-        )];
-        let x_rail_config = (x_rail_stepper_configs, x_pos_min, x_pos_max, x_pos_endstop);
+        // Stepper and Rail configurations
+        let mut rail_configs = Vec::new();
+        for axis_char in ['x', 'y', 'z'] {
+            let sec_name = format!("stepper_{}", axis_char);
+            let pos_min = config.getfloat(&sec_name, "position_min", Some(0.0), None, None).map_err(cfg_err)?;
+            let pos_max = config.getfloat(&sec_name, "position_max", None, Some(pos_min), None).map_err(cfg_err)?;
+            let pos_endstop = config.getfloat(&sec_name, "position_endstop", Some(0.0), None, None).map_err(cfg_err)?;
 
-        let y_pos_min = config.getfloat("stepper_y", "position_min", Some(0.0), None, None).map_err(cfg_err)?;
-        let y_pos_max = config.getfloat("stepper_y", "position_max", None, Some(y_pos_min), None).map_err(cfg_err)?;
-        let y_pos_endstop = config.getfloat("stepper_y", "position_endstop", Some(0.0), None, None).map_err(cfg_err)?;
-        let y_rail_stepper_configs = vec![(
-            config.get("stepper_y", "name", Some("stepper_y".to_string())).unwrap_or_else(|_| "stepper_y".to_string()),
-            config.getfloat("stepper_y", "step_distance", Some(DEFAULT_STEP_DISTANCE), Some(0.0), None).map_err(cfg_err)?
-        )];
-        let y_rail_config = (y_rail_stepper_configs, y_pos_min, y_pos_max, y_pos_endstop);
+            let rotation_distance = config.getfloat(&sec_name, "rotation_distance", Some(DEFAULT_ROTATION_DISTANCE), Some(0.0), None).map_err(cfg_err)?;
+            let full_steps = config.getint(&sec_name, "full_steps_per_rotation", Some(DEFAULT_FULL_STEPS_PER_ROTATION as i64), Some(1), None).map_err(cfg_err)? as u32;
+            let microsteps = config.getint(&sec_name, "microsteps", Some(DEFAULT_MICROSTEPS as i64), Some(1), None).map_err(cfg_err)? as u32;
+            let gear_ratio = config.getfloat(&sec_name, "gear_ratio", Some(1.0), Some(0.0), None).map_err(cfg_err)?;
 
-        let z_pos_min = config.getfloat("stepper_z", "position_min", Some(0.0), None, None).map_err(cfg_err)?;
-        let z_pos_max = config.getfloat("stepper_z", "position_max", None, Some(z_pos_min), None).map_err(cfg_err)?;
-        let z_pos_endstop = config.getfloat("stepper_z", "position_endstop", Some(0.0), None, None).map_err(cfg_err)?;
-        let z_rail_stepper_configs = vec![(
-            config.get("stepper_z", "name", Some("stepper_z".to_string())).unwrap_or_else(|_| "stepper_z".to_string()),
-            config.getfloat("stepper_z", "step_distance", Some(DEFAULT_STEP_DISTANCE), Some(0.0), None).map_err(cfg_err)?
-        )];
-        let z_rail_config = (z_rail_stepper_configs, z_pos_min, z_pos_max, z_pos_endstop);
+            let stepper_configs_for_rail = vec![(
+                config.get(&sec_name, "name", Some(sec_name.clone())).unwrap_or_else(|_| sec_name.clone()),
+                rotation_distance,
+                full_steps,
+                microsteps,
+                gear_ratio
+            )];
+            rail_configs.push((stepper_configs_for_rail, pos_min, pos_max, pos_endstop));
+        }
 
         let default_z_velo = max_velocity / 20.0;
         let default_z_accel = max_accel / 20.0;
         let max_z_velocity = config.getfloat("printer", "max_z_velocity", Some(default_z_velo), Some(0.0), Some(max_velocity)).map_err(cfg_err)?;
         let max_z_accel = config.getfloat("printer", "max_z_accel", Some(default_z_accel), Some(0.0), Some(max_accel)).map_err(cfg_err)?;
 
+        // Heater configurations
         let extruder_heater_name = config.get("extruder", "heater_name", Some("extruder".to_string())).unwrap_or_else(|_| "extruder".to_string());
+        let extruder_min_temp = config.getfloat("extruder", "min_temp", Some(0.0), None, None).map_err(cfg_err)?;
+        let extruder_max_temp = config.getfloat("extruder", "max_temp", Some(280.0), Some(extruder_min_temp), None).map_err(cfg_err)?;
+
         let bed_heater_name = config.get("heater_bed", "heater_name", Some("heater_bed".to_string())).unwrap_or_else(|_| "heater_bed".to_string());
+        let bed_min_temp = config.getfloat("heater_bed", "min_temp", Some(0.0), None, None).map_err(cfg_err)?;
+        let bed_max_temp = config.getfloat("heater_bed", "max_temp", Some(120.0), Some(bed_min_temp), None).map_err(cfg_err)?;
 
         // Fan configuration
-        let fan_section_name = "fan"; // Assuming the primary part cooling fan is under [fan]
+        let fan_section_name = "fan";
         let fan_name = config.get(fan_section_name, "name", Some("part_cooling_fan".to_string()))
             .unwrap_or_else(|_| "part_cooling_fan".to_string());
         let fan_max_power = config.getfloat(fan_section_name, "max_power", Some(1.0), Some(0.0), Some(1.0))
@@ -487,8 +508,21 @@ impl<'a> ToolHead<'a> {
         let fan_kick_start_time = config.getfloat(fan_section_name, "kick_start_time", Some(0.1), Some(0.0), None)
             .map_err(cfg_err)? as f32;
 
+        // Endstop configurations (using already fetched pos_endstop and new homing params)
+        let x_homing_speed = config.getfloat("stepper_x", "homing_speed", Some(DEFAULT_HOMING_SPEED), Some(0.0), None).map_err(cfg_err)?;
+        let x_homing_retract_dist = config.getfloat("stepper_x", "homing_retract_dist", Some(DEFAULT_HOMING_RETRACT_DIST), Some(0.0), None).map_err(cfg_err)?;
+        let x_second_homing_speed = config.getfloat("stepper_x", "second_homing_speed", Some(x_homing_speed * DEFAULT_SECOND_HOMING_SPEED_RATIO), Some(0.0), None).map_err(cfg_err)?;
 
-        let mut toolhead = ToolHead {
+        let y_homing_speed = config.getfloat("stepper_y", "homing_speed", Some(DEFAULT_HOMING_SPEED), Some(0.0), None).map_err(cfg_err)?;
+        let y_homing_retract_dist = config.getfloat("stepper_y", "homing_retract_dist", Some(DEFAULT_HOMING_RETRACT_DIST), Some(0.0), None).map_err(cfg_err)?;
+        let y_second_homing_speed = config.getfloat("stepper_y", "second_homing_speed", Some(y_homing_speed * DEFAULT_SECOND_HOMING_SPEED_RATIO), Some(0.0), None).map_err(cfg_err)?;
+
+        let z_homing_speed = config.getfloat("stepper_z", "homing_speed", Some(DEFAULT_HOMING_SPEED / 2.0), Some(0.0), None).map_err(cfg_err)?; // Z often slower
+        let z_homing_retract_dist = config.getfloat("stepper_z", "homing_retract_dist", Some(DEFAULT_HOMING_RETRACT_DIST / 2.0), Some(0.0), None).map_err(cfg_err)?;
+        let z_second_homing_speed = config.getfloat("stepper_z", "second_homing_speed", Some(z_homing_speed * DEFAULT_SECOND_HOMING_SPEED_RATIO), Some(0.0), None).map_err(cfg_err)?;
+
+
+        let toolhead = ToolHead {
             reactor: reactor_ref,
             printer: printer_ref,
             all_mcus: mcus_list.clone(),
@@ -513,26 +547,21 @@ impl<'a> ToolHead<'a> {
             kin_flush_times: Vec::new(),
             trapq: TrapQ::new_for_test(),
             flush_trapqs: vec![TrapQ::new_for_test()],
-            extruder_heater: Heater::new(extruder_heater_name), // TODO: Pass min/max temp from config
-            bed_heater: Heater::new(bed_heater_name),     // TODO: Pass min/max temp from config
-            x_endstop: Endstop::new("x_endstop".to_string(), x_pos_endstop),
-            y_endstop: Endstop::new("y_endstop".to_string(), y_pos_endstop),
-            z_endstop: Endstop::new("z_endstop".to_string(), z_pos_endstop),
+            extruder_heater: Heater::new(extruder_heater_name, extruder_min_temp, extruder_max_temp),
+            bed_heater: Heater::new(bed_heater_name, bed_min_temp, bed_max_temp),
+            x_endstop: Endstop::new("x_endstop".to_string(), rail_configs[0].3, x_homing_speed, x_homing_retract_dist, x_second_homing_speed),
+            y_endstop: Endstop::new("y_endstop".to_string(), rail_configs[1].3, y_homing_speed, y_homing_retract_dist, y_second_homing_speed),
+            z_endstop: Endstop::new("z_endstop".to_string(), rail_configs[2].3, z_homing_speed, z_homing_retract_dist, z_second_homing_speed),
             part_cooling_fan: Fan::new(fan_name, fan_max_power, fan_off_below, fan_kick_start_time),
             kin: Box::new(CartesianKinematics::new(
-                x_rail_config.clone(), y_rail_config.clone(), z_rail_config.clone(), max_z_velocity, max_z_accel
+                rail_configs[0].clone(), rail_configs[1].clone(), rail_configs[2].clone(), max_z_velocity, max_z_accel
             )),
         };
 
-        toolhead._calc_junction_deviation();
+        // toolhead._calc_junction_deviation(); // Already done with the temporary toolhead instance
 
-        toolhead.kin = Box::new(CartesianKinematics::new(
-            x_rail_config,
-            y_rail_config,
-            z_rail_config,
-            max_z_velocity,
-            max_z_accel,
-        ));
+        // No need to re-assign kin, it's done in the struct initialization.
+        // The previous awkward double-init of kin is removed.
 
         struct PlaceholderExtraAxis;
         impl ExtraAxis for PlaceholderExtraAxis {
@@ -591,7 +620,7 @@ impl<'a> ToolHead<'a> {
 
         if min_print_time > self.print_time {
             self.print_time = min_print_time;
-            self.printer.send_event("toolhead:sync_print_time", curtime, est_print_time, self.print_time);
+            self.printer.send_event("toolhead:sync_print_time".to_string(), format!("curtime:{}, est_print_time:{}, print_time:{}", curtime, est_print_time, self.print_time));
         }
     }
 
@@ -646,7 +675,7 @@ impl<'a> ToolHead<'a> {
             let kin_new_pos = [new_pos[0], new_pos[1], new_pos[2]];
             self.kin.set_kinematics_position(&kin_new_pos, mask);
         }
-        self.printer.send_event("toolhead:set_position");
+        self.printer.send_event("toolhead:set_position".to_string(), "".to_string());
     }
 
     pub fn get_reactor(&self) -> &dyn Reactor {
@@ -661,13 +690,14 @@ impl<'a> ToolHead<'a> {
             return Err("Invalid axis_index for homing".to_string());
         }
 
-        let homing_speed = DEFAULT_HOMING_SPEED;
         let (endstop, gcode_pos_after_homing, axis_char) = match axis_index {
             0 => (&self.x_endstop, X_GCODE_POSITION_AFTER_HOMING, 'X'),
             1 => (&self.y_endstop, Y_GCODE_POSITION_AFTER_HOMING, 'Y'),
             2 => (&self.z_endstop, Z_GCODE_POSITION_AFTER_HOMING, 'Z'),
             _ => unreachable!(),
         };
+        let homing_speed = endstop.homing_speed; // Use configured homing speed
+
         let homing_positive_dir = false;
         let step_size = if homing_positive_dir { 1.0 } else { -1.0 };
         let max_homing_travel = 300.0;
@@ -676,8 +706,8 @@ impl<'a> ToolHead<'a> {
         self.wait_moves();
 
         println!(
-            "ToolHead: Starting iterative homing for axis {}. Target machine_pos: {:.3f}",
-            axis_char, endstop.trigger_position_machine
+            "ToolHead: Starting iterative homing for axis {}. Speed: {:.1} Target machine_pos: {:.3f}",
+            axis_char, homing_speed, endstop.trigger_position_machine
         );
 
         loop {
@@ -753,20 +783,11 @@ impl<'a> ToolHead<'a> {
         println!("ToolHead: wait_moves called (lookahead flushed).");
     }
 
-    // Temporary method for testing/verification in klippy_main.rs
     pub fn get_kinematics_calculated_position(&self) -> Result<[f64; 3], String> {
         self.kin.calc_position_from_steppers()
     }
 
-    // Temporary method for testing/verification to simulate steppers reaching a G-code target
     pub fn move_kinematics_steppers_to_gcode_target(&mut self, target_gcode_pos: [f64;3]) -> Result<(), String> {
-        // This method requires CartesianKinematics to have set_steppers_to_gcode_target
-        // We need to downcast or add it to the trait. For now, let's assume it's on the trait
-        // or handle the downcast here if self.kin was &mut dyn Kinematics.
-        // Since self.kin is Box<dyn Kinematics>, we need to be careful.
-        // For simplicity, if we know it's Cartesian, we could downcast.
-        // However, a cleaner way would be for the Kinematics trait to have this.
-        // Let's assume we add `set_steppers_to_gcode_target` to the Kinematics trait for now.
         self.kin.set_steppers_to_gcode_target(target_gcode_pos)
     }
 }
@@ -819,37 +840,39 @@ mod tests {
         }
     }
 
-    const DEFAULT_MAX_ACCEL: f64 = 3000.0;
-    const DEFAULT_JUNCTION_DEV: f64 = 0.013;
-    const DEFAULT_MAX_VELOCITY: f64 = 500.0;
-    const DEFAULT_MAX_ACCEL_TO_DECEL: f64 = DEFAULT_MAX_ACCEL / 2.0;
+    const DEFAULT_MAX_ACCEL_TEST: f64 = 3000.0; // Renamed to avoid conflict
+    const DEFAULT_JUNCTION_DEV_TEST: f64 = 0.013;
+    const DEFAULT_MAX_VELOCITY_TEST: f64 = 500.0;
+    const DEFAULT_MAX_ACCEL_TO_DECEL_TEST: f64 = DEFAULT_MAX_ACCEL_TEST / 2.0;
 
     fn create_test_toolhead_with_reactor_printer() -> (ToolHead<'static>, Box<MockReactor>, Box<MockPrinterUtility>) {
         let mut config = Configfile::new(None);
         config.add_section("printer");
-        config.set("printer", "max_velocity", &DEFAULT_MAX_VELOCITY.to_string());
-        config.set("printer", "max_accel", &DEFAULT_MAX_ACCEL.to_string());
+        config.set("printer", "max_velocity", &DEFAULT_MAX_VELOCITY_TEST.to_string());
+        config.set("printer", "max_accel", &DEFAULT_MAX_ACCEL_TEST.to_string());
         config.set("printer", "square_corner_velocity", &"5.0".to_string());
-        // Add stepper configs for kinematics initialization
-        config.add_section("stepper_x");
-        config.set("stepper_x", "position_min", "0");
-        config.set("stepper_x", "position_max", "200");
-        config.set("stepper_x", "position_endstop", "0");
-        config.set("stepper_x", "step_distance", "0.0125");
 
-
-        config.add_section("stepper_y");
-        config.set("stepper_y", "position_min", "0");
-        config.set("stepper_y", "position_max", "200");
-        config.set("stepper_y", "position_endstop", "0");
-        config.set("stepper_y", "step_distance", "0.0125");
-
-
-        config.add_section("stepper_z");
-        config.set("stepper_z", "position_min", "0");
-        config.set("stepper_z", "position_max", "180");
-        config.set("stepper_z", "position_endstop", "0");
-        config.set("stepper_z", "step_distance", "0.0025");
+        for axis in ["x", "y", "z"].iter() {
+            let sec_name = format!("stepper_{}", axis);
+            config.add_section(&sec_name);
+            config.set(&sec_name, "position_min", "0");
+            config.set(&sec_name, "position_max", if *axis == "z" {"180"} else {"200"});
+            config.set(&sec_name, "position_endstop", "0");
+            config.set(&sec_name, "rotation_distance", if *axis == "z" {"8"} else {"40"});
+            config.set(&sec_name, "full_steps_per_rotation", "200");
+            config.set(&sec_name, "microsteps", "16");
+            config.set(&sec_name, "gear_ratio", "1.0");
+            config.set(&sec_name, "homing_speed", if *axis == "z" {"10"} else {"50"});
+            config.set(&sec_name, "homing_retract_dist", if *axis == "z" {"2"} else {"5"});
+            config.set(&sec_name, "second_homing_speed", if *axis == "z" {"5"} else {"25"});
+        }
+        config.add_section("extruder");
+        config.set("extruder", "min_temp", "0");
+        config.set("extruder", "max_temp", "280");
+        config.add_section("heater_bed");
+        config.set("heater_bed", "min_temp", "0");
+        config.set("heater_bed", "max_temp", "120");
+        config.add_section("fan");
 
 
         let reactor = Box::new(MockReactor);
@@ -872,7 +895,7 @@ mod tests {
         let end_pos = [10.0, 0.0, 0.0, 0.0];
         let speed = 100.0;
         let m = Move::new(
-            DEFAULT_MAX_ACCEL, DEFAULT_JUNCTION_DEV, DEFAULT_MAX_VELOCITY, DEFAULT_MAX_ACCEL_TO_DECEL,
+            DEFAULT_MAX_ACCEL_TEST, DEFAULT_JUNCTION_DEV_TEST, DEFAULT_MAX_VELOCITY_TEST, DEFAULT_MAX_ACCEL_TO_DECEL_TEST,
             start_pos, end_pos, speed
         );
 
@@ -882,8 +905,8 @@ mod tests {
         assert!(approx_eq(m.axes_r[0], 1.0, 1e-9));
         assert!(approx_eq(m.min_move_t, 10.0 / 100.0, 1e-9));
         assert!(approx_eq(m.max_cruise_v2, speed.powi(2), 1e-9));
-        assert!(approx_eq(m.accel, DEFAULT_MAX_ACCEL, 1e-9));
-        assert!(approx_eq(m.delta_v2, 2.0 * 10.0 * DEFAULT_MAX_ACCEL, 1e-9));
+        assert!(approx_eq(m.accel, DEFAULT_MAX_ACCEL_TEST, 1e-9));
+        assert!(approx_eq(m.delta_v2, 2.0 * 10.0 * DEFAULT_MAX_ACCEL_TEST, 1e-9));
     }
 
     #[test]
@@ -892,7 +915,7 @@ mod tests {
         let end_pos = [10.0, 0.0, 0.0, 5.0];
         let speed = 20.0;
         let m = Move::new(
-            DEFAULT_MAX_ACCEL, DEFAULT_JUNCTION_DEV, DEFAULT_MAX_VELOCITY, DEFAULT_MAX_ACCEL_TO_DECEL,
+            DEFAULT_MAX_ACCEL_TEST, DEFAULT_JUNCTION_DEV_TEST, DEFAULT_MAX_VELOCITY_TEST, DEFAULT_MAX_ACCEL_TO_DECEL_TEST,
             start_pos, end_pos, speed
         );
 
@@ -911,7 +934,7 @@ mod tests {
         let end_pos = [0.0, 0.0, 0.0, 0.0];
         let speed = 100.0;
          let m = Move::new(
-            DEFAULT_MAX_ACCEL, DEFAULT_JUNCTION_DEV, DEFAULT_MAX_VELOCITY, DEFAULT_MAX_ACCEL_TO_DECEL,
+            DEFAULT_MAX_ACCEL_TEST, DEFAULT_JUNCTION_DEV_TEST, DEFAULT_MAX_VELOCITY_TEST, DEFAULT_MAX_ACCEL_TO_DECEL_TEST,
             start_pos, end_pos, speed
         );
         assert!(!m.is_kinematic_move);
@@ -925,7 +948,7 @@ mod tests {
         let end_pos = [10.0, 0.0, 0.0, 0.0];
         let initial_speed = 100.0;
         let mut m = Move::new(
-            DEFAULT_MAX_ACCEL, DEFAULT_JUNCTION_DEV, DEFAULT_MAX_VELOCITY, DEFAULT_MAX_ACCEL_TO_DECEL,
+            DEFAULT_MAX_ACCEL_TEST, DEFAULT_JUNCTION_DEV_TEST, DEFAULT_MAX_VELOCITY_TEST, DEFAULT_MAX_ACCEL_TO_DECEL_TEST,
             start_pos, end_pos, initial_speed
         );
 
@@ -946,7 +969,7 @@ mod tests {
         let initial_speed = 100.0;
         let initial_accel = 2000.0;
         let mut m = Move::new(
-            initial_accel, DEFAULT_JUNCTION_DEV, DEFAULT_MAX_VELOCITY, DEFAULT_MAX_ACCEL_TO_DECEL,
+            initial_accel, DEFAULT_JUNCTION_DEV_TEST, DEFAULT_MAX_VELOCITY_TEST, DEFAULT_MAX_ACCEL_TO_DECEL_TEST,
             start_pos, end_pos, initial_speed
         );
         m.limit_speed(150.0, 1000.0);
@@ -964,7 +987,7 @@ mod tests {
         let speed = 100.0;
         let accel = 1000.0;
         let mut m = Move::new(
-            accel, DEFAULT_JUNCTION_DEV, DEFAULT_MAX_VELOCITY, DEFAULT_MAX_ACCEL_TO_DECEL,
+            accel, DEFAULT_JUNCTION_DEV_TEST, DEFAULT_MAX_VELOCITY_TEST, DEFAULT_MAX_ACCEL_TO_DECEL_TEST,
             start_pos, end_pos, speed
         );
         let start_v = 0.0;
@@ -989,13 +1012,13 @@ mod tests {
         let extra_axes_mock: Vec<Box<dyn ExtraAxis>> = vec![Box::new(MockExtraAxis)];
         let move1_start = [0.0, 0.0, 0.0, 0.0];
         let move1_end = [10.0, 0.0, 0.0, 0.0];
-        let mut move1 = Move::new(DEFAULT_MAX_ACCEL, DEFAULT_JUNCTION_DEV, DEFAULT_MAX_VELOCITY, DEFAULT_MAX_ACCEL_TO_DECEL, move1_start, move1_end, 50.0);
+        let mut move1 = Move::new(DEFAULT_MAX_ACCEL_TEST, DEFAULT_JUNCTION_DEV_TEST, DEFAULT_MAX_VELOCITY_TEST, DEFAULT_MAX_ACCEL_TO_DECEL_TEST, move1_start, move1_end, 50.0);
         move1.max_start_v2 = 0.0;
         move1.max_smoothed_v2 = 0.0;
 
         let move2_start = [10.0, 0.0, 0.0, 0.0];
         let move2_end = [10.0, 10.0, 0.0, 0.0];
-        let mut move2 = Move::new(DEFAULT_MAX_ACCEL, DEFAULT_JUNCTION_DEV, DEFAULT_MAX_VELOCITY, DEFAULT_MAX_ACCEL_TO_DECEL, move2_start, move2_end, 50.0);
+        let mut move2 = Move::new(DEFAULT_MAX_ACCEL_TEST, DEFAULT_JUNCTION_DEV_TEST, DEFAULT_MAX_VELOCITY_TEST, DEFAULT_MAX_ACCEL_TO_DECEL_TEST, move2_start, move2_end, 50.0);
 
         move2.calc_junction(&move1, &extra_axes_mock);
 
@@ -1008,7 +1031,7 @@ mod tests {
         let mut laq = LookAheadQueue::new();
         let extra_axes_mock: Vec<Box<dyn ExtraAxis>> = vec![Box::new(MockExtraAxis)];
 
-        let move1 = Move::new(DEFAULT_MAX_ACCEL, DEFAULT_JUNCTION_DEV, DEFAULT_MAX_VELOCITY, DEFAULT_MAX_ACCEL_TO_DECEL, [0.0,0.0,0.0,0.0], [10.0,0.0,0.0,0.0], 100.0);
+        let move1 = Move::new(DEFAULT_MAX_ACCEL_TEST, DEFAULT_JUNCTION_DEV_TEST, DEFAULT_MAX_VELOCITY_TEST, DEFAULT_MAX_ACCEL_TO_DECEL_TEST, [0.0,0.0,0.0,0.0], [10.0,0.0,0.0,0.0], 100.0);
         let initial_junction_flush = laq.junction_flush;
         let min_move_t1 = move1.min_move_t;
 
@@ -1016,7 +1039,7 @@ mod tests {
         assert_eq!(laq.queue.len(), 1);
         assert!(approx_eq(laq.junction_flush, initial_junction_flush - min_move_t1, 1e-9));
 
-        let move2 = Move::new(DEFAULT_MAX_ACCEL, DEFAULT_JUNCTION_DEV, DEFAULT_MAX_VELOCITY, DEFAULT_MAX_ACCEL_TO_DECEL, [10.0,0.0,0.0,0.0], [10.0,10.0,0.0,0.0], 100.0);
+        let move2 = Move::new(DEFAULT_MAX_ACCEL_TEST, DEFAULT_JUNCTION_DEV_TEST, DEFAULT_MAX_VELOCITY_TEST, DEFAULT_MAX_ACCEL_TO_DECEL_TEST, [10.0,0.0,0.0,0.0], [10.0,10.0,0.0,0.0], 100.0);
         let min_move_t2 = move2.min_move_t;
         laq.add_move(move2, &extra_axes_mock);
         assert_eq!(laq.queue.len(), 2);
@@ -1029,8 +1052,8 @@ mod tests {
         let mut laq = LookAheadQueue::new();
         let extra_axes_mock: Vec<Box<dyn ExtraAxis>> = vec![Box::new(MockExtraAxis)];
 
-        let move1 = Move::new(DEFAULT_MAX_ACCEL, DEFAULT_JUNCTION_DEV, DEFAULT_MAX_VELOCITY, DEFAULT_MAX_ACCEL_TO_DECEL, [0.0,0.0,0.0,0.0], [10.0,0.0,0.0,0.0], 100.0);
-        let move2 = Move::new(DEFAULT_MAX_ACCEL, DEFAULT_JUNCTION_DEV, DEFAULT_MAX_VELOCITY, DEFAULT_MAX_ACCEL_TO_DECEL, [10.0,0.0,0.0,0.0], [20.0,0.0,0.0,0.0], 100.0);
+        let move1 = Move::new(DEFAULT_MAX_ACCEL_TEST, DEFAULT_JUNCTION_DEV_TEST, DEFAULT_MAX_VELOCITY_TEST, DEFAULT_MAX_ACCEL_TO_DECEL_TEST, [0.0,0.0,0.0,0.0], [10.0,0.0,0.0,0.0], 100.0);
+        let move2 = Move::new(DEFAULT_MAX_ACCEL_TEST, DEFAULT_JUNCTION_DEV_TEST, DEFAULT_MAX_VELOCITY_TEST, DEFAULT_MAX_ACCEL_TO_DECEL_TEST, [10.0,0.0,0.0,0.0], [20.0,0.0,0.0,0.0], 100.0);
         laq.add_move(move1.clone(), &extra_axes_mock);
         laq.add_move(move2.clone(), &extra_axes_mock);
 
@@ -1041,6 +1064,10 @@ mod tests {
         assert!(flushed_moves[1].start_v > 0.0 || flushed_moves[1].cruise_t > 0.0);
     }
 }
+
+[end of klipper_host_rust/src/toolhead.rs]
+
+[end of klipper_host_rust/src/toolhead.rs]
 
 [end of klipper_host_rust/src/toolhead.rs]
 
