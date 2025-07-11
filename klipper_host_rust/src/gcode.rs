@@ -173,6 +173,7 @@ impl<'a> GCode<'a> {
         match cmd.command_letter {
             'G' => match cmd.command_number as i32 {
                 0 | 1 => self.cmd_g0_g1(cmd, toolhead),
+                4 => self.cmd_g4(cmd, toolhead),
                 28 => self.cmd_g28(cmd, toolhead),
                 90 => self.cmd_g90(cmd),
                 91 => self.cmd_g91(cmd),
@@ -394,6 +395,19 @@ impl<'a> GCode<'a> {
     // M83: Use Relative E distances
     fn cmd_m83(&mut self, _cmd: &GCodeCommand) -> Result<(), CommandError> {
         self.state.absolute_extrude = false;
+        Ok(())
+    }
+
+    // G4: Dwell
+    // Klipper's G4 P specifies milliseconds.
+    fn cmd_g4(&mut self, cmd: &GCodeCommand, toolhead: &mut ToolHead<'a>) -> Result<(), CommandError> {
+        let p_val_ms = self.get_float_param_opt(&cmd.params, 'P').unwrap_or(0.0);
+        // Klipper's get_float with minval=0 ensures non-negative.
+        // Our get_float_param_opt doesn't do that yet, so add a check.
+        let delay_ms = if p_val_ms < 0.0 { 0.0 } else { p_val_ms };
+        let delay_s = delay_ms / 1000.0;
+
+        toolhead.dwell(delay_s).map_err(|e| CommandError(e))?; // Assuming toolhead.dwell might return Result in future
         Ok(())
     }
 }
@@ -968,4 +982,72 @@ mod tests {
         assert_eq!(gcode.state.gcode_offset.e, Some(50.0), "G92 E offset should remain unchanged");
     }
 
+    // Tests for G4
+    #[test]
+    fn test_cmd_g4_with_p_param() {
+        let mut gcode = create_test_gcode();
+        let mut toolhead = create_test_toolhead();
+        let initial_print_time = toolhead.get_last_move_time();
+
+        let cmd_g4_p100 = gcode.parse_line("G4 P100").unwrap(); // 100 ms
+        gcode.process_command(&cmd_g4_p100, &mut toolhead).unwrap();
+
+        // dwell should advance print_time by 0.1 seconds
+        let expected_print_time = initial_print_time + 0.1;
+        assert!((toolhead.get_last_move_time() - expected_print_time).abs() < 1e-9,
+                "Toolhead print_time should advance by 0.1s for G4 P100. Expected {}, got {}",
+                expected_print_time, toolhead.get_last_move_time());
+    }
+
+    #[test]
+    fn test_cmd_g4_no_param() {
+        let mut gcode = create_test_gcode();
+        let mut toolhead = create_test_toolhead();
+        let initial_print_time = toolhead.get_last_move_time();
+
+        let cmd_g4 = gcode.parse_line("G4").unwrap();
+        gcode.process_command(&cmd_g4, &mut toolhead).unwrap();
+
+        // Default P value is 0, so no change in print_time
+        assert!((toolhead.get_last_move_time() - initial_print_time).abs() < 1e-9,
+                "Toolhead print_time should not change for G4 with no params. Expected {}, got {}",
+                initial_print_time, toolhead.get_last_move_time());
+    }
+
+    #[test]
+    fn test_cmd_g4_negative_p_param() {
+        let mut gcode = create_test_gcode();
+        let mut toolhead = create_test_toolhead();
+        let initial_print_time = toolhead.get_last_move_time();
+
+        let cmd_g4_neg_p = gcode.parse_line("G4 P-100").unwrap();
+        gcode.process_command(&cmd_g4_neg_p, &mut toolhead).unwrap();
+
+        // Negative P should result in 0s dwell
+        assert!((toolhead.get_last_move_time() - initial_print_time).abs() < 1e-9,
+                "Toolhead print_time should not change for G4 with negative P. Expected {}, got {}",
+                initial_print_time, toolhead.get_last_move_time());
+    }
+
+    #[test]
+    fn test_cmd_g4_s_param_is_ignored() { // Klipper toolhead.cmd_G4 only uses P
+        let mut gcode = create_test_gcode();
+        let mut toolhead = create_test_toolhead();
+        let initial_print_time = toolhead.get_last_move_time();
+
+        let cmd_g4_s = gcode.parse_line("G4 S2").unwrap(); // Should be ignored by cmd_G4
+        gcode.process_command(&cmd_g4_s, &mut toolhead).unwrap();
+
+        // S param is ignored, P defaults to 0, so no change in print_time
+        assert!((toolhead.get_last_move_time() - initial_print_time).abs() < 1e-9,
+                "Toolhead print_time should not change for G4 S2 as only P is considered. Expected {}, got {}",
+                initial_print_time, toolhead.get_last_move_time());
+
+        let cmd_g4_p50_s2 = gcode.parse_line("G4 P50 S2").unwrap();
+        gcode.process_command(&cmd_g4_p50_s2, &mut toolhead).unwrap();
+        let expected_print_time = initial_print_time + 0.05; // From P50
+         assert!((toolhead.get_last_move_time() - expected_print_time).abs() < 1e-9,
+                "Toolhead print_time should advance by 0.05s for G4 P50 S2. Expected {}, got {}",
+                expected_print_time, toolhead.get_last_move_time());
+    }
 }

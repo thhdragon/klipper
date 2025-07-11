@@ -85,8 +85,10 @@ pub fn klippy_main() {
         "M82",                      // Absolute extrusion
         "G1 X1 Z1 E5",              // Move to G-code X1 Z1, G-code E5
                                     // (actual machine E will be E5 + E_offset from G92 E0)
+        "G4 P500",                  // Dwell for 500 milliseconds
         "G28 Y",                    // Re-home Y
         "G1 Y15",                   // Move Y to 15 (should be machine 15, gcode 15)
+        "G4 P100",                  // Dwell for 100 milliseconds
         "INVALID GCODE",            // Test error handling
         "G1 X10000",                // Test potential toolhead error (if limits were enforced)
     ];
