@@ -297,4 +297,45 @@ impl GpioManager {
             None => Err("Pin not found in manager to release (was it taken for ADC?)"),
         }
     }
+
+    // --- PWM Pin Handling ---
+
+    /// Configures a pin for PWM use if it's available and PWM capable.
+    /// Marks the pin state as FunctionPwm. The actual PWM peripheral setup
+    /// is done by the caller using the PWM Slices peripheral.
+    /// This method primarily handles the GpioManager's state tracking for the pin.
+    pub fn configure_pin_for_pwm(&mut self, pin_id: u8) -> Result<(), &'static str> {
+        // Check if pin_id is valid for any PWM channel (0-29 are all potentially PWM capable on RP2040)
+        if pin_id as usize >= NUM_GPIO_PINS {
+            return Err("Invalid pin_id for PWM");
+        }
+
+        // A mapping from GPIO pin_id to PWM Slice/Channel is needed by the caller.
+        // This function just validates if the pin can be set to PWM mode by GpioManager.
+        // For example, GPIO0 can be PWM0_A, GPIO1 can be PWM0_B, etc.
+
+        self.with_pin_mut(pin_id, |mp| {
+            match mp.current_mode {
+                PinModeState::Disabled | PinModeState::InputFloating | PinModeState::OutputPushPull => {
+                    // It's generally safe to reconfigure from these common states.
+                    // The actual HAL call to set the pin function to PWM will happen externally
+                    // by the code that uses the PWM Slices peripheral.
+                    // This GpioManager method just updates its internal state tracking.
+                    // The DynPin itself is not changed here yet, that happens when the HAL
+                    // configures the pin for PWM using `gpio_to_pwm_slice_gpio`.
+                    mp.current_mode = PinModeState::FunctionPwm;
+                    defmt::debug!("GpioManager: Pin {} configured for PWM state.", pin_id);
+                    Ok(())
+                }
+                PinModeState::FunctionPwm => {
+                    // Already in PWM mode, allow re-configuration by caller
+                    Ok(())
+                }
+                _ => {
+                    defmt::warn!("GpioManager: Pin {} in incompatible mode {:?} for PWM.", pin_id, mp.current_mode);
+                    Err(DynPinModeError::InvalidState) // Re-purpose error or use specific one
+                }
+            }
+        })
+    }
 }

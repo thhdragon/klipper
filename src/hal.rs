@@ -97,3 +97,52 @@ pub trait AdcChannel {
 //     fn acquire_channel(&mut self, pin_id: u8) -> Result<Self::Channel, AdcError>;
 // }
 // For now, AdcChannel itself is the main focus.
+
+/// Errors that can occur during PWM operations.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, defmt::Format)]
+pub enum PwmError {
+    InvalidPin,         // The specified pin cannot be used for PWM or is invalid.
+    PinUnavailable,     // The pin is currently in use by another function.
+    InvalidDutyCycle,   // Duty cycle value is out of range (e.g., > 1.0 or > max_raw).
+    InvalidFrequency,   // Frequency value is out of achievable range.
+    InvalidPeriod,      // Period value is out of achievable range.
+    ConfigurationError, // Error during PWM or pin configuration.
+}
+
+/// Trait for Pulse Width Modulation (PWM) channels.
+/// Assumes a single PWM channel is being controlled.
+pub trait PwmChannel {
+    /// Associated error type for this PWM implementation.
+    type Error: core::fmt::Debug + defmt::Format;
+
+    // Constructor is typically handled by a higher-level PWM peripheral manager
+    // that vends PwmChannel instances for specific pins/channels.
+    // fn new_pwm_channel(pin_id: u8, pwm_peripheral_resources: ???) -> Result<Self, Self::Error> where Self: Sized;
+
+    /// Enables the PWM channel output.
+    fn enable(&mut self) -> Result<(), Self::Error>;
+
+    /// Disables the PWM channel output.
+    /// (e.g., sets duty to 0 or tristates the pin, depending on hardware).
+    fn disable(&mut self) -> Result<(), Self::Error>;
+
+    /// Sets the duty cycle as a percentage (0.0 to 1.0).
+    /// 0.0 means always off, 1.0 means always on (within the PWM period).
+    fn set_duty_cycle_percent(&mut self, duty_percent: f32) -> Result<(), Self::Error>;
+
+    /// Sets the duty cycle using a raw hardware-specific value.
+    /// `duty_raw` typically ranges from 0 to `get_max_duty_raw()`.
+    fn set_duty_cycle_raw(&mut self, duty_raw: u16) -> Result<(), Self::Error>;
+
+    /// Gets the maximum possible raw duty cycle value for this channel.
+    /// This often depends on the PWM period/frequency and hardware counter size.
+    fn get_max_duty_raw(&self) -> u16;
+
+    /// Sets the frequency of the PWM signal in Hz.
+    /// Note: Setting frequency may also affect the resolution of the duty cycle (max_duty_raw).
+    fn set_frequency_hz(&mut self, freq_hz: u32) -> Result<(), Self::Error>;
+
+    // /// Sets the period of the PWM signal in raw timer ticks.
+    // /// This is often a more direct way to control frequency for some HALs.
+    // fn set_period_ticks(&mut self, period_ticks: u32) -> Result<(), Self::Error>;
+}
