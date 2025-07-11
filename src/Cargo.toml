@@ -39,6 +39,10 @@ cortex-m-rt = "0.7.3" # Check for the latest version, ensure compatibility with 
 usb-device = "0.3.1" # Check for latest version
 usbd-serial = "0.2.0" # Check for latest version, ensure compatibility with usb-device
 
+# Defmt Logging
+defmt = "0.3.5"        # Check for latest version
+defmt-rtt = "0.4.0"    # Check for latest version, ensure compatibility with defmt
+
 # For no_std with alloc (needed by trapq.rs which uses Vec)
 # This requires nightly compiler and a global allocator definition.
 # For now, I will assume the `alloc` feature can be enabled on a crate/module basis

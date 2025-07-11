@@ -1,27 +1,29 @@
 #![no_std]
 #![no_main]
 
-// Panic handler
+// Defmt imports
+use defmt::*; // Logging macros
+use defmt_rtt as _; // Global logger + RTT transport + defmt panic handler
+
+// Entry point
+use cortex_m_rt::entry;
+
+// NOTE: The custom panic_handler below is likely overridden by defmt_rtt's panic handler.
+// We can remove it if defmt's output is preferred for panics.
+// For now, let's keep it to see which one takes precedence or if there's a conflict.
+// If defmt-rtt is linked, its panic handler should be used.
+
+// Panic handler (original, may be superseded by defmt-rtt)
 use core::panic::PanicInfo;
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    // Log the panic info if a logger is available
-    // For example, using RTT or semihosting if enabled.
-    // log::error!("{}", info);
-
-    // On panic, loop indefinitely. Blink an LED or signal error in some way.
-    // Attempt to blink the LED rapidly as an error signal if possible.
-    // This part is tricky without a fully initialized HAL.
-    // For now, just a simple loop.
+    // This existing panic handler will likely NOT be called if defmt-rtt is linked.
+    // defmt::error!("Panic: {}", defmt::Debug2Format(info)); // Example if we wanted to use defmt here manually
     loop {
-        // Use a volatile write to prevent the compiler from optimizing this loop away.
         cortex_m::asm::nop();
     }
 }
-
-// Entry point
-use cortex_m_rt::entry;
 
 // HAL and PAC for RP2040
 use rp2040_hal::{
@@ -152,32 +154,13 @@ fn main() -> ! {
 
         // Try to send data over USB serial
         // SAFETY: Accessing static mut. Ok for polling if USB IRQ doesn't interfere.
-        unsafe {
-            if let Some(serial) = USB_SERIAL.as_mut() {
-                // Create a message with a counter
-                // Note: heapless::String or arrayvec could be used for formatting without std.
-                // For simplicity, we'll use a fixed buffer and manual formatting.
-                let mut message_buf = [0u8; 64]; // Buffer for our message
-                let greeting = b"Hello, Klipper! Count: ";
-                let count_str = u32_to_str(count, &mut message_buf[greeting.len()..]);
-                let newline = b"\r\n";
-
-                // Combine parts into the buffer
-                message_buf[..greeting.len()].copy_from_slice(greeting);
-                // count_str is already in message_buf
-                let end_of_count = greeting.len() + count_str.len();
-                message_buf[end_of_count..end_of_count + newline.len()].copy_from_slice(newline);
-
-                let final_message = &message_buf[..end_of_count + newline.len()];
-
-                // Write the message. Ignore errors and partial writes for this simple example.
-                let _ = serial.write(final_message);
-            }
-        }
+        // Use defmt for the counter message
+        info!("Hello, Klipper! Count: {}", count);
         count = count.wrapping_add(1);
 
 
         // Poll the USB device for events
+        // The serial port is still polled for incoming commands and for sending command responses.
         // This needs to be called regularly to process USB traffic
         // SAFETY: Accessing static mut globals. Guard with critical section if interrupts were involved.
         // For polling, this is okay as long as USB interrupt is not enabled and trying to access these.

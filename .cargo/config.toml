@@ -21,4 +21,4 @@ runner = "probe-rs run --chip RP2040"
 
 [env]
 # Optional: Set environment variables for the build process if needed
-# DEFMT_LOG = "info" # Example for defmt logging levels
+DEFMT_LOG = "info" # Set default defmt log level
