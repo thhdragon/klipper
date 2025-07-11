@@ -1002,6 +1002,11 @@ mod tests {
         assert_eq!(th_pos[0], toolhead::X_GCODE_POSITION_AFTER_HOMING);
         assert_eq!(th_pos[1], toolhead::Y_GCODE_POSITION_AFTER_HOMING);
         assert_eq!(th_pos[2], toolhead::Z_GCODE_POSITION_AFTER_HOMING);
+
+        let kin_limits = toolhead.kin.get_axis_limits_for_test();
+        assert_eq!(kin_limits[0], (0.0, 200.0), "X axis limits after G28 all");
+        assert_eq!(kin_limits[1], (0.0, 200.0), "Y axis limits after G28 all");
+        assert_eq!(kin_limits[2], (0.0, 180.0), "Z axis limits after G28 all");
     }
 
     #[test]
@@ -1026,6 +1031,11 @@ mod tests {
         assert_eq!(th_pos[0], toolhead::X_GCODE_POSITION_AFTER_HOMING);
         assert_eq!(th_pos[1], 20.0); // Y unchanged
         assert_eq!(th_pos[2], toolhead::Z_GCODE_POSITION_AFTER_HOMING);
+
+        let kin_limits = toolhead.kin.get_axis_limits_for_test();
+        assert_eq!(kin_limits[0], (0.0, 200.0), "X axis limits after G28 X Z");
+        assert_eq!(kin_limits[1], (1.0, -1.0), "Y axis limits should be unhomed after G28 X Z");
+        assert_eq!(kin_limits[2], (0.0, 180.0), "Z axis limits after G28 X Z");
     }
 
     #[test]
