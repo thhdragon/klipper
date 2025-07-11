@@ -32,6 +32,16 @@ class DeltaKinematics:
                                           above=0., maxval=self.max_accel)
         # Read global delta radius
         self.radius = config.getfloat('delta_radius', above=0.)
+        # Effector joint radius (distance from nozzle to effector arm joints)
+        # This is a new parameter, crucial for tilt compensation.
+        # Defaulting to a smallish value, but should ideally be configured by user.
+        self.effector_joint_radius = config.getfloat('delta_effector_radius', 40.0, above=0.)
+        if config.get('delta_effector_radius', None) is None:
+            logging.warning(
+                "Config option 'delta_effector_radius' not specified in [printer] section."
+                " Using default %.2fmm. For accurate probe tilt compensation, this value should be set."
+                % (self.effector_joint_radius,))
+
         # Read per-stepper parameters
         self.angles = []
         self.arm_lengths = []
@@ -218,12 +228,91 @@ class DeltaKinematics:
                      for rail in self.rails]
         # Pass radius_offsets to DeltaCalibration constructor
         return DeltaCalibration(self.radius, self.angles, self.arm_lengths,
-                                endstops, stepdists, self.radius_offsets)
+                                endstops, stepdists, self.radius_offsets,
+                                self.effector_joint_radius) # Pass effector_joint_radius
+
+    def get_effector_normal(self, nozzle_x, nozzle_y, nozzle_z):
+        # Calculate the normal vector of the effector plane at the given nozzle XYZ.
+        # This implementation uses a simplified approach assuming effector joint XY positions
+        # are oriented according to tower angles relative to the nozzle XY,
+        # and then solves for their Z heights using arm length constraints.
+
+        # Ensure FFI is loaded (it should be by the time kinematics are used)
+        ffi_main, ffi_lib = chelper.get_ffi()
+
+        carriage_heights = []
+        for i in range(3):
+            sk = self.rails[i].get_steppers()[0].get_sk()
+            h = ffi_lib.itersolve_calc_position_from_coord(
+                sk, nozzle_x, nozzle_y, nozzle_z
+            )
+            carriage_heights.append(h)
+
+        C_coords = [] # Carriage 3D coordinates (tower_x, tower_y, carriage_z)
+        for i in range(3):
+            C_coords.append( (self.towers[i][0], self.towers[i][1], carriage_heights[i]) )
+
+        E_coords_xy = [] # Approximated XY of effector joints
+        for i in range(3):
+            # Assume effector joint angles align with tower angles (no relative yaw of effector)
+            angle_rad = math.radians(self.angles[i])
+            ex = nozzle_x + self.effector_joint_radius * math.cos(angle_rad)
+            ey = nozzle_y + self.effector_joint_radius * math.sin(angle_rad)
+            E_coords_xy.append( (ex, ey) )
+
+        E_coords_z = [] # Z coordinates of effector joints
+        for i in range(3):
+            dx_sq = (E_coords_xy[i][0] - C_coords[i][0])**2
+            dy_sq = (E_coords_xy[i][1] - C_coords[i][1])**2
+            arm_len_sq = self.arm2[i]
+
+            val_under_sqrt = arm_len_sq - dx_sq - dy_sq
+            if val_under_sqrt < 1e-9: # Use a small epsilon to avoid sqrt of tiny negative due to float precision
+                # This implies an impossible geometry or point at extreme reach.
+                logging.warning(
+                    "Probe tilt: Unreachable effector joint %d for nozzle (%.3f,%.3f,%.3f). ArmLenSq=%.3f, dXsq+dYsq=%.3f"
+                    % (i, nozzle_x, nozzle_y, nozzle_z, arm_len_sq, dx_sq + dy_sq))
+                return (0.0, 0.0, 1.0) # Default to perfectly level effector
+
+            e_z = C_coords[i][2] - math.sqrt(val_under_sqrt)
+            E_coords_z.append(e_z)
+
+        E = [ (E_coords_xy[i][0], E_coords_xy[i][1], E_coords_z[i]) for i in range(3) ]
+
+        # Calculate normal vector from the three effector points E0, E1, E2
+        v1_x = E[1][0] - E[0][0]
+        v1_y = E[1][1] - E[0][1]
+        v1_z = E[1][2] - E[0][2]
+
+        v2_x = E[2][0] - E[0][0]
+        v2_y = E[2][1] - E[0][1]
+        v2_z = E[2][2] - E[0][2]
+
+        # Cross product
+        nx = v1_y * v2_z - v1_z * v2_y
+        ny = v1_z * v2_x - v1_x * v2_z
+        nz = v1_x * v2_y - v1_y * v2_x
+
+        norm_len = math.sqrt(nx**2 + ny**2 + nz**2)
+        if norm_len < 1e-9: # Check for zero length normal (collinear points)
+            logging.warning(
+                    "Probe tilt: Zero length normal vector for nozzle (%.3f,%.3f,%.3f)."
+                    % (nozzle_x, nozzle_y, nozzle_z))
+            return (0.0, 0.0, 1.0)
+
+        nx /= norm_len
+        ny /= norm_len
+        nz /= norm_len
+
+        # Ensure normal points "upwards" (positive Z component)
+        if nz < 0.0:
+            return (-nx, -ny, -nz)
+        return (nx, ny, nz)
 
 # Delta parameter calibration for DELTA_CALIBRATE tool
 class DeltaCalibration:
     def __init__(self, radius, angles, arms, endstops, stepdists,
-                 radius_offsets=None): # Added radius_offsets
+                 radius_offsets=None, effector_joint_radius=40.0): # Added radius_offsets and effector_joint_radius
         self.radius = radius # Global delta_radius
         self.angles = angles # List of 3 tower angles [angle_a, angle_b, angle_c]
         self.arms = arms # List of 3 arm lengths [arm_a, arm_b, arm_c]
@@ -320,7 +409,8 @@ class DeltaCalibration:
 
         # stepdists are fixed and must be carried over from the original object (self.stepdists)
         return DeltaCalibration(radius, current_angles, new_arms, new_endstops,
-                                self.stepdists, new_radius_offsets)
+                                self.stepdists, new_radius_offsets,
+                                self.effector_joint_radius) # Pass through effector_joint_radius
     def get_position_from_stable(self, stable_position):
         # Return cartesian coordinates for the given stable_position
         sphere_coords = [

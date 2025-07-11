@@ -1394,12 +1394,37 @@ class ZMesh:
             msg += "Mesh Range: min=%.4f max=%.4f\n" % (rng[0], rng[1])
             msg += "Interpolation Algorithm: %s\n" \
                    % (self.mesh_params['algo'])
-            msg += "Measured points:\n"
-            for y_line in range(self.mesh_y_count - 1, -1, -1):
-                for z in matrix[y_line]:
-                    msg += "  %f" % (z)
-                msg += "\n"
-            print_func(msg)
+            msg += "Measured points:\n" # This is actually the interpolated mesh_matrix
+            # Output format for visualizers: "Bed X: X.XXX Y: Y.YYY Z: Z.ZZZZZZ"
+            # Need to iterate and calculate X,Y for each Z to output in this format.
+            # This format is more standard for external processing than just a grid of Z values.
+
+            origin_x, origin_y = (0., 0.)
+            is_round_mesh = False
+            if self.mesh_params.get('radius') is not None:
+                is_round_mesh = True
+                if self.mesh_params.get('origin') is not None:
+                    origin_x, origin_y = self.mesh_params['origin']
+                mesh_radius_sq = self.mesh_params['radius']**2
+                # Small tolerance for floating point comparisons of distance
+                tolerance_sq = 1e-4 # (0.01mm)^2, an arbitrary small number
+
+            output_lines = [msg] # Start with existing metadata
+            for y_idx in range(self.mesh_y_count - 1, -1, -1): # Iterate from max Y to min Y
+                y_coord = self.get_y_coordinate(y_idx)
+                for x_idx in range(self.mesh_x_count): # Iterate from min X to max X
+                    x_coord = self.get_x_coordinate(x_idx)
+                    z_val = matrix[y_idx][x_idx]
+
+                    if is_round_mesh:
+                        dist_sq = (x_coord - origin_x)**2 + (y_coord - origin_y)**2
+                        if dist_sq > mesh_radius_sq + tolerance_sq:
+                            # Point is outside the circle for a round mesh
+                            output_lines.append("Bed X: %.3f Y: %.3f Z: nan" % (x_coord, y_coord))
+                            continue # Skip to next point
+
+                    output_lines.append("Bed X: %.3f Y: %.3f Z: %.6f" % (x_coord, y_coord, z_val))
+            print_func("\n".join(output_lines))
         else:
             print_func("bed_mesh: Z Mesh not generated")
     def build_mesh(self, z_matrix):
