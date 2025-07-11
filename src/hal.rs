@@ -14,6 +14,28 @@ pub trait GpioOut {
     // For now, a simple toggle is provided.
 }
 
+/// Enum to specify internal pull resistor configuration for input pins.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PullType {
+    Up,
+    Down,
+    Floating,
+}
+
+/// Trait for digital input pins.
+pub trait GpioIn {
+    /// Configures a pin as an input with the specified pull resistor.
+    /// `pin_id`: The MCU-specific identifier for the pin.
+    /// `pull`: The desired pull resistor configuration.
+    /// Returns an instance of the GpioIn implementor.
+    /// This might panic or return a Result in a more robust implementation if pin_id is invalid.
+    fn new_input(pin_id: u8, pull: PullType) -> Self where Self: Sized; // Sized because new returns Self
+
+    /// Reads the current state of the input pin.
+    /// Returns `true` if the pin is high, `false` if low.
+    fn read(&self) -> bool;
+}
+
 pub trait Timer {
     // Represents a timer that can be scheduled by a scheduler
     // The callback will likely need to be more flexible, perhaps taking a context.
