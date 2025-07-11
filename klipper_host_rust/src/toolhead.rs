@@ -2,6 +2,42 @@
 // Corresponds to klippy/toolhead.py - Manages the printer's toolhead.
 
 use crate::configfile::Configfile;
+
+#[derive(Debug, Clone)]
+pub struct Endstop {
+    pub name: String,
+    // pub pin_name: String, // For future hardware integration
+    pub triggered: bool,    // Conceptual state
+    pub trigger_position_machine: f64, // Machine coordinate where this endstop triggers
+    // pub pullup: bool, // For future hardware integration
+    // pub invert: bool, // For future hardware integration
+}
+
+impl Endstop {
+    fn new(name: String, trigger_position_machine: f64) -> Self {
+        Endstop {
+            name,
+            triggered: false,
+            trigger_position_machine,
+        }
+    }
+
+    // Method to check if the endstop is triggered based on current machine position.
+    // In a real system, this would query hardware.
+    // For simulation, we compare current_machine_pos to trigger_position_machine.
+    // homing_positive_dir: true if homing towards positive coordinates for this axis.
+    #[allow(dead_code)] // Will be used by perform_homing_move
+    fn is_triggered_by_pos(&self, current_machine_pos: f64, homing_positive_dir: bool) -> bool {
+        if homing_positive_dir {
+            current_machine_pos >= self.trigger_position_machine
+        } else {
+            current_machine_pos <= self.trigger_position_machine
+        }
+    }
+}
+
+
+use crate::mcu::Mcu;
 use crate::mcu::Mcu;
 use crate::reactor::Reactor;
 use crate::heaters::Heater; // Import the Heater struct
@@ -414,6 +450,12 @@ pub struct ToolHead<'a> {
     // Heaters
     pub extruder_heater: Heater, // Assuming one extruder for now
     pub bed_heater: Heater,
+
+    // Endstops (conceptual for now)
+    x_endstop: Endstop,
+    y_endstop: Endstop,
+    z_endstop: Endstop,
+    // TODO: Add more for Z1, Z2 etc. if multi-Z is supported
 }
 
 // Basic trait definitions - these would likely be in their own modules
@@ -475,8 +517,11 @@ impl<'a> ToolHead<'a> {
             clear_history_time: 0.0,
             kin_flush_delay: 0.001, // SDS_CHECK_TIME
             kin_flush_times: Vec::new(),
-            extruder_heater: Heater::new("extruder".to_string()), // Initialize extruder heater
-            bed_heater: Heater::new("heater_bed".to_string()),     // Initialize bed heater
+            extruder_heater: Heater::new("extruder".to_string()),
+            bed_heater: Heater::new("heater_bed".to_string()),
+            x_endstop: Endstop::new("x_endstop".to_string(), X_MACHINE_POSITION_AT_ENDSTOP),
+            y_endstop: Endstop::new("y_endstop".to_string(), Y_MACHINE_POSITION_AT_ENDSTOP),
+            z_endstop: Endstop::new("z_endstop".to_string(), Z_MACHINE_POSITION_AT_ENDSTOP),
             // Initialize other fields, possibly with defaults or placeholders
         };
 
@@ -677,78 +722,81 @@ impl<'a> ToolHead<'a> {
 
     // Performs a homing move for a single axis.
     // axis_index: 0 for X, 1 for Y, 2 for Z.
-    // For now, this is a simplified, mocked version.
-    // It will "move" to a conceptual endstop and return its configured machine position at trigger.
+    // This version simulates iterative movement towards an endstop.
     pub fn perform_homing_move(
         &mut self,
         axis_index: usize,
-        // config_homing_speed: f64, // TODO: Would come from config
-        // config_position_endstop: f64, // TODO: Would come from config (this is the GCODE value to set)
-        // config_homing_dir_is_positive: bool // TODO: Whether homing towards positive or negative
+        // For this iteration, G92 offsets are NOT considered during the raw probing move.
+        // The G28 handler will deal with G92 updates *after* this function returns the machine trigger position.
+        // So, self.commanded_pos is treated as equivalent to machine_pos for triggering checks.
     ) -> Result<f64, String> {
         if axis_index > 2 {
             return Err("Invalid axis_index for homing".to_string());
         }
 
-        // Mocked parameters (would normally come from config per axis)
-        // These constants are defined at the top of the ToolHead struct for now
         let homing_speed = DEFAULT_HOMING_SPEED; // mm/s
-        // This is the MACHINE coordinate where the endstop is physically located.
-        // After homing, G28 will typically issue a G92 to make this machine coordinate
-        // correspond to a specific G-CODE coordinate (often 0, or bed_size).
-        let machine_pos_at_endstop_trigger = match axis_index {
-            0 => X_MACHINE_POSITION_AT_ENDSTOP, // e.g., 0.0 if min endstop at 0
-            1 => Y_MACHINE_POSITION_AT_ENDSTOP, // e.g., 0.0
-            2 => Z_MACHINE_POSITION_AT_ENDSTOP, // e.g., 0.0
+        let (endstop, gcode_pos_after_homing, axis_char) = match axis_index {
+            0 => (&self.x_endstop, X_GCODE_POSITION_AFTER_HOMING, 'X'),
+            1 => (&self.y_endstop, Y_GCODE_POSITION_AFTER_HOMING, 'Y'),
+            2 => (&self.z_endstop, Z_GCODE_POSITION_AFTER_HOMING, 'Z'),
             _ => unreachable!(),
         };
 
-        // Simulate flushing moves before homing that axis
-        self.wait_moves(); // Existing method to flush lookahead and wait
+        // Assuming min endstops: homing towards negative coordinates.
+        // A real implementation would get this from config (e.g., homing_positive_dir).
+        let homing_positive_dir = false;
+        let step_size = if homing_positive_dir { 1.0 } else { -1.0 }; // Small step for simulation
+        let max_homing_travel = 300.0; // Max distance to travel before faulting
+        let mut travel_so_far = 0.0;
 
-        let axis_char = ['X', 'Y', 'Z'][axis_index];
-        println!(
-            "ToolHead: Mock homing for axis {}. Moving at speed {} mm/s. Expecting endstop trigger at machine pos: {:.3}",
-            axis_char, homing_speed, machine_pos_at_endstop_trigger
-        );
-
-        // In a real implementation:
-        // 1. Get current G-CODE position: self.commanded_pos[axis_index]
-        // 2. Get current G92 offset for the axis from gcode_state (passed in or accessed).
-        // 3. Calculate current MACHINE position = GCODE_pos - G92_offset.
-        // 4. Determine homing direction (e.g., towards negative for X min).
-        // 5. Command a move to a point far beyond the expected endstop trigger point in that direction.
-        //    This move would be executed via drip_move, monitoring the endstop.
-        // 6. drip_move would return the MACHINE position where the endstop triggered.
-
-        // For this mock:
-        // We directly "know" the machine_pos_at_endstop_trigger.
-        // We need to update self.commanded_pos to reflect the G-CODE coordinate that G28 will set.
-        // G28 will call G92 logic: G92 NewGcodePos.
-        // The NewGcodePos is often 0 (e.g. X_POSITION_ENDSTOP_GCODE_VALUE).
-        // The G92 logic calculates: offset = machine_pos_at_endstop_trigger - NewGcodePos.
-        // Then G28 calls toolhead.set_position(NewGcodePos for this axis).
-        // So, after this homing move, toolhead's commanded_pos for this axis should become NewGcodePos.
-
-        let gcode_pos_after_homing_g92 = match axis_index {
-             0 => X_GCODE_POSITION_AFTER_HOMING,
-             1 => Y_GCODE_POSITION_AFTER_HOMING,
-             2 => Z_GCODE_POSITION_AFTER_HOMING,
-            _ => unreachable!(),
-        };
-        self.commanded_pos[axis_index] = gcode_pos_after_homing_g92;
-
-        // Simulate that the toolhead is now physically at machine_pos_at_endstop_trigger,
-        // and its G-code coordinate for this axis is gcode_pos_after_homing_g92.
-        // The actual update to GCodeState's last_position (machine) and base_position (gcode)
-        // will be handled by the G28 command in gcode.rs using the returned machine_pos_at_endstop_trigger.
+        self.wait_moves(); // Flush previous moves
 
         println!(
-            "ToolHead: Axis {} mock homing complete. Endstop 'triggered' at machine position {:.3f}. Toolhead G-code pos for axis set to {:.3f}.",
-            axis_char, machine_pos_at_endstop_trigger, gcode_pos_after_homing_g92
+            "ToolHead: Starting iterative homing for axis {}. Target machine_pos: {:.3f}",
+            axis_char, endstop.trigger_position_machine
         );
 
-        Ok(machine_pos_at_endstop_trigger)
+        loop {
+            // Calculate current machine position for checking.
+            // SIMPLIFICATION: Treat self.commanded_pos as machine_pos FOR THIS CHECK.
+            // A full implementation would need to know the G92 offset for this axis if we were moving in G-code space.
+            // Or, homing moves could be commanded in a "raw machine coordinate" mode.
+            let current_simulated_machine_pos = self.commanded_pos[axis_index];
+
+            if endstop.is_triggered_by_pos(current_simulated_machine_pos, homing_positive_dir) {
+                println!(
+                    "ToolHead: Axis {} endstop triggered at machine_pos {:.3f} (simulated, target was {:.3f})",
+                    axis_char, current_simulated_machine_pos, endstop.trigger_position_machine
+                );
+                // The actual trigger position is defined by the endstop's property
+                self.commanded_pos[axis_index] = gcode_pos_after_homing; // Update toolhead's G-code view
+                return Ok(endstop.trigger_position_machine);
+            }
+
+            if travel_so_far >= max_homing_travel {
+                return Err(format!(
+                    "Homing failed for axis {}: Max travel {:.1f}mm reached without trigger",
+                    axis_char, max_homing_travel
+                ));
+            }
+
+            // Create the next small move
+            let mut next_pos_gcode = self.commanded_pos;
+            next_pos_gcode[axis_index] += step_size;
+
+            // Perform the small step. This updates self.commanded_pos.
+            // Using a reduced speed for finer control might be good, but self.move_to uses its own lookahead.
+            // For simulation, the speed here mainly affects how quickly print_time advances.
+            if let Err(e) = self.move_to(next_pos_gcode, homing_speed) {
+                return Err(format!("Error during homing step for axis {}: {}", axis_char, e));
+            }
+            self.wait_moves(); // Ensure this small step is "completed" in simulation
+
+            travel_so_far += step_size.abs();
+            // Add a small delay to prevent an infinite loop in tests if something is wrong,
+            // and to make the simulation progress in observable time if debugging klippy_main.
+            // std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     // newpos is [f64;4]
