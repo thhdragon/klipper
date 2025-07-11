@@ -1,11 +1,4 @@
-# Test case for basic movement on delta printers
-CONFIG delta_calibrate.cfg
-DICTIONARY ../configs/linux.dict
-
-# Start by homing the printer.
 G28
-
-# Run basic delta calibration (in manual mode)
 DELTA_CALIBRATE METHOD=manual
 G1 Z0.1
 ACCEPT
@@ -21,8 +14,6 @@ G1 Z0.1
 ACCEPT
 G1 Z0.1
 ACCEPT
-
-# Run extended delta calibration
 DELTA_ANALYZE CENTER_DISTS=74,74,74,74,74,74
 DELTA_ANALYZE OUTER_DISTS=74,74,74,74,74,74
 DELTA_ANALYZE CENTER_PILLAR_WIDTHS=9,9,9

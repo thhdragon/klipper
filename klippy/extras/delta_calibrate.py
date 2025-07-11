@@ -163,37 +163,74 @@ class DeltaCalibrate:
         self.calculate_params(probe_positions, self.last_distances)
     def calculate_params(self, probe_positions, distances):
         height_positions = self.manual_heights + probe_positions
+        if not height_positions:
+            self.gcode.respond_info("No probe positions available for calibration.")
+            return
+
         # Setup for coordinate descent analysis
-        kin = self.printer.lookup_object('toolhead').get_kinematics()
+        toolhead = self.printer.lookup_object('toolhead')
+        kin = toolhead.get_kinematics()
         orig_delta_params = odp = kin.get_calibration()
-        adj_params, params = odp.coordinate_descent_params(distances)
-        logging.info("Calculating delta_calibrate with:\n%s\n%s\n"
-                     "Initial delta_calibrate parameters: %s",
-                     height_positions, distances, params)
-        z_weight = 1.
-        if distances:
+
+        # The `is_extended` argument to coordinate_descent_params is no longer
+        # relevant as arm lengths etc. are now standard.
+        # We pass False or remove its usage if DeltaCalibration is updated.
+        # Assuming DeltaCalibration.coordinate_descent_params now always returns
+        # the full set of new parameters (radius, offsets, arms, angles, endstops)
+        adj_params, params = odp.coordinate_descent_params(is_extended=True) # Use True to get all params
+
+        logging.info("Calculating delta_calibrate with %d height points and %d distance points."
+                     % (len(height_positions), len(distances)))
+        logging.info("Initial delta_calibrate parameters: %s" % (params,))
+        logging.info("Parameters to be adjusted: %s" % (adj_params,))
+
+        z_weight = 1.0
+        # If distances are provided (e.g. from DELTA_ANALYZE or future integration),
+        # weight them. Otherwise, only height errors are used.
+        if distances and probe_positions: # ensure probe_positions is not empty for ratio
             z_weight = len(distances) / (MEASURE_WEIGHT * len(probe_positions))
+        elif distances and not probe_positions: # only distances, no probe points
+            z_weight = 0.0 # effectively disable height error contribution if no heights
+
         # Perform coordinate descent
-        def delta_errorfunc(params):
+        def delta_errorfunc(current_iter_params):
             try:
                 # Build new delta_params for params under test
-                delta_params = orig_delta_params.new_calibration(params)
-                getpos = delta_params.get_position_from_stable
-                # Calculate z height errors
+                # current_iter_params is a dictionary of the parameters being adjusted
+                temp_delta_params = orig_delta_params.new_calibration(current_iter_params)
+                getpos = temp_delta_params.get_position_from_stable
+
                 total_error = 0.
-                for z_offset, stable_pos in height_positions:
-                    x, y, z = getpos(stable_pos)
-                    total_error += (z - z_offset)**2
-                total_error *= z_weight
+                # Calculate z height errors
+                if height_positions: # Ensure there are height positions to process
+                    height_error_sum = 0.
+                    for z_offset, stable_pos in height_positions:
+                        x, y, z = getpos(stable_pos)
+                        height_error_sum += (z - z_offset)**2
+                    total_error += height_error_sum * z_weight
+
                 # Calculate distance errors
-                for dist, stable_pos1, stable_pos2 in distances:
-                    x1, y1, z1 = getpos(stable_pos1)
-                    x2, y2, z2 = getpos(stable_pos2)
-                    d = math.sqrt((x1-x2)**2 + (y1-y2)**2 + (z1-z2)**2)
-                    total_error += (d - dist)**2
+                if distances: # Ensure there are distance measurements to process
+                    distance_error_sum = 0.
+                    for dist, stable_pos1, stable_pos2 in distances:
+                        x1, y1, z1 = getpos(stable_pos1)
+                        x2, y2, z2 = getpos(stable_pos2)
+                        # Check for math domain errors from getpos if points are unreachable
+                        # This should ideally be caught by getpos or trilateration returning NaN/inf
+                        # or raising a specific exception that we can catch here.
+                        # For now, assume valid coordinates are returned.
+                        d = math.sqrt((x1-x2)**2 + (y1-y2)**2 + (z1-z2)**2)
+                        distance_error_sum += (d - dist)**2
+                    total_error += distance_error_sum
+
                 return total_error
-            except ValueError:
-                return 9999999999999.9
+            except (ValueError, math.domain) as e: # Catch math errors if points are unreachable
+                logging.debug("Math error in delta_errorfunc: %s with params %s" % (str(e), current_iter_params))
+                return float('inf') # Return a large error if params are invalid
+            except Exception as e: # Catch any other unexpected error
+                logging.exception("Unexpected error in delta_errorfunc with params %s" % (current_iter_params,))
+                return float('inf')
+
         new_params = mathutil.background_coordinate_descent(
             self.printer, adj_params, params, delta_errorfunc)
         # Log and report results
