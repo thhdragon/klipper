@@ -202,18 +202,22 @@ fn main() -> ! {
                                 }
 
                                 if byte == b'\n' {
-                                    // Newline received, process the line
-                                    let line_prefix = b"LINE: ";
-                                    // Temporarily construct the message to send
-                                    // In a real app, avoid allocating like this in a loop if possible
-                                    // or use a pre-allocated buffer.
-                                    // For now, this is illustrative.
+                                    // Newline received, process the line.
+                                    // Trim the newline before processing.
+                                    // LINE_BUFFER currently contains the line *with* the newline.
+                                    let mut line_to_process = LINE_BUFFER.clone(); // Clone to trim
+                                    if line_to_process.ends_with('\n') {
+                                        line_to_process.pop(); // Remove \n
+                                        if line_to_process.ends_with('\r') {
+                                            line_to_process.pop(); // Remove \r if present
+                                        }
+                                    }
 
-                                    // Try to write the prefix
-                                    let _ = serial.write(line_prefix);
-                                    // Try to write the line content
-                                    let _ = serial.write(LINE_BUFFER.as_bytes());
-                                    // serial.write already sends \n if it's in LINE_BUFFER
+                                    // Call process_command with the trimmed line.
+                                    // serial is mutably borrowed by process_command if it needs to write.
+                                    // This is okay as USB_SERIAL is Option<SerialPort<...>>
+                                    // and we're in an unsafe block accessing it.
+                                    process_command(&line_to_process, serial);
 
                                     LINE_BUFFER.clear(); // Clear buffer for the next line
                                 }
@@ -260,4 +264,52 @@ fn u32_to_str<'a>(mut n: u32, buf: &'a mut [u8]) -> &'a [u8] {
     }
 
     &buf[0..i]
+}
+
+// Function to process received commands
+fn process_command(line: &str, serial: &mut SerialPort<UsbBus>) {
+    if line == "PING" {
+        serial_write_line(serial, "PONG\r\n");
+    } else if line == "ID" {
+        serial_write_line(serial, "KlipperRustRP2040_v0.0.1\r\n");
+    } else if line.starts_with("ECHO ") {
+        // Extract the part after "ECHO "
+        if let Some(text_to_echo) = line.get("ECHO ".len()..) {
+            serial_write_line(serial, text_to_echo);
+            serial_write_line(serial, "\r\n"); // Add newline after echoing
+        } else {
+            // Should not happen if starts_with is true and "ECHO " has non-zero length
+            serial_write_line(serial, "Error: Malformed ECHO command\r\n");
+        }
+    } else if line.is_empty() {
+        // Ignore empty lines (e.g. if just \r\n is sent)
+    } else {
+        serial_write_line(serial, "Error: Unknown command '");
+        serial_write_line(serial, line);
+        serial_write_line(serial, "'\r\n");
+    }
+}
+
+
+// Helper function to write a string slice over serial.
+// Handles potential partial writes.
+#[allow(dead_code)] // Will be used by process_command
+fn serial_write_line(serial: &mut SerialPort<UsbBus>, data: &str) {
+    let bytes = data.as_bytes();
+    let mut written = 0;
+    while written < bytes.len() {
+        match serial.write(&bytes[written..]) {
+            Ok(len) if len > 0 => {
+                written += len;
+            }
+            Ok(_) => { /* 0 bytes written, buffer likely full, try again */ }
+            Err(UsbError::WouldBlock) => { /* Try again later */ }
+            Err(_) => { /* Other error, stop trying */ break; }
+        }
+        // It's important that UsbDevice.poll is called frequently enough
+        // for the host to actually pick up the data.
+        // If this function blocks for too long (e.g. spinning on WouldBlock),
+        // it can starve USB polling. For now, this simple loop is okay
+        // as process_command is called within the main USB polling loop.
+    }
 }
