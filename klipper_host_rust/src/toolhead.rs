@@ -42,6 +42,7 @@ use crate::reactor::Reactor;
 use crate::heaters::Heater; // Import the Heater struct
 use crate::kinematics::cartesian::CartesianKinematics; // Import CartesianKinematics
 use crate::trapq::TrapQ;
+use crate::extras::fan::Fan; // Import Fan
 
 // Constants for default homing parameters
 // These would normally come from the config file.
@@ -508,17 +509,9 @@ impl<'a> ToolHead<'a> {
             max_z_accel,
         ));
 
-        // Define PlaceholderKinematics here only if it's truly a local placeholder
-        struct PlaceholderKinematics; // This should be removed if CartesianKinematics is always used
-        impl Kinematics for PlaceholderKinematics {
-            fn check_move(&self, _move_params: &mut Move) -> Result<(), String> { Ok(()) }
-            fn set_kinematics_position(&mut self, _new_pos: &[f64; 3], _homed_axes_mask: [bool; 3]) {}
-            #[cfg(test)]
-            fn get_axis_limits_for_test(&self) -> [(f64, f64); 3] {
-                [(1.0, -1.0), (1.0, -1.0), (1.0, -1.0)]
-            }
-        }
-        // toolhead.kin = Box::new(PlaceholderKinematics); // This line was the original, now replaced above by CartesianKinematics
+        // PlaceholderKinematics struct definition removed from here.
+        // It should be defined in the tests module if needed for other tests,
+        // or removed entirely if CartesianKinematics is always used.
 
         struct PlaceholderExtraAxis;
         impl ExtraAxis for PlaceholderExtraAxis {

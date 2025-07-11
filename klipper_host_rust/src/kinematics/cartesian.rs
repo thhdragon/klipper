@@ -184,12 +184,22 @@ impl Kinematics for CartesianKinematics {
             }
         }
     }
+
+    #[cfg(test)]
+    fn get_axis_limits_for_test(&self) -> [(f64, f64); 3] {
+        self.limits
+    }
 }
 
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Import Move specifically for tests if it's not already visible
+    // For this test, Move is in crate::toolhead so it should be found if toolhead is a dependency of kinematics.
+    // However, to be explicit or if cartesian.rs is compiled as part of a test binary differently:
+    use crate::toolhead::Move;
+
 
     #[test]
     fn rail_creation() {
@@ -213,8 +223,9 @@ mod tests {
     }
 
     // Helper to create a basic Move struct for testing check_move
+    // Parameters for Move::new: max_accel, junction_deviation, max_velocity, max_accel_to_decel, start_pos, end_pos, speed
     fn create_test_move(start_pos: [f64;4], end_pos: [f64;4], speed: f64) -> Move {
-        Move::new(3000.0, 0.01, 300.0, 1500.0, start_pos, end_pos, speed)
+        Move::new(3000.0, 0.013, 300.0, 1500.0, start_pos, end_pos, speed)
     }
 
 
@@ -232,63 +243,62 @@ mod tests {
     fn test_check_move_out_of_bounds_x_max() {
         let mut kin = create_test_kinematics();
         kin.set_kinematics_position(&[0.0,0.0,0.0], [true,true,true]);
-        let mut move_invalid = create_test_move([0.0,0.0,0.0,0.0], [210.0, 10.0, 10.0, 0.0], 100.0);
+        let mut move_invalid = create_test_move([0.0,0.0,0.0,0.0], [200.1, 10.0, 10.0, 0.0], 100.0); // X > 200.0
         let result = kin.check_move(&mut move_invalid);
         assert!(result.is_err());
-        assert!(result.unwrap_err().message.contains("Move out of range: X 210.000"));
+        assert!(result.unwrap_err().contains("Move out of range: X 200.100"));
     }
 
     #[test]
     fn test_check_move_out_of_bounds_y_min() {
         let mut kin = create_test_kinematics();
         kin.set_kinematics_position(&[0.0,0.0,0.0], [true,true,true]);
-        let mut move_invalid = create_test_move([0.0,0.0,0.0,0.0], [10.0, -10.0, 10.0, 0.0], 100.0);
+        let mut move_invalid = create_test_move([0.0,0.0,0.0,0.0], [10.0, -0.1, 10.0, 0.0], 100.0); // Y < 0.0
         let result = kin.check_move(&mut move_invalid);
         assert!(result.is_err());
-        assert!(result.unwrap_err().message.contains("Move out of range: Y -10.000"));
+        assert!(result.unwrap_err().contains("Move out of range: Y -0.100"));
     }
 
     #[test]
     fn test_check_move_out_of_bounds_z_max() {
         let mut kin = create_test_kinematics();
         kin.set_kinematics_position(&[0.0,0.0,0.0], [true,true,true]);
-        let mut move_invalid = create_test_move([0.0,0.0,0.0,0.0], [10.0, 10.0, 190.0, 0.0], 100.0);
+        let mut move_invalid = create_test_move([0.0,0.0,0.0,0.0], [10.0, 10.0, 180.1, 0.0], 100.0); // Z > 180.0
         let result = kin.check_move(&mut move_invalid);
         assert!(result.is_err());
-        assert!(result.unwrap_err().message.contains("Move out of range: Z 190.000"));
+        assert!(result.unwrap_err().contains("Move out of range: Z 180.100"));
     }
 
     #[test]
     fn test_check_move_unhomed_axis() {
-        let kin = create_test_kinematics(); // Limits are (1.0, -1.0) by default
+        let kin = create_test_kinematics(); // Limits are (1.0, -1.0) by default (unhomed)
         let mut move_unhomed = create_test_move([0.0,0.0,0.0,0.0], [10.0, 10.0, 10.0, 0.0], 100.0);
         let result = kin.check_move(&mut move_unhomed);
         assert!(result.is_err());
-        assert!(result.unwrap_err().message.contains("X axis must be homed first"));
+        // Depending on which axis is checked first if multiple are moving into unhomed territory.
+        // The current implementation checks X, then Y, then Z (if Z moves).
+        assert!(result.unwrap_err().contains("X axis must be homed first"));
     }
 
     #[test]
     fn test_check_move_z_limits_speed_accel() {
         let mut kin = create_test_kinematics();
-        kin.set_kinematics_position(&[0.0,0.0,0.0], [true,true,true]);
+        kin.set_kinematics_position(&[0.0,0.0,0.0], [true,true,true]); // Home all
 
-        let original_max_cruise_v2 = (100.0_f64).powi(2);
-        let original_accel = 3000.0;
-
+        // Default Move::new params: max_accel=3000, max_velocity=300
         let mut move_z = create_test_move([0.0,0.0,0.0,0.0], [0.0, 0.0, 10.0, 0.0], 100.0);
-        // Ensure initial move values are what we expect before limit_speed is called
-        assert_eq!(move_z.max_cruise_v2, original_max_cruise_v2);
-        assert_eq!(move_z.accel, original_accel);
+        let original_max_cruise_v2 = move_z.max_cruise_v2; // (100.0)^2
+        let original_accel = move_z.accel;           // 3000.0
 
         kin.check_move(&mut move_z).unwrap();
 
-        // move_d is 10.0 for Z only move. axes_d[2] is 10.0. z_ratio = 10.0 / 10.0 = 1.0.
-        // max_z_velocity = 25.0, max_z_accel = 500.0
-        // Expected limited speed = 25.0 * 1.0 = 25.0
-        // Expected limited accel = 500.0 * 1.0 = 500.0
-        let expected_limited_speed = kin.max_z_velocity; // * z_ratio (which is 1.0)
-        let expected_limited_accel = kin.max_z_accel;    // * z_ratio (which is 1.0)
+        // For this move_z: move_d = 10.0, axes_d[2] = 10.0. So, z_ratio = 1.0.
+        // kin.max_z_velocity = 25.0, kin.max_z_accel = 500.0
+        let expected_limited_speed = kin.max_z_velocity; // 25.0 * 1.0 = 25.0
+        let expected_limited_accel = kin.max_z_accel;    // 500.0 * 1.0 = 500.0
 
+        assert_ne!(move_z.max_cruise_v2, original_max_cruise_v2, "max_cruise_v2 should have been limited for Z move");
+        assert_ne!(move_z.accel, original_accel, "accel should have been limited for Z move");
         assert_eq!(move_z.max_cruise_v2, expected_limited_speed.powi(2));
         assert_eq!(move_z.accel, expected_limited_accel);
     }
@@ -296,10 +306,10 @@ mod tests {
      #[test]
     fn test_set_kinematics_position_updates_limits() {
         let mut kin = create_test_kinematics();
-        assert_eq!(kin.limits[0], (1.0, -1.0)); // Unhomed
+        assert_eq!(kin.limits[0], (1.0, -1.0)); // Unhomed X
 
         kin.set_kinematics_position(&[0.0, 0.0, 0.0], [true, false, false]); // Home X
-        assert_eq!(kin.limits[0], (0.0, 200.0)); // X homed
+        assert_eq!(kin.limits[0], (0.0, 200.0)); // X homed (range from rail_x)
         assert_eq!(kin.limits[1], (1.0, -1.0));  // Y still unhomed
         assert_eq!(kin.limits[2], (1.0, -1.0));  // Z still unhomed
 
