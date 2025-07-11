@@ -49,18 +49,30 @@ max_z_accel: 300
 position_min: 0
 position_max: 210
 position_endstop: 0
+rotation_distance: 40
+full_steps_per_rotation: 200
+microsteps: 16
 
 [stepper_y]
 position_min: 0
 position_max: 220
 position_endstop: 0
+rotation_distance: 40
+full_steps_per_rotation: 200
+microsteps: 16
 
 [stepper_z]
 position_min: 0
 position_max: 190
 position_endstop: 0
+rotation_distance: 8 # Example for a leadscrew
+full_steps_per_rotation: 200
+microsteps: 16
 
 [extruder]
+heater_name: my_extruder_heater # Example of using a custom name
+min_temp: 0
+max_temp: 280
 # placeholder for extruder specific settings like nozzle_diameter, sensor_type, etc.
 
 [heater_bed]

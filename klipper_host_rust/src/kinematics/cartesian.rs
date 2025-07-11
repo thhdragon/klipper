@@ -11,24 +11,41 @@ use crate::toolhead::{Kinematics, Move}; // Kinematics trait is in toolhead.rs f
 // full_steps_per_rotation = 200
 // microsteps = 16
 // step_distance = 40 / (200 * 16) = 40 / 3200 = 0.0125 mm/step
-const DEFAULT_STEP_DISTANCE: f64 = 0.0125;
+pub const DEFAULT_STEP_DISTANCE: f64 = 0.0125; // Made pub for ToolHead defaults if needed
+pub const DEFAULT_ROTATION_DISTANCE: f64 = 40.0;
+pub const DEFAULT_FULL_STEPS_PER_ROTATION: u32 = 200;
+pub const DEFAULT_MICROSTEPS: u32 = 16;
 
 
 // Simplified Stepper representation for host-side kinematics
 #[derive(Debug, Clone)]
 pub struct Stepper {
     name: String,
-    step_distance: f64,
+    pub rotation_distance: f64,
+    pub steps_per_rotation: u32, // Effective steps per rotation (full_steps * microsteps * gear_ratio)
+    pub step_distance: f64,      // Calculated: rotation_distance / steps_per_rotation
     position_steps: i64,      // Current position in microsteps from mcu_position_offset origin
     mcu_position_offset: f64, // Offset in mm to align step counter with G-code zero
 }
 
 impl Stepper {
-    pub fn new(name: String, step_distance: f64) -> Self {
+    pub fn new(name: String, rotation_distance: f64, steps_per_rotation: u32) -> Self {
+        let step_distance = if steps_per_rotation == 0 {
+            // Avoid division by zero, though steps_per_rotation should always be > 0
+            // In Klipper, this would be an error during config parsing.
+            // For now, set a very large step_distance (effectively zero movement per step)
+            // or consider panicking or returning Result.
+            eprintln!("Warning: steps_per_rotation is 0 for stepper {}, step_distance will be incorrect.", name);
+            f64::MAX
+        } else {
+            rotation_distance / (steps_per_rotation as f64)
+        };
         Stepper {
             name,
+            rotation_distance,
+            steps_per_rotation,
             step_distance,
-            position_steps: 0, // Assume starts at step 0 relative to its mcu_position_offset origin
+            position_steps: 0,
             mcu_position_offset: 0.0,
         }
     }
@@ -83,14 +100,15 @@ pub struct Rail {
 impl Rail {
     pub fn new(
         name: String,
-        stepper_configs: Vec<(String, f64)>, // Vec of (stepper_name, step_distance)
+        // Vec of (stepper_name, rotation_distance, total_steps_per_rotation)
+        stepper_configs: Vec<(String, f64, u32)>,
         position_min: f64,
         position_max: f64,
         position_endstop: f64,
     ) -> Self {
         let steppers = stepper_configs
             .into_iter()
-            .map(|(s_name, s_dist)| Stepper::new(s_name, s_dist))
+            .map(|(s_name, rot_dist, steps_per_rot)| Stepper::new(s_name, rot_dist, steps_per_rot))
             .collect();
         Rail {
             name,
@@ -150,9 +168,10 @@ pub struct CartesianKinematics {
 
 impl CartesianKinematics {
     pub fn new(
-        x_rail_config: (Vec<(String,f64)>, f64, f64, f64), // stepper_configs, min, max, endstop_pos
-        y_rail_config: (Vec<(String,f64)>, f64, f64, f64),
-        z_rail_config: (Vec<(String,f64)>, f64, f64, f64),
+        // Each tuple: (Vec<(stepper_name, rotation_dist, steps_per_rotation)>, min_pos, max_pos, endstop_pos)
+        x_rail_config: (Vec<(String, f64, u32)>, f64, f64, f64),
+        y_rail_config: (Vec<(String, f64, u32)>, f64, f64, f64),
+        z_rail_config: (Vec<(String, f64, u32)>, f64, f64, f64),
         max_z_velocity: f64,
         max_z_accel: f64,
     ) -> Self {
