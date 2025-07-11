@@ -1,166 +1,193 @@
 #![no_std]
 #![no_main]
 
-// Defmt imports
-use defmt::*; // Logging macros
-use defmt_rtt as _; // Global logger + RTT transport + defmt panic handler
-
-// Entry point
+use defmt::*;
+use defmt_rtt as _;
 use cortex_m_rt::entry;
-
-// Panic handler (original, likely superseded by defmt-rtt)
 use core::panic::PanicInfo;
-#[cfg(not(test))]
-#[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    // This existing panic handler will likely NOT be called if defmt-rtt is linked.
-    loop {
-        cortex_m::asm::nop();
-    }
-}
+use core::cell::RefCell;
+use cortex_m::interrupt::{Mutex as InterruptMutex, free as interrupt_free};
 
-// HAL and PAC for RP2040
+// HAL and PAC
 use rp2040_hal::{
     clocks::{init_clocks_and_plls, Clock},
-    pac::{self, interrupt, NVIC}, // Import NVIC for interrupt control
+    pac::{self, interrupt, NVIC},
     sio::Sio,
     watchdog::Watchdog,
-    timer::Timer as RpHalTimer, // Alias HAL's Timer to avoid conflict
+    timer::Timer as RpHalTimer, // RP2040 HAL Timer
+    timer::{Alarm0, Alarm1},    // Specific Alarms
     usb::UsbBus,
 };
 use rp2040_hal::clocks::UsbClock;
 
-// Klipper HAL Timer trait and our implementation
-use klipper_mcu_lib::hal::Timer as KlipperHalTimer; // Alias our HAL trait
-use klipper_mcu_lib::rp2040_hal_impl::timer::Rp2040Timer;
-use rp2040_hal::timer::Alarm0; // Specific alarm for testing
+// Klipper HAL Traits and Implementations
+use klipper_mcu_lib::{
+    hal::{Timer as KlipperHalTimer, GpioOut, StepEventResult},
+    rp2040_hal_impl::{
+        timer::Rp2040Timer,
+        gpio::Rp2040GpioOut,
+    },
+    sched::{SchedulerState, KlipperSchedulerTrait}, // Klipper Scheduler
+};
 
-// For static storage of the timer instance
-use core::cell::RefCell;
-use cortex_m::interrupt::Mutex as InterruptMutex; // Alias to avoid conflict if `Mutex` is used elsewhere
-
-// USB Device support
+// USB
 use usb_device::class_prelude::*;
 use usb_device::prelude::*;
 use usbd_serial::SerialPort;
 
-// Klipper GpioOut trait
-use klipper_mcu_lib::{
-    hal::GpioOut,
-    rp2040_hal_impl::gpio::Rp2040GpioOut,
-};
+// --- Panic Handler ---
+#[cfg(not(test))]
+#[panic_handler]
+fn panic(_info: &PanicInfo) -> ! {
+    loop { cortex_m::asm::nop(); }
+}
 
-// Globals for USB
+// --- Globals ---
 static mut USB_BUS: Option<UsbBusAllocator<UsbBus>> = None;
 static mut USB_SERIAL: Option<SerialPort<UsbBus>> = None;
 static mut USB_DEVICE: Option<UsbDevice<UsbBus>> = None;
 
-// Define a line buffer for incoming serial commands
 const MAX_LINE_LENGTH: usize = 256;
 static mut LINE_BUFFER: heapless::String<MAX_LINE_LENGTH> = heapless::String::new();
 
-// Static storage for our test timer instance (using Alarm0)
+// Test Timer (Client Timer using Alarm0)
 static TEST_TIMER0: InterruptMutex<RefCell<Option<Rp2040Timer<Alarm0>>>> = InterruptMutex::new(RefCell::new(None));
+const TEST_TIMER0_ID: u32 = 0;
 
-// Timer callback function
-fn test_timer0_callback(timer: &mut Rp2040Timer<Alarm0>) -> klipper_mcu_lib::hal::StepEventResult {
-    defmt::info!("Test Timer0 Fired! Current waketime: {}", timer.get_waketime());
+// Scheduler (uses Alarm1 for its master timer)
+static SCHEDULER: InterruptMutex<RefCell<Option<SchedulerState<Alarm1>>>> = InterruptMutex::new(RefCell::new(None));
 
-    // Reschedule for 1 second later (approx)
+// --- Callbacks and Dispatchers ---
+
+// Callback for TEST_TIMER0
+fn test_timer0_callback(timer: &mut Rp2040Timer<Alarm0>) -> StepEventResult {
+    info!("Test Timer0 (ID {}) Fired! Current waketime: {}", TEST_TIMER0_ID, timer.get_waketime());
     let current_waketime = timer.get_waketime();
-    // Assuming 1MHz timer clock from rp2040-hal default setup
-    let next_waketime = current_waketime.wrapping_add(1_000_000);
-    timer.set_waketime(next_waketime);
-    defmt::debug!("Timer0 rescheduled to: {}", next_waketime);
+    let next_waketime = current_waketime.wrapping_add(1_000_000); // Approx 1 sec
 
-    () // StepEventResult is () for now
+    timer.set_waketime(next_waketime); // Arm its own hardware alarm
+
+    // Inform the scheduler of the new waketime for this timer
+    interrupt_free(|cs| {
+        if let Some(scheduler) = SCHEDULER.borrow(cs).borrow_mut().as_mut() {
+            // The scheduler's add_timer will internally call schedule_task
+            scheduler.add_timer(timer);
+        }
+    });
+    debug!("Test Timer0 (ID {}) rescheduled via callback to: {}", TEST_TIMER0_ID, next_waketime);
+    ()
 }
 
+// Callback for the Scheduler's master timer (Alarm1)
+fn master_scheduler_timer_callback(_master_timer_ref: &mut Rp2040Timer<Alarm1>) -> StepEventResult {
+    interrupt_free(|cs| {
+        if let Some(scheduler) = SCHEDULER.borrow(cs).borrow_mut().as_mut() {
+            scheduler.service_master_timer();
+        }
+    });
+    ()
+}
+
+// Dispatch function called by the scheduler to run client timer tasks' logic
+// This is passed to SchedulerState::new
+pub fn dispatch_klipper_task_from_scheduler(task_id: u32) {
+    match task_id {
+        TEST_TIMER0_ID => {
+            interrupt_free(|cs| {
+                if let Some(timer) = TEST_TIMER0.borrow(cs).borrow_mut().as_mut() {
+                    // This calls the timer's own callback (test_timer0_callback)
+                    // because Rp2040Timer::on_interrupt checks alarm.finished()
+                    // and then calls its stored callback.
+                    // This assumes the scheduler is the one determining it's "finished" conceptually.
+                    timer.on_interrupt();
+                }
+            });
+        }
+        _ => warn!("Scheduler: Dispatch for unknown task ID {}", task_id),
+    }
+}
+
+
+// --- Entry Point ---
 #[entry]
 fn main() -> ! {
-    // Setup peripherals
-    let mut pac_peripherals = pac::Peripherals::take().unwrap();
-    let core_peripherals = pac::CorePeripherals::take().unwrap();
-    let mut watchdog = Watchdog::new(pac_peripherals.WATCHDOG);
-    let sio = Sio::new(pac_peripherals.SIO);
+    let mut pac = pac::Peripherals::take().unwrap();
+    let core = pac::CorePeripherals::take().unwrap();
+    let mut watchdog = Watchdog::new(pac.WATCHDOG);
+    let sio = Sio::new(pac.SIO);
 
-    let external_xtal_freq_hz = 12_000_000u32;
     let clocks = init_clocks_and_plls(
-        external_xtal_freq_hz,
-        pac_peripherals.XOSC,
-        pac_peripherals.CLOCKS,
-        pac_peripherals.PLL_SYS,
-        pac_peripherals.PLL_USB,
-        &mut pac_peripherals.RESETS,
-        &mut watchdog,
-    )
-    .ok()
-    .unwrap();
+        12_000_000u32, pac.XOSC, pac.CLOCKS, pac.PLL_SYS, pac.PLL_USB,
+        &mut pac.RESETS, &mut watchdog,
+    ).ok().unwrap();
 
-    // Initialize USB
+    // USB Init
     let usb_bus_allocator = UsbBusAllocator::new(UsbBus::new(
-        pac_peripherals.USBCTRL_REGS,
-        pac_peripherals.USBCTRL_DPRAM,
-        clocks.usb_clock,
-        true,
-        &mut pac_peripherals.RESETS,
+        pac.USBCTRL_REGS, pac.USBCTRL_DPRAM, clocks.usb_clock, true, &mut pac.RESETS,
     ));
-
-    unsafe {
-        USB_BUS = Some(usb_bus_allocator);
-    }
+    unsafe { USB_BUS = Some(usb_bus_allocator); }
     let bus_ref = unsafe { USB_BUS.as_ref().unwrap() };
-
     unsafe {
         USB_SERIAL = Some(SerialPort::new(bus_ref));
-        USB_DEVICE = Some(
-            UsbDeviceBuilder::new(bus_ref, UsbVidPid(0x16c0, 0x27dd))
-                .manufacturer("KlipperMCU")
-                .product("Klipper Rust Firmware")
-                .serial_number("TEST_SERIAL")
-                .device_class(usbd_serial::USB_CLASS_CDC)
-                .build(),
-        );
+        USB_DEVICE = Some(UsbDeviceBuilder::new(bus_ref, UsbVidPid(0x16c0, 0x27dd))
+            .manufacturer("KlipperMCU").product("Klipper Rust Firmware").serial_number("TEST")
+            .device_class(usbd_serial::USB_CLASS_CDC).build());
     }
 
-    let mut delay = cortex_m::delay::Delay::new(core_peripherals.SYST, clocks.system_clock.freq().to_Hz());
-
+    let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
     let pins = rp2040_hal::gpio::Pins::new(
-        pac_peripherals.IO_BANK0,
-        pac_peripherals.PADS_BANK0,
-        sio.gpio_bank0,
-        &mut pac_peripherals.RESETS,
+        pac.IO_BANK0, pac.PADS_BANK0, sio.gpio_bank0, &mut pac.RESETS,
     );
     let mut led_pin = Rp2040GpioOut::new(pins.gpio25.into_push_pull_output().into_dyn_pin());
 
-    // Initialize the RP2040 HAL Timer
-    let rp_hal_timer = RpHalTimer::new(pac_peripherals.TIMER, &mut pac_peripherals.RESETS);
-    let alarm0 = rp_hal_timer.alarm_0().unwrap(); // Take Alarm0
+    // --- Timer and Scheduler Setup ---
+    let rp_hal_timer = RpHalTimer::new(pac.TIMER, &mut pac.RESETS);
 
-    // Create and store our Klipper HAL Timer instance for Alarm0
+    // Client Timer (TEST_TIMER0 using Alarm0)
+    let alarm0 = rp_hal_timer.alarm_0().unwrap();
     let klipper_timer0 = Rp2040Timer::new(alarm0, test_timer0_callback);
-    cortex_m::interrupt::free(|cs| {
-        TEST_TIMER0.borrow(cs).replace(Some(klipper_timer0));
-    });
+    interrupt_free(|cs| { TEST_TIMER0.borrow(cs).replace(Some(klipper_timer0)); });
+    // Enable TEST_TIMER0's own hardware interrupt (for when its alarm physically fires)
+    unsafe { NVIC::unmask(pac::Interrupt::TIMER_IRQ_0); }
 
-    // Schedule the first timer event
+
+    // Scheduler (using Alarm1)
+    let alarm1_for_scheduler = rp_hal_timer.alarm_1().unwrap();
+    // Clone RpHalTimer for the scheduler to use for read_time().
+    // RpHalTimer is Copy, so this is fine.
+    let scheduler_raw_timer_ref = rp_hal_timer;
+
+    let klipper_scheduler = SchedulerState::new(
+        alarm1_for_scheduler,
+        scheduler_raw_timer_ref,
+        master_scheduler_timer_callback,
+        dispatch_klipper_task_from_scheduler, // Pass the dispatcher function
+    );
+    interrupt_free(|cs| { SCHEDULER.borrow(cs).replace(Some(klipper_scheduler)); });
+    // Enable Scheduler's master timer interrupt (Alarm1)
+    unsafe { NVIC::unmask(pac::Interrupt::TIMER_IRQ_1); }
+
+    // Initial scheduling of TEST_TIMER0 via the Scheduler
     let now_ticks = rp_hal_timer.get_counter_low();
-    let initial_waketime = now_ticks.wrapping_add(2_000_000); // Approx 2 seconds from now
+    let initial_waketime_for_test_timer0 = now_ticks.wrapping_add(2_000_000); // Approx 2s
 
-    cortex_m::interrupt::free(|cs| {
-        if let Some(timer) = TEST_TIMER0.borrow(cs).borrow_mut().as_mut() {
-            timer.set_waketime(initial_waketime);
-            defmt::info!("Test Timer0 initial waketime set to: {}", initial_waketime);
+    interrupt_free(|cs| {
+        if let Some(scheduler) = SCHEDULER.borrow(cs).borrow_mut().as_mut() {
+            // Use the scheduler's method to schedule the task.
+            // This uses the HACK in add_timer for now.
+            // A better way would be:
+            // scheduler.schedule_task(TEST_TIMER0_ID, initial_waketime_for_test_timer0);
+            // For now, we need to get a ref to TEST_TIMER0 and pass it to add_timer
+            if let Some(timer0_ref) = TEST_TIMER0.borrow(cs).borrow_mut().as_mut() {
+                timer0_ref.set_waketime(initial_waketime_for_test_timer0); // Set its own time first
+                scheduler.add_timer(timer0_ref); // Then tell scheduler
+                info!("TEST_TIMER0 (ID {}) initially scheduled by main for {}", TEST_TIMER0_ID, initial_waketime_for_test_timer0);
+            }
         }
     });
 
-    // Unmask the interrupt for TIMER_IRQ_0 in the NVIC
-    unsafe {
-        NVIC::unmask(pac::Interrupt::TIMER_IRQ_0);
-    }
-
+    info!("Setup complete, entering main loop.");
     let mut loop_count = 0u32;
-    defmt::info!("Setup complete, entering main loop.");
 
     loop {
         led_pin.write(true);
@@ -168,8 +195,8 @@ fn main() -> ! {
         led_pin.write(false);
         delay.delay_ms(250);
 
-        if loop_count % 4 == 0 { // Log less frequently from main loop
-            defmt::debug!("Main loop iteration: {}", loop_count);
+        if loop_count % 4 == 0 {
+            debug!("Main loop iteration: {}", loop_count);
         }
         loop_count = loop_count.wrapping_add(1);
 
@@ -184,8 +211,7 @@ fn main() -> ! {
                             for &byte in received_bytes {
                                 if LINE_BUFFER.push(byte as char).is_err() {
                                     let _ = serial.write(b"Error: Line buffer full\r\n");
-                                    LINE_BUFFER.clear();
-                                    break;
+                                    LINE_BUFFER.clear(); break;
                                 }
                                 if byte == b'\n' {
                                     let mut line_to_process = LINE_BUFFER.clone();
@@ -198,7 +224,7 @@ fn main() -> ! {
                         }
                         Ok(_) => {}
                         Err(UsbError::WouldBlock) => {}
-                        Err(e) => { defmt::warn!("USB read error: {:?}", defmt::Debug2Format(&e)); }
+                        Err(e) => { warn!("USB read error: {:?}", Debug2Format(&e)); }
                     }
                 }
             }
@@ -206,30 +232,32 @@ fn main() -> ! {
     }
 }
 
-#[allow(non_snake_case)] // RP2040 PAC names interrupts in UPPER_CASE
+// --- Interrupt Handlers ---
+#[allow(non_snake_case)]
 #[interrupt]
-fn TIMER_IRQ_0() {
-    cortex_m::interrupt::free(|cs| {
+fn TIMER_IRQ_0() { // For TEST_TIMER0's own hardware alarm
+    interrupt_free(|cs| {
         if let Some(timer) = TEST_TIMER0.borrow(cs).borrow_mut().as_mut() {
-            // Important: Check if *this specific alarm* is the source of interrupt
-            // The on_interrupt method itself checks alarm.finished()
-            timer.on_interrupt();
-        } else {
-            // This case should ideally not happen if setup is correct
-            // and timer is not removed from static storage.
-            // However, if it does, clear the interrupt for safety if possible,
-            // though without the alarm object it's hard.
-            // For now, just log.
-            defmt::error!("TIMER_IRQ_0 fired but no timer instance found in static storage!");
-            // Manually clear all alarm0 IRQs if possible (rp2040-hal specific)
-            // This is a bit of a hack; proper design would ensure instance exists
-            // or the IRQ is disabled when instance is None.
-            // unsafe { (*rp2040_pac::TIMER::ptr()).intr.write(|w| w.alarm_0().set_bit()); }
+            timer.on_interrupt(); // Calls test_timer0_callback
         }
     });
 }
 
+#[allow(non_snake_case)]
+#[interrupt]
+fn TIMER_IRQ_1() { // For Scheduler's master_timer (Alarm1)
+    interrupt_free(|cs| {
+        if let Some(scheduler) = SCHEDULER.borrow(cs).borrow_mut().as_mut() {
+            // The scheduler's master_timer.on_interrupt() will call master_scheduler_timer_callback,
+            // which in turn calls scheduler.service_master_timer().
+            scheduler.master_timer.on_interrupt();
+        }
+    });
+}
+
+// --- Command Processing & Helpers ---
 fn process_command(line: &str, serial: &mut SerialPort<UsbBus>) {
+    // ... (process_command implementation as before) ...
     if line == "PING" {
         serial_write_line(serial, "PONG\r\n");
     } else if line == "ID" {
@@ -251,6 +279,7 @@ fn process_command(line: &str, serial: &mut SerialPort<UsbBus>) {
 }
 
 fn serial_write_line(serial: &mut SerialPort<UsbBus>, data: &str) {
+    // ... (serial_write_line implementation as before) ...
     let bytes = data.as_bytes();
     let mut written = 0;
     while written < bytes.len() {
@@ -264,6 +293,7 @@ fn serial_write_line(serial: &mut SerialPort<UsbBus>, data: &str) {
 }
 
 fn u32_to_str<'a>(mut n: u32, buf: &'a mut [u8]) -> &'a [u8] {
+    // ... (u32_to_str implementation as before) ...
     if n == 0 {
         buf[0] = b'0';
         return &buf[0..1];
@@ -280,3 +310,16 @@ fn u32_to_str<'a>(mut n: u32, buf: &'a mut [u8]) -> &'a [u8] {
     }
     &buf[0..i]
 }
+
+// This is needed for sched.rs to compile, as it calls `crate::dispatch_klipper_task`.
+// In a `bin` crate, `main.rs` items are not automatically part of `crate::` for other modules
+// unless `main.rs` itself is structured as `mod main { ... }` and re-exported by `lib.rs`,
+// or `lib.rs` is the crate root and `main.rs` uses items from it.
+// Given our setup, `klipper_mcu_lib` is the library, and `main.rs` is the binary.
+// `sched.rs` is part of `klipper_mcu_lib`.
+// So, this function should ideally be in `lib.rs` or `main.rs` should call a method
+// on the scheduler that takes the dispatcher.
+// The current `sched.rs` now takes `task_dispatcher: fn(u32)` in `new()`.
+// `dispatch_klipper_task_from_scheduler` is the function we pass.
+// So the call `crate::dispatch_klipper_task(task_id);` in `sched.rs` should be removed
+// as it's now `(self.task_dispatcher)(task_id);`. (This was corrected in the sched.rs overwrite).
