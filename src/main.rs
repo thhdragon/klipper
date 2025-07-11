@@ -181,7 +181,53 @@ fn main() -> ! {
             if let Some(usb_dev) = USB_DEVICE.as_mut() {
                 if let Some(serial) = USB_SERIAL.as_mut() {
                     usb_dev.poll(&mut [serial]);
-                    // Read/Write operations would go here - Step 4
+
+                    // Check for new data received over USB
+                    let mut read_buf = [0u8; 64]; // Buffer for reading serial data
+                    match serial.read(&mut read_buf) {
+                        Ok(count) if count > 0 => {
+                            // Data received. `count` bytes are in `read_buf[0..count]`.
+                            let received_data = &read_buf[0..count];
+
+                            // Echo the data back
+                            // We need to handle potential partial writes if the output buffer is full,
+                            // but for a simple echo, we'll try a single write.
+                            let mut bytes_written = 0;
+                            while bytes_written < count {
+                                match serial.write(&received_data[bytes_written..]) {
+                                    Ok(len) if len > 0 => {
+                                        bytes_written += len;
+                                    }
+                                    Ok(_) => { // 0 bytes written, buffer likely full
+                                        break;
+                                    }
+                                    Err(UsbError::WouldBlock) => {
+                                        // Output buffer is full, try again later.
+                                        // This might require breaking the inner loop and polling USB again.
+                                        // For simple echo, we might just drop data or spin,
+                                        // but a better approach is to yield or manage buffer state.
+                                        // For now, we'll just break and try on the next main loop iteration.
+                                        break;
+                                    }
+                                    Err(_) => {
+                                        // Some other error, stop trying to write this chunk.
+                                        // log::error!("USB write error during echo");
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Ok(_) => {
+                            // No data received or 0 bytes read
+                        }
+                        Err(UsbError::WouldBlock) => {
+                            // No data available to read
+                        }
+                        Err(_err) => {
+                            // An error occurred during read
+                            // For example: log::error!("USB read error: {:?}", err);
+                        }
+                    }
                 }
             }
         }
