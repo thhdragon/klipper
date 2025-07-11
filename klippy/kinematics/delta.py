@@ -7,6 +7,15 @@ import math, logging
 import stepper, mathutil
 import chelper # For get_effector_normal
 
+try:
+    import scipy.optimize
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+    # This module might be imported even if scipy isn't used by delta_calibrate,
+    # so a warning here might be too noisy if user isn't using advanced calibration.
+    # logging.info("SciPy library not found, brentq for lean-aware IK in DeltaCalibration will be disabled.")
+
 # Slow moves once the ratio of tower to XY movement exceeds SLOW_RATIO
 SLOW_RATIO = 3.
 
@@ -383,21 +392,48 @@ class DeltaCalibration:
             sphere_coords.append( (eff_x, eff_y, eff_z) )
         return mathutil.trilateration(sphere_coords, [a**2 for a in self.arms])
 
-    def calc_stable_position(self, coord): # IK
-        if any(abs(l) > 1e-6 for l in self.radial_leans_rad) or \
-           any(abs(l) > 1e-6 for l in self.tangential_leans_rad):
-            logging.warning("DeltaCalibration.calc_stable_position is NOT YET lean-aware. "
-                            "Calibration may be inaccurate if towers lean significantly.")
+    def calc_stable_position(self, coord): # IK (coord is nozzle_xyz = (nx, ny, nz))
+        nx, ny, nz = coord
         steppos_h_on_rail = []
+
         for i in range(3):
-            dx = self.towers[i][0] - coord[0]
-            dy = self.towers[i][1] - coord[1]
-            val_under_sqrt = self.arms[i]**2 - dx**2 - dy**2
-            if val_under_sqrt < 0:
-                logging.error("DeltaCalibration: Unreachable point in calc_stable_position (tower %d, non-lean-aware): %s" % (i, coord,))
-                raise ValueError("Delta kinematics: Unreachable point for tower %d in non-lean-aware IK" % i)
-            h_i = math.sqrt(val_under_sqrt) + coord[2]
-            steppos_h_on_rail.append(h_i)
+            def f_h_i(h_i_trial):
+                ctx_i, cty_i, ctz_i = self._get_effective_tower_xy_and_z(i, h_i_trial)
+                dist_sq = (nx - ctx_i)**2 + (ny - cty_i)**2 + (nz - ctz_i)**2
+                return dist_sq - self.arms[i]**2
+
+            dx_simple = self.towers[i][0] - nx
+            dy_simple = self.towers[i][1] - ny
+            val_under_sqrt_simple = self.arms[i]**2 - dx_simple**2 - dy_simple**2
+            if val_under_sqrt_simple < 0:
+                logging.error("DeltaCalibration IK: Unreachable point for tower %d (initial guess): %s" % (i, coord,))
+                raise ValueError("Delta kinematics: Unreachable point for tower %d in IK initial guess" % i)
+            h_i_approx = math.sqrt(val_under_sqrt_simple) + nz
+
+            h_min_bracket = h_i_approx - 50
+            h_max_bracket = h_i_approx + 50
+            h_min_bracket = max(h_min_bracket, -100.0)
+            h_max_bracket = min(h_max_bracket, self.endstops[i] + 100.0)
+
+            h_i_solution = None
+            try:
+                if not SCIPY_AVAILABLE:
+                    raise ImportError("SciPy not available for brentq in DeltaCalibration")
+                h_i_solution = scipy.optimize.brentq(f_h_i, h_min_bracket, h_max_bracket, xtol=1e-6, rtol=1e-6)
+            except Exception as e: # Catch broader errors from brentq or f_h_i
+                logging.warning("SciPy brentq failed for IK in DeltaCalibration (tower %d, coord %s): %s. "
+                                "Using non-lean-aware IK as fallback for this point." % (i, coord, str(e)))
+                # Non-lean-aware fallback
+                dx_fallback = self.towers[i][0] - nx
+                dy_fallback = self.towers[i][1] - ny
+                val_under_sqrt_fallback = self.arms[i]**2 - dx_fallback**2 - dy_fallback**2
+                if val_under_sqrt_fallback < 0:
+                    logging.error("DeltaCalibration: Unreachable point in IK fallback (tower %d): %s" % (i, coord,))
+                    raise ValueError("Delta kinematics: Unreachable point for tower %d in IK fallback" % i)
+                h_i_solution = math.sqrt(val_under_sqrt_fallback) + nz
+
+            steppos_h_on_rail.append(h_i_solution)
+
         return [(self.endstops[i] - h_i) / self.stepdists[i]
                 for i, h_i in enumerate(steppos_h_on_rail)]
 
