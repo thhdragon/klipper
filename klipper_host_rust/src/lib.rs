@@ -14,22 +14,26 @@ pub mod clocksync;
 pub mod configfile;
 pub mod pins;
 pub mod reactor;
-// pub mod serialhdl; // Commented out due to compilation errors
+pub mod serialhdl;
 pub mod stepper; // Host-side stepper logic
 pub mod util;      // Host-side utilities
 pub mod webhooks;
 pub mod console;
 pub mod mathutil;
 pub mod msgproto;
-// pub mod trapq; // Added trapq module - Commented out due to compilation errors
+pub mod trapq;
 pub mod itersolve; // Added itersolve module
 pub mod stepcompress; // Added stepcompress module
+pub mod heaters;      // Added heaters module
 
 // Declare module for the kinematics subdirectory
 pub mod kinematics;
 
 // Declare module for the extras subdirectory
 pub mod extras;
+
+#[cfg(test)]
+pub mod test_utils; // Module for test helper functions
 
 // Basic test for the library itself
 #[cfg(test)]

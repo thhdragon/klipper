@@ -1,7 +1,7 @@
 // klipper_host_rust/src/kinematics/mod.rs
 // Corresponds to klippy/kinematics/__init__.py and other kinematics files.
 
-// pub mod cartesian;
+pub mod cartesian;
 // pub mod corexy;
 // pub mod delta;
 // pub mod extruder;

@@ -103,7 +103,7 @@ impl SerialHdl {
     }
 
     /// Placeholder for sending a raw command.
-#   #[allow(unused_variables)] // To quieten warnings for unused params in placeholder
+    #[allow(unused_variables)] // To quieten warnings for unused params in placeholder
     pub fn raw_send(&self, command: Command, cmd_id: u32, data: u32, queue: CommandQueue) {
         // Example: self.serial.raw_send(self.get_clock_cmd, 0, 0, self.cmd_queue)
         // println!(
@@ -121,7 +121,7 @@ impl SerialHdl {
     }
 
     /// Placeholder for registering a response handler.
-#   #[allow(unused_variables)] // To quieten warnings for unused params in placeholder
+    #[allow(unused_variables)] // To quieten warnings for unused params in placeholder
     pub fn register_response(&mut self, callback: ResponseCallback, message_type: &str) {
         // Example: serial.register_response(self._handle_clock, 'clock')
         // println!(
@@ -137,7 +137,7 @@ impl SerialHdl {
     }
 
     /// Placeholder for `serial.set_clock_est`
-#   #[allow(unused_variables)] // To quieten warnings for unused params in placeholder
+    #[allow(unused_variables)] // To quieten warnings for unused params in placeholder
     pub fn set_clock_est(&self, new_freq: f64, time_avg: f64, clock_avg_adj: i64, cur_clock: u64) {
         // println!(
         //     "SerialHdl: set_clock_est freq={}, time_avg={}, clock_avg_adj={}, cur_clock={}",
