@@ -45,6 +45,9 @@ pub trait Timer {
     fn get_waketime(&self) -> u32;
     fn set_waketime(&mut self, waketime: u32);
     // func pointer is handled by the callback in new()
+
+    /// Gets the unique ID of this timer instance.
+    fn get_id(&self) -> u32;
 }
 
 pub trait Scheduler {

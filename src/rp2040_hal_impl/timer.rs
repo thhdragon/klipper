@@ -18,8 +18,9 @@ pub struct Rp2040Timer<A: Alarm> {
     /// The currently scheduled waketime (raw timer value).
     pub(super) scheduled_waketime: u32,
     /// Flag to control if this timer's own hardware interrupt should be enabled when armed.
-    /// If false, it's expected to be driven by an external scheduler.
     pub(super) hw_irq_enabled: bool,
+    /// Unique identifier for this timer instance.
+    pub(super) id: u32,
 }
 
 impl<A: Alarm> Rp2040Timer<A> {
@@ -90,14 +91,15 @@ impl<A: Alarm> Rp2040Timer<A> {
 }
 
 impl<A: Alarm> HalTimer for Rp2040Timer<A> {
-    fn new(mut alarm: A, callback: fn(&mut Self) -> StepEventResult) -> Self {
-        alarm.disable_interrupt(); // Ensure interrupt is initially disabled by default
-        alarm.clear_interrupt();   // Clear any pending state
+    fn new(mut alarm: A, callback: fn(&mut Self) -> StepEventResult, id: u32) -> Self { // Added id parameter
+        alarm.disable_interrupt();
+        alarm.clear_interrupt();
         Self {
             alarm,
             callback: Some(callback),
             scheduled_waketime: 0,
-            hw_irq_enabled: true, // Default to hardware IRQ being active
+            hw_irq_enabled: true,
+            id, // Store the ID
         }
     }
 

@@ -6,7 +6,7 @@ use crate::hal::{
     Timer as KlipperHalTimer,
     StepEventResult
 };
-use crate::rp2040_hal_impl::timer::Rp2040Timer;
+use crate::rp2040_hal_impl::timer::Rp2040Timer; // Not directly used here, but Timer trait is
 
 use rp2040_hal::timer::{Alarm, Timer as RpHalTimer};
 use heapless::binary_heap::{BinaryHeap, Max};
@@ -44,9 +44,9 @@ impl Ord for ScheduledTask {
 
 pub struct SchedulerState<MasterAlarm: Alarm> {
     tasks: BinaryHeap<ScheduledTask, Max, MAX_SCHEDULED_TIMERS>,
-    master_timer: Rp2040Timer<MasterAlarm>,
+    master_timer: Rp2040Timer<MasterAlarm>, // Scheduler's own timer
     raw_rp_timer: RpHalTimer,
-    task_dispatcher: fn(u32), // Function pointer for dispatching tasks
+    task_dispatcher: fn(u32),
 }
 
 impl<MasterAlarm: Alarm> SchedulerState<MasterAlarm> {
@@ -54,9 +54,11 @@ impl<MasterAlarm: Alarm> SchedulerState<MasterAlarm> {
         master_timer_alarm: MasterAlarm,
         raw_rp_timer: RpHalTimer,
         master_timer_callback: fn(&mut Rp2040Timer<MasterAlarm>) -> StepEventResult,
-        task_dispatcher: fn(u32), // Added dispatcher
+        task_dispatcher: fn(u32),
+        // Add ID for the master_timer itself, though not strictly needed by scheduler logic for it
+        master_timer_id: u32,
     ) -> Self {
-        let master_timer = Rp2040Timer::new(master_timer_alarm, master_timer_callback);
+        let master_timer = Rp2040Timer::new(master_timer_alarm, master_timer_callback, master_timer_id);
         Self {
             tasks: BinaryHeap::new(),
             master_timer,
@@ -88,21 +90,45 @@ impl<MasterAlarm: Alarm> SchedulerState<MasterAlarm> {
 
     fn reschedule_master_timer_interrupt(&mut self) {
         if let Some(next_task) = self.tasks.peek() {
+            // defmt::trace!("Scheduler: Next task ID {} at {}. Rescheduling master.", next_task.id, next_task.waketime);
             self.master_timer.set_waketime(next_task.waketime);
+        } else {
+            // defmt::trace!("Scheduler: No tasks. Master timer not rescheduled.");
+            // Optionally explicitly disarm master_timer if it has such a method and is needed.
+            // For now, not calling set_waketime means its IRQ won't re-fire.
         }
     }
 
+    // Public method for explicit task scheduling or rescheduling.
     pub fn schedule_task(&mut self, task_id: u32, waketime: u32) {
-        let mut temp_heap = BinaryHeap::<ScheduledTask, Max, MAX_SCHEDULED_TIMERS>::new();
+        // Remove any existing task with the same ID
+        let mut temp_tasks = Vec::<ScheduledTask, MAX_SCHEDULED_TIMERS>::new();
+        let mut task_updated = false;
         while let Some(task) = self.tasks.pop() {
-            if task.id != task_id {
-                temp_heap.push(task).ok();
+            if task.id == task_id {
+                // Update existing task's waketime if found, then re-add
+                // This is effectively what add_timer should do.
+                // For simplicity of BinaryHeap, we remove and re-add.
+                // A more advanced heap might offer decrease_key.
+                // For now, just ensure it's not duplicated by removing.
+                task_updated = true; // Mark that we found and removed it
+            } else {
+                temp_tasks.push(task).ok(); // Keep other tasks
             }
         }
-        self.tasks = temp_heap;
+        // Push back other tasks
+        for task in temp_tasks {
+            self.tasks.push(task).ok();
+        }
 
-        let task = ScheduledTask { id: task_id, waketime };
-        if self.tasks.push(task).is_ok() {
+        // Add the new/updated task
+        let new_task = ScheduledTask { id: task_id, waketime };
+        if self.tasks.push(new_task).is_ok() {
+            if task_updated {
+                defmt::trace!("Scheduler: Updated task ID {} to waketime {}", task_id, waketime);
+            } else {
+                defmt::trace!("Scheduler: Scheduled new task ID {} for waketime {}", task_id, waketime);
+            }
             self.reschedule_master_timer_interrupt();
         } else {
             defmt::error!("Scheduler: Task queue full! Cannot schedule task ID {}", task_id);
@@ -112,17 +138,15 @@ impl<MasterAlarm: Alarm> SchedulerState<MasterAlarm> {
 
 impl<MasterAlarm: Alarm> KlipperSchedulerTrait for SchedulerState<MasterAlarm> {
     fn add_timer(&mut self, timer_ref: &mut dyn KlipperHalTimer) {
-        // HACK/Simplification: Assumes ID 0 for any timer passed for now.
-        // A proper system would need `timer_ref` to provide its ID.
-        let task_id_for_timer_ref = 0;
+        let task_id = timer_ref.get_id(); // Get the actual ID from the timer
         let waketime = timer_ref.get_waketime();
-        defmt::debug!("Scheduler (add_timer): Task ID {} waketime {}. Re-evaluating.", task_id_for_timer_ref, waketime);
-        self.schedule_task(task_id_for_timer_ref, waketime);
+
+        defmt::debug!("Scheduler (add_timer): Updating/Adding Task ID {} to waketime {}.", task_id, waketime);
+        self.schedule_task(task_id, waketime); // Use the public method to handle heap update
     }
 
-    fn delete_timer(&mut self, _timer_to_delete: &mut dyn KlipperHalTimer) {
-        // HACK/Simplification: Assumes ID 0.
-        let task_id_to_remove = 0;
+    fn delete_timer(&mut self, timer_to_delete: &mut dyn KlipperHalTimer) {
+        let task_id_to_remove = timer_to_delete.get_id(); // Get the actual ID
 
         let mut temp_heap = BinaryHeap::<ScheduledTask, Max, MAX_SCHEDULED_TIMERS>::new();
         let mut found = false;
@@ -138,6 +162,8 @@ impl<MasterAlarm: Alarm> KlipperSchedulerTrait for SchedulerState<MasterAlarm> {
         if found {
             defmt::debug!("Scheduler (delete_timer): Removed task ID {}. Re-evaluating.", task_id_to_remove);
             self.reschedule_master_timer_interrupt();
+        } else {
+            defmt::warn!("Scheduler (delete_timer): Task ID {} not found in queue.", task_id_to_remove);
         }
     }
 

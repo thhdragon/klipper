@@ -63,6 +63,7 @@ static TEST_TIMER0: InterruptMutex<RefCell<Option<Rp2040Timer<Alarm0>>>> = Inter
 const TEST_TIMER0_ID: u32 = 0;
 static TEST_TIMER1: InterruptMutex<RefCell<Option<Rp2040Timer<Alarm2>>>> = InterruptMutex::new(RefCell::new(None));
 const TEST_TIMER1_ID: u32 = 1;
+const SCHEDULER_MASTER_TIMER_ID: u32 = 99; // ID for the scheduler's own timer
 
 const LED_PIN_ID: u8 = 25;
 
@@ -199,58 +200,57 @@ fn main() -> ! {
 
     // Timer and Scheduler Setup (as before for TEST_TIMER0 and SCHEDULER)
     let rp_hal_timer = RpHalTimer::new(pac_peripherals.TIMER, &mut pac_peripherals.RESETS);
+
+    // Client Timer TEST_TIMER0 (ID 0)
     let alarm0 = rp_hal_timer.alarm_0().unwrap();
-    let mut klipper_timer0 = Rp2040Timer::new(alarm0, test_timer0_callback);
+    let mut klipper_timer0 = Rp2040Timer::new(alarm0, test_timer0_callback, TEST_TIMER0_ID); // Pass ID
     klipper_timer0.set_hw_irq_active(false);
     interrupt_free(|cs| { TEST_TIMER0.borrow(cs).replace(Some(klipper_timer0)); });
 
-    let alarm1_for_scheduler = rp_hal_timer.alarm_1().unwrap(); // Scheduler uses Alarm1
+    // Client Timer TEST_TIMER1 (ID 1)
+    let alarm2 = rp_hal_timer.alarm_2().unwrap();
+    let mut klipper_timer1 = Rp2040Timer::new(alarm2, test_timer1_callback, TEST_TIMER1_ID); // Pass ID
+    klipper_timer1.set_hw_irq_active(false);
+    interrupt_free(|cs| {
+        TEST_TIMER1.borrow(cs).replace(Some(klipper_timer1));
+    });
+
+    // Scheduler (uses Alarm1, and its own timer ID)
+    let alarm1_for_scheduler = rp_hal_timer.alarm_1().unwrap();
     let scheduler_raw_timer_ref = rp_hal_timer;
     let klipper_scheduler = SchedulerState::new(
         alarm1_for_scheduler, scheduler_raw_timer_ref,
         master_scheduler_timer_callback, dispatch_klipper_task_from_scheduler,
+        SCHEDULER_MASTER_TIMER_ID, // Pass ID for scheduler's own timer
     );
     interrupt_free(|cs| { SCHEDULER.borrow(cs).replace(Some(klipper_scheduler)); });
     unsafe { NVIC::unmask(pac::Interrupt::TIMER_IRQ_1); }
 
-    // Initial scheduling for TEST_TIMER0 (as before)
+    // Initial scheduling for TEST_TIMER0
     let now_ticks = rp_hal_timer.get_counter_low();
-    let initial_waketime_for_test_timer0 = now_ticks.wrapping_add(1_000_000); // 1 sec for timer0
+    let initial_waketime_for_test_timer0 = now_ticks.wrapping_add(1_000_000); // 1 sec
     interrupt_free(|cs| {
         if let Some(scheduler) = SCHEDULER.borrow(cs).borrow_mut().as_mut() {
              if let Some(timer0_ref) = TEST_TIMER0.borrow(cs).borrow_mut().as_mut() {
                 timer0_ref.set_waketime(initial_waketime_for_test_timer0);
-                scheduler.add_timer(timer0_ref); // Will use ID 0 due to HACK
+                scheduler.add_timer(timer0_ref); // add_timer will now use timer0_ref.get_id()
                 info!("TEST_TIMER0 (ID {}) initially scheduled for {}", TEST_TIMER0_ID, initial_waketime_for_test_timer0);
             }
         }
     });
 
-    // Initialize and Schedule TEST_TIMER1 (New part for this step)
-    let alarm2 = rp_hal_timer.alarm_2().unwrap(); // Use Alarm2
-    let mut klipper_timer1 = Rp2040Timer::new(alarm2, test_timer1_callback);
-    klipper_timer1.set_hw_irq_active(false); // Scheduler driven
-    interrupt_free(|cs| {
-        TEST_TIMER1.borrow(cs).replace(Some(klipper_timer1));
-    });
-    // NOTE: No NVIC unmask for TIMER_IRQ_2 as it's scheduler driven.
-
-    let initial_waketime_for_test_timer1 = now_ticks.wrapping_add(1_500_000); // Approx 1.5s, different from timer0
+    // Initial scheduling for TEST_TIMER1
+    let initial_waketime_for_test_timer1 = now_ticks.wrapping_add(1_500_000); // 1.5s
     interrupt_free(|cs| {
         if let Some(scheduler) = SCHEDULER.borrow(cs).borrow_mut().as_mut() {
             if let Some(timer1_ref) = TEST_TIMER1.borrow(cs).borrow_mut().as_mut() {
                 timer1_ref.set_waketime(initial_waketime_for_test_timer1);
-                // IMPORTANT: The current scheduler.add_timer HACK assumes ID 0.
-                // This will NOT correctly schedule TEST_TIMER1 (ID 1).
-                // We need to use scheduler.schedule_task(TEST_TIMER1_ID, initial_waketime_for_test_timer1)
-                // or fix add_timer in sched.rs to derive ID.
-                // For this step, to make it work, I will use schedule_task directly.
-                scheduler.schedule_task(TEST_TIMER1_ID, initial_waketime_for_test_timer1);
+                // Now use add_timer, as it's fixed to use get_id()
+                scheduler.add_timer(timer1_ref);
                 info!("TEST_TIMER1 (ID {}) initially scheduled for {}", TEST_TIMER1_ID, initial_waketime_for_test_timer1);
             }
         }
     });
-
 
     info!("Setup complete, entering main loop.");
     let mut loop_count = 0u32;
