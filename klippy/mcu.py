@@ -31,20 +31,18 @@ class RetryAsyncCommand:
         if self.need_response and params['#sent_time'] >= self.min_query_time:
             self.need_response = False
             self.reactor.async_complete(self.completion, params)
-    def get_response(self, cmds, cmd_queue, minclock=0, reqclock=0, retry=True):
+    def get_response(self, cmds, cmd_queue, minclock=0, reqclock=0):
         cmd, = cmds
         self.serial.raw_send_wait_ack(cmd, minclock, reqclock, cmd_queue)
         self.min_query_time = 0.
-        timeout_time = query_time = self.reactor.monotonic()
-        if retry:
-            timeout_time += self.TIMEOUT_TIME
+        first_query_time = query_time = self.reactor.monotonic()
         while 1:
             params = self.completion.wait(query_time + self.RETRY_TIME)
             if params is not None:
                 self.serial.register_response(None, self.name, self.oid)
                 return params
             query_time = self.reactor.monotonic()
-            if query_time > timeout_time:
+            if query_time > first_query_time + self.TIMEOUT_TIME:
                 self.serial.register_response(None, self.name, self.oid)
                 raise serialhdl.error("Timeout on wait for '%s' response"
                                       % (self.name,))
@@ -66,21 +64,19 @@ class CommandQueryWrapper:
         if cmd_queue is None:
             cmd_queue = serial.get_default_command_queue()
         self._cmd_queue = cmd_queue
-    def _do_send(self, cmds, minclock, reqclock, retry):
+    def _do_send(self, cmds, minclock, reqclock):
         xh = self._xmit_helper(self._serial, self._response, self._oid)
         reqclock = max(minclock, reqclock)
         try:
-            return xh.get_response(cmds, self._cmd_queue, minclock, reqclock,
-                                   retry)
+            return xh.get_response(cmds, self._cmd_queue, minclock, reqclock)
         except serialhdl.error as e:
             raise self._error(str(e))
-    def send(self, data=(), minclock=0, reqclock=0, retry=True):
-        return self._do_send([self._cmd.encode(data)], minclock, reqclock,
-                             retry)
+    def send(self, data=(), minclock=0, reqclock=0):
+        return self._do_send([self._cmd.encode(data)], minclock, reqclock)
     def send_with_preface(self, preface_cmd, preface_data=(), data=(),
-                          minclock=0, reqclock=0, retry=True):
+                          minclock=0, reqclock=0):
         cmds = [preface_cmd._cmd.encode(preface_data), self._cmd.encode(data)]
-        return self._do_send(cmds, minclock, reqclock, retry)
+        return self._do_send(cmds, minclock, reqclock)
 
 # Wrapper around command sending
 class CommandWrapper:

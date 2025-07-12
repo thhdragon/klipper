@@ -310,12 +310,9 @@ class SerialRetryCommand:
         self.serial.register_response(self.handle_callback, name, oid)
     def handle_callback(self, params):
         self.last_params = params
-    def get_response(self, cmds, cmd_queue, minclock=0, reqclock=0,
-                     retry=True):
+    def get_response(self, cmds, cmd_queue, minclock=0, reqclock=0):
         retries = 5
         retry_delay = .010
-        if not retry:
-            retries = 0
         while 1:
             for cmd in cmds[:-1]:
                 self.serial.raw_send(cmd, minclock, reqclock, cmd_queue)

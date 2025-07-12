@@ -1,428 +1,120 @@
 // src/gpio_manager.rs
 #![cfg_attr(not(test), no_std)]
 
-use rp2040_hal::gpio::dynpin::{DynPin, DynPinModeError};
-use rp2040_hal::gpio::{self, Pins, FunctionSio, SioConfig, PullType as HalPullType, FunctionPwm, PinId};
-use crate::hal::PullType as KlipperPullType;
-use defmt::Format;
+use rp2040_hal::gpio::{self, Pin, FunctionSio, SioInput, PullDown};
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Format)]
-pub enum PinModeState {
-    Disabled,
-    InputFloating,
-    InputPullUp,
-    InputPullDown,
-    OutputPushPull,
-    FunctionAdc,
-    FunctionPwm,
-}
+// Define aliases for the pin types to make the struct definition cleaner.
+// This defines the "resting state" of a pin when it's stored in the manager.
+// The default reset state for pins in rp2040-hal is FunctionSio<SioInput> with PullDown.
+type Gpio0Pin = Pin<gpio::bank0::Gpio0, FunctionSio<SioInput>, PullDown>;
+type Gpio1Pin = Pin<gpio::bank0::Gpio1, FunctionSio<SioInput>, PullDown>;
+type Gpio2Pin = Pin<gpio::bank0::Gpio2, FunctionSio<SioInput>, PullDown>;
+type Gpio3Pin = Pin<gpio::bank0::Gpio3, FunctionSio<SioInput>, PullDown>;
+type Gpio4Pin = Pin<gpio::bank0::Gpio4, FunctionSio<SioInput>, PullDown>;
+type Gpio5Pin = Pin<gpio::bank0::Gpio5, FunctionSio<SioInput>, PullDown>;
+type Gpio6Pin = Pin<gpio::bank0::Gpio6, FunctionSio<SioInput>, PullDown>;
+type Gpio7Pin = Pin<gpio::bank0::Gpio7, FunctionSio<SioInput>, PullDown>;
+type Gpio8Pin = Pin<gpio::bank0::Gpio8, FunctionSio<SioInput>, PullDown>;
+type Gpio9Pin = Pin<gpio::bank0::Gpio9, FunctionSio<SioInput>, PullDown>;
+type Gpio10Pin = Pin<gpio::bank0::Gpio10, FunctionSio<SioInput>, PullDown>;
+type Gpio11Pin = Pin<gpio::bank0::Gpio11, FunctionSio<SioInput>, PullDown>;
+type Gpio12Pin = Pin<gpio::bank0::Gpio12, FunctionSio<SioInput>, PullDown>;
+type Gpio13Pin = Pin<gpio::bank0::Gpio13, FunctionSio<SioInput>, PullDown>;
+type Gpio14Pin = Pin<gpio::bank0::Gpio14, FunctionSio<SioInput>, PullDown>;
+type Gpio15Pin = Pin<gpio::bank0::Gpio15, FunctionSio<SioInput>, PullDown>;
+type Gpio16Pin = Pin<gpio::bank0::Gpio16, FunctionSio<SioInput>, PullDown>;
+type Gpio17Pin = Pin<gpio::bank0::Gpio17, FunctionSio<SioInput>, PullDown>;
+type Gpio18Pin = Pin<gpio::bank0::Gpio18, FunctionSio<SioInput>, PullDown>;
+type Gpio19Pin = Pin<gpio::bank0::Gpio19, FunctionSio<SioInput>, PullDown>;
+type Gpio20Pin = Pin<gpio::bank0::Gpio20, FunctionSio<SioInput>, PullDown>;
+type Gpio21Pin = Pin<gpio::bank0::Gpio21, FunctionSio<SioInput>, PullDown>;
+type Gpio22Pin = Pin<gpio::bank0::Gpio22, FunctionSio<SioInput>, PullDown>;
+type Gpio23Pin = Pin<gpio::bank0::Gpio23, FunctionSio<SioInput>, PullDown>;
+type Gpio24Pin = Pin<gpio::bank0::Gpio24, FunctionSio<SioInput>, PullDown>;
+type Gpio25Pin = Pin<gpio::bank0::Gpio25, FunctionSio<SioInput>, PullDown>;
+type Gpio26Pin = Pin<gpio::bank0::Gpio26, FunctionSio<SioInput>, PullDown>;
+type Gpio27Pin = Pin<gpio::bank0::Gpio27, FunctionSio<SioInput>, PullDown>;
+type Gpio28Pin = Pin<gpio::bank0::Gpio28, FunctionSio<SioInput>, PullDown>;
+type Gpio29Pin = Pin<gpio::bank0::Gpio29, FunctionSio<SioInput>, PullDown>;
 
-impl Default for PinModeState {
-    fn default() -> Self {
-        PinModeState::Disabled
-    }
-}
 
-#[derive(Format)]
-pub struct ManagedPin {
-    #[defmt(Debug2Format)]
-    pub(crate) pin: DynPin,
-    pub(crate) current_mode: PinModeState,
-    pub(crate) id: u8,
-}
-
-impl ManagedPin {
-    pub fn new(pin: DynPin, id: u8) -> Self {
-        Self {
-            pin,
-            current_mode: PinModeState::Disabled,
-            id,
-        }
-    }
-    pub fn id(&self) -> u8 { self.id }
-}
-
-pub const NUM_GPIO_PINS: usize = 30;
-
+/// Manages the state and ownership of all GPIO pins.
+/// Each pin is stored as an Option wrapping its typed HAL representation.
+/// When a pin is used for a specific function, its Option is `take()`n,
+/// and after use, it must be converted back to its default state and `replace()`d.
+#[allow(non_snake_case)]
 pub struct GpioManager {
-    pins: [Option<ManagedPin>; NUM_GPIO_PINS],
+    // Each field corresponds to a GPIO pin.
+    pub Gpio0: Option<Gpio0Pin>,
+    pub Gpio1: Option<Gpio1Pin>,
+    pub Gpio2: Option<Gpio2Pin>,
+    pub Gpio3: Option<Gpio3Pin>,
+    pub Gpio4: Option<Gpio4Pin>,
+    pub Gpio5: Option<Gpio5Pin>,
+    pub Gpio6: Option<Gpio6Pin>,
+    pub Gpio7: Option<Gpio7Pin>,
+    pub Gpio8: Option<Gpio8Pin>,
+    pub Gpio9: Option<Gpio9Pin>,
+    pub Gpio10: Option<Gpio10Pin>,
+    pub Gpio11: Option<Gpio11Pin>,
+    pub Gpio12: Option<Gpio12Pin>,
+    pub Gpio13: Option<Gpio13Pin>,
+    pub Gpio14: Option<Gpio14Pin>,
+    pub Gpio15: Option<Gpio15Pin>,
+    pub Gpio16: Option<Gpio16Pin>,
+    pub Gpio17: Option<Gpio17Pin>,
+    pub Gpio18: Option<Gpio18Pin>,
+    pub Gpio19: Option<Gpio19Pin>,
+    pub Gpio20: Option<Gpio20Pin>,
+    pub Gpio21: Option<Gpio21Pin>,
+    pub Gpio22: Option<Gpio22Pin>,
+    pub Gpio23: Option<Gpio23Pin>,
+    pub Gpio24: Option<Gpio24Pin>,
+    pub Gpio25: Option<Gpio25Pin>,
+    pub Gpio26: Option<Gpio26Pin>,
+    pub Gpio27: Option<Gpio27Pin>,
+    pub Gpio28: Option<Gpio28Pin>,
+    pub Gpio29: Option<Gpio29Pin>,
 }
 
 impl GpioManager {
-    pub fn new(hal_pins: Pins) -> Self {
-        let mut pins_array: [Option<ManagedPin>; NUM_GPIO_PINS] = core::array::from_fn(|_| None);
-        pins_array[0]  = Some(ManagedPin::new(hal_pins.gpio0.into_dyn_pin(), 0));
-        pins_array[1]  = Some(ManagedPin::new(hal_pins.gpio1.into_dyn_pin(), 1));
-        pins_array[2]  = Some(ManagedPin::new(hal_pins.gpio2.into_dyn_pin(), 2));
-        pins_array[3]  = Some(ManagedPin::new(hal_pins.gpio3.into_dyn_pin(), 3));
-        pins_array[4]  = Some(ManagedPin::new(hal_pins.gpio4.into_dyn_pin(), 4));
-        pins_array[5]  = Some(ManagedPin::new(hal_pins.gpio5.into_dyn_pin(), 5));
-        pins_array[6]  = Some(ManagedPin::new(hal_pins.gpio6.into_dyn_pin(), 6));
-        pins_array[7]  = Some(ManagedPin::new(hal_pins.gpio7.into_dyn_pin(), 7));
-        pins_array[8]  = Some(ManagedPin::new(hal_pins.gpio8.into_dyn_pin(), 8));
-        pins_array[9]  = Some(ManagedPin::new(hal_pins.gpio9.into_dyn_pin(), 9));
-        pins_array[10] = Some(ManagedPin::new(hal_pins.gpio10.into_dyn_pin(), 10));
-        pins_array[11] = Some(ManagedPin::new(hal_pins.gpio11.into_dyn_pin(), 11));
-        pins_array[12] = Some(ManagedPin::new(hal_pins.gpio12.into_dyn_pin(), 12));
-        pins_array[13] = Some(ManagedPin::new(hal_pins.gpio13.into_dyn_pin(), 13));
-        pins_array[14] = Some(ManagedPin::new(hal_pins.gpio14.into_dyn_pin(), 14));
-        pins_array[15] = Some(ManagedPin::new(hal_pins.gpio15.into_dyn_pin(), 15));
-        pins_array[16] = Some(ManagedPin::new(hal_pins.gpio16.into_dyn_pin(), 16));
-        pins_array[17] = Some(ManagedPin::new(hal_pins.gpio17.into_dyn_pin(), 17));
-        pins_array[18] = Some(ManagedPin::new(hal_pins.gpio18.into_dyn_pin(), 18));
-        pins_array[19] = Some(ManagedPin::new(hal_pins.gpio19.into_dyn_pin(), 19));
-        pins_array[20] = Some(ManagedPin::new(hal_pins.gpio20.into_dyn_pin(), 20));
-        pins_array[21] = Some(ManagedPin::new(hal_pins.gpio21.into_dyn_pin(), 21));
-        pins_array[22] = Some(ManagedPin::new(hal_pins.gpio22.into_dyn_pin(), 22));
-        pins_array[23] = Some(ManagedPin::new(hal_pins.gpio23.into_dyn_pin(), 23));
-        pins_array[24] = Some(ManagedPin::new(hal_pins.gpio24.into_dyn_pin(), 24));
-        pins_array[25] = Some(ManagedPin::new(hal_pins.gpio25.into_dyn_pin(), 25));
-        pins_array[26] = Some(ManagedPin::new(hal_pins.gpio26.into_dyn_pin(), 26));
-        pins_array[27] = Some(ManagedPin::new(hal_pins.gpio27.into_dyn_pin(), 27));
-        pins_array[28] = Some(ManagedPin::new(hal_pins.gpio28.into_dyn_pin(), 28));
-        pins_array[29] = Some(ManagedPin::new(hal_pins.gpio29.into_dyn_pin(), 29));
-        Self { pins: pins_array }
-    }
-
-    fn with_pin_mut<F, R>(&mut self, pin_id: u8, func: F) -> Result<R, &'static str>
-    where F: FnOnce(&mut ManagedPin) -> Result<R, DynPinModeError>,
-    {
-        if pin_id as usize >= NUM_GPIO_PINS { return Err("Invalid pin_id"); }
-        match self.pins[pin_id as usize].as_mut() {
-            Some(managed_pin) => func(managed_pin).map_err(|_e| "Pin operation failed (DynPinModeError)"),
-            None => Err("Pin not available (should not happen if initialized)"),
+    /// Creates a new GpioManager, taking ownership of all GPIO pins from the HAL `Pins` struct.
+    /// Each pin is stored in its corresponding `Option` field.
+    pub fn new(hal_pins: gpio::Pins) -> Self {
+        Self {
+            Gpio0: Some(hal_pins.gpio0),
+            Gpio1: Some(hal_pins.gpio1),
+            Gpio2: Some(hal_pins.gpio2),
+            Gpio3: Some(hal_pins.gpio3),
+            Gpio4: Some(hal_pins.gpio4),
+            Gpio5: Some(hal_pins.gpio5),
+            Gpio6: Some(hal_pins.gpio6),
+            Gpio7: Some(hal_pins.gpio7),
+            Gpio8: Some(hal_pins.gpio8),
+            Gpio9: Some(hal_pins.gpio9),
+            Gpio10: Some(hal_pins.gpio10),
+            Gpio11: Some(hal_pins.gpio11),
+            Gpio12: Some(hal_pins.gpio12),
+            Gpio13: Some(hal_pins.gpio13),
+            Gpio14: Some(hal_pins.gpio14),
+            Gpio15: Some(hal_pins.gpio15),
+            Gpio16: Some(hal_pins.gpio16),
+            Gpio17: Some(hal_pins.gpio17),
+            Gpio18: Some(hal_pins.gpio18),
+            Gpio19: Some(hal_pins.gpio19),
+            Gpio20: Some(hal_pins.gpio20),
+            Gpio21: Some(hal_pins.gpio21),
+            Gpio22: Some(hal_pins.gpio22),
+            Gpio23: Some(hal_pins.gpio23),
+            Gpio24: Some(hal_pins.gpio24),
+            Gpio25: Some(hal_pins.gpio25),
+            Gpio26: Some(hal_pins.gpio26),
+            Gpio27: Some(hal_pins.gpio27),
+            Gpio28: Some(hal_pins.gpio28),
+            Gpio29: Some(hal_pins.gpio29),
         }
-    }
-
-    pub fn configure_pin_as_output(&mut self, pin_id: u8) -> Result<(), &'static str> { /* ... as before ... */ }
-    pub fn write_pin_output(&mut self, pin_id: u8, high: bool) -> Result<(), &'static str> { /* ... as before ... */ }
-    pub fn configure_pin_as_input(&mut self, pin_id: u8, pull: KlipperPullType) -> Result<(), &'static str> { /* ... as before ... */ }
-    pub fn read_pin_input(&mut self, pin_id: u8) -> Result<bool, &'static str> { /* ... as before ... */ }
-    pub fn release_pin(&mut self, pin_id: u8) -> Result<(), &'static str> { /* ... as before, sets to Disabled/FloatingInput ... */ }
-
-    // Re-implementations from previous step to ensure they are present
-    pub fn configure_pin_as_output(&mut self, pin_id: u8) -> Result<(), &'static str> {
-        self.with_pin_mut(pin_id, |mp| {
-            let temp_dyn_pin = core::mem::replace(&mut mp.pin, unsafe { core::mem::zeroed() });
-            mp.pin = temp_dyn_pin.into_push_pull_output().into_dyn_pin();
-            mp.current_mode = PinModeState::OutputPushPull;
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-    pub fn write_pin_output(&mut self, pin_id: u8, high: bool) -> Result<(), &'static str> {
-        self.with_pin_mut(pin_id, |mp| {
-            if mp.current_mode != PinModeState::OutputPushPull {
-                return Err(DynPinModeError::InvalidState);
-            }
-            if high { mp.pin.set_high() } else { mp.pin.set_low() }
-        })
-    }
-
-    pub fn configure_pin_as_input(&mut self, pin_id: u8, pull: KlipperPullType) -> Result<(), &'static str> {
-        self.with_pin_mut(pin_id, |mp| {
-            let temp_dyn_pin = core::mem::replace(&mut mp.pin, unsafe { core::mem::zeroed() });
-            mp.pin = match pull {
-                KlipperPullType::Up => temp_dyn_pin.into_pull_up_input().into_dyn_pin(),
-                KlipperPullType::Down => temp_dyn_pin.into_pull_down_input().into_dyn_pin(),
-                KlipperPullType::Floating => temp_dyn_pin.into_floating_input().into_dyn_pin(),
-            };
-            mp.current_mode = match pull {
-                KlipperPullType::Up => PinModeState::InputPullUp,
-                KlipperPullType::Down => PinModeState::InputPullDown,
-                KlipperPullType::Floating => PinModeState::InputFloating,
-            };
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-    pub fn read_pin_input(&mut self, pin_id: u8) -> Result<bool, &'static str> {
-        self.with_pin_mut(pin_id, |mp| {
-            match mp.current_mode {
-                PinModeState::InputFloating | PinModeState::InputPullUp | PinModeState::InputPullDown => {
-                    mp.pin.is_high()
-                }
-                _ => Err(DynPinModeError::InvalidState),
-            }
-        })
-    }
-
-    pub fn release_pin(&mut self, pin_id: u8) -> Result<(), &'static str> {
-        self.with_pin_mut(pin_id, |mp| {
-            let temp_dyn_pin = core::mem::replace(&mut mp.pin, unsafe { core::mem::zeroed() });
-            mp.pin = temp_dyn_pin.into_floating_input().into_dyn_pin();
-            mp.current_mode = PinModeState::Disabled;
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-
-    // --- ADC Pin Handling ---
-    // AdcCapablePin enum definition remains as before.
-    pub enum AdcCapablePin {
-        Gpio26(gpio::Pin<gpio::bank0::Gpio26, gpio::FloatingInput>),
-        Gpio27(gpio::Pin<gpio::bank0::Gpio27, gpio::FloatingInput>),
-        Gpio28(gpio::Pin<gpio::bank0::Gpio28, gpio::FloatingInput>),
-        Gpio29(gpio::Pin<gpio::bank0::Gpio29, gpio::FloatingInput>),
-    }
-
-    /// Attempts to take an ADC-capable pin from the manager for ADC use.
-    /// It uses an `unsafe` block to reconstruct a typed pin.
-    /// The `ManagedPin`'s state is updated to `FunctionAdc`.
-    /// The internal `DynPin` of the `ManagedPin` is NOT modified by this `take` operation itself,
-    /// but the caller receives a new typed pin instance that takes control of hardware.
-    pub fn take_pin_for_adc(&mut self, pin_id: u8) -> Result<AdcCapablePin, &'static str> {
-        if !(26..=29).contains(&pin_id) {
-            return Err("Pin is not ADC capable (must be GPIO26-29)");
-        }
-
-        let managed_pin_slot = &mut self.pins[pin_id as usize];
-
-        if let Some(managed_pin) = managed_pin_slot.as_mut() {
-            match managed_pin.current_mode {
-                PinModeState::Disabled | PinModeState::InputFloating => {
-                    // Ok to proceed. The DynPin inside managed_pin should be in a compatible state
-                    // or will be overridden by the typed pin's configuration.
-                    // The unsafe reconstruction creates a new typed view.
-                    let typed_adc_pin = match pin_id {
-                        26 => AdcCapablePin::Gpio26(unsafe { gpio::Pin::new(gpio::bank0::Gpio26::ID) }.into_floating_input()),
-                        27 => AdcCapablePin::Gpio27(unsafe { gpio::Pin::new(gpio::bank0::Gpio27::ID) }.into_floating_input()),
-                        28 => AdcCapablePin::Gpio28(unsafe { gpio::Pin::new(gpio::bank0::Gpio28::ID) }.into_floating_input()),
-                        29 => AdcCapablePin::Gpio29(unsafe { gpio::Pin::new(gpio::bank0::Gpio29::ID) }.into_floating_input())),
-                        _ => unreachable!(), // Should be caught by the first check
-                    };
-                    managed_pin.current_mode = PinModeState::FunctionAdc;
-                    defmt::debug!("GpioManager: Pin {} mode set to FunctionAdc. Returning typed handle.", pin_id);
-                    Ok(typed_adc_pin)
-                }
-                PinModeState::FunctionAdc => {
-                    // Pin is already notionally in ADC mode. This might indicate an issue
-                    // if it wasn't released, or it could be a request to re-get the handle.
-                    // For now, let's allow re-taking it if already FunctionAdc, but log a warning.
-                    defmt::warn!("GpioManager: Pin {} re-taken for ADC. Was already FunctionAdc.", pin_id);
-                     let typed_adc_pin = match pin_id {
-                        26 => AdcCapablePin::Gpio26(unsafe { gpio::Pin::new(gpio::bank0::Gpio26::ID) }.into_floating_input()),
-                        27 => AdcCapablePin::Gpio27(unsafe { gpio::Pin::new(gpio::bank0::Gpio27::ID) }.into_floating_input()),
-                        28 => AdcCapablePin::Gpio28(unsafe { gpio::Pin::new(gpio::bank0::Gpio28::ID) }.into_floating_input()),
-                        29 => AdcCapablePin::Gpio29(unsafe { gpio::Pin::new(gpio::bank0::Gpio29::ID) }.into_floating_input())),
-                        _ => unreachable!(),
-                    };
-                    Ok(typed_adc_pin)
-                }
-                _ => Err("Pin in incompatible mode for ADC"),
-            }
-        } else {
-            // This should not happen if GpioManager is initialized correctly with all pins Some.
-            Err("Pin slot is unexpectedly empty in GpioManager")
-        }
-    }
-
-    // release_adc_pin is renamed to release_adc_pin_by_id and modified later.
-    // For now, ensure the old release_adc_pin is correctly updated if it was used.
-    // The plan is to use release_adc_pin_by_id.
-    // Removing the old `release_adc_pin` that took `AdcCapablePin`.
-    // pub fn release_adc_pin(&mut self, pin_id: u8, _adc_capable_pin: AdcCapablePin) -> Result<(), &'static str> { /* ... old ... */ }
-
-    /// Releases a pin previously marked for ADC use, returning it to a Disabled state.
-    /// The internal DynPin is reconfigured to a default state (floating input).
-    pub fn release_pin_from_adc(&mut self, pin_id: u8) -> Result<(), &'static str> {
-        if !(26..=29).contains(&pin_id) { // Ensure it's an ADC pin ID
-            return Err("Invalid pin_id for ADC release (not GPIO26-29)");
-        }
-        // General bounds check is done by with_pin_mut
-
-        self.with_pin_mut(pin_id, |mp| {
-            if mp.current_mode != PinModeState::FunctionAdc {
-                defmt::warn!("GpioManager: Attempted to release pin {} from ADC, but it was in mode {:?}, not FunctionAdc.", pin_id, mp.current_mode);
-                return Err(DynPinModeError::InvalidState); // Or a more specific error
-            }
-
-            // Take the current DynPin, reconfigure it to a default state, and put it back.
-            let current_dyn_pin = core::mem::replace(&mut mp.pin, unsafe { core::mem::zeroed() });
-            mp.pin = current_dyn_pin.into_floating_input(); // Returns new DynPin in floating input state
-            mp.current_mode = PinModeState::Disabled;
-            defmt::debug!("GpioManager: Pin {} released from ADC, reset to FloatingInput, mode set to Disabled.", pin_id);
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-
-    // --- PWM Pin Handling ---
-    // PwmCapablePin enum definition remains as before.
-    #[allow(missing_docs)]
-    pub enum PwmCapablePin {
-        Gpio0(gpio::Pin<gpio::bank0::Gpio0, gpio::FunctionPwm>), Gpio1(gpio::Pin<gpio::bank0::Gpio1, gpio::FunctionPwm>),
-        Gpio2(gpio::Pin<gpio::bank0::Gpio2, gpio::FunctionPwm>), Gpio3(gpio::Pin<gpio::bank0::Gpio3, gpio::FunctionPwm>),
-        Gpio4(gpio::Pin<gpio::bank0::Gpio4, gpio::FunctionPwm>), Gpio5(gpio::Pin<gpio::bank0::Gpio5, gpio::FunctionPwm>),
-        Gpio6(gpio::Pin<gpio::bank0::Gpio6, gpio::FunctionPwm>), Gpio7(gpio::Pin<gpio::bank0::Gpio7, gpio::FunctionPwm>),
-        Gpio8(gpio::Pin<gpio::bank0::Gpio8, gpio::FunctionPwm>), Gpio9(gpio::Pin<gpio::bank0::Gpio9, gpio::FunctionPwm>),
-        Gpio10(gpio::Pin<gpio::bank0::Gpio10, gpio::FunctionPwm>), Gpio11(gpio::Pin<gpio::bank0::Gpio11, gpio::FunctionPwm>),
-        Gpio12(gpio::Pin<gpio::bank0::Gpio12, gpio::FunctionPwm>), Gpio13(gpio::Pin<gpio::bank0::Gpio13, gpio::FunctionPwm>),
-        Gpio14(gpio::Pin<gpio::bank0::Gpio14, gpio::FunctionPwm>), Gpio15(gpio::Pin<gpio::bank0::Gpio15, gpio::FunctionPwm>),
-        Gpio16(gpio::Pin<gpio::bank0::Gpio16, gpio::FunctionPwm>), Gpio17(gpio::Pin<gpio::bank0::Gpio17, gpio::FunctionPwm>),
-        Gpio18(gpio::Pin<gpio::bank0::Gpio18, gpio::FunctionPwm>), Gpio19(gpio::Pin<gpio::bank0::Gpio19, gpio::FunctionPwm>),
-        Gpio20(gpio::Pin<gpio::bank0::Gpio20, gpio::FunctionPwm>), Gpio21(gpio::Pin<gpio::bank0::Gpio21, gpio::FunctionPwm>),
-        Gpio22(gpio::Pin<gpio::bank0::Gpio22, gpio::FunctionPwm>), Gpio23(gpio::Pin<gpio::bank0::Gpio23, gpio::FunctionPwm>),
-        Gpio24(gpio::Pin<gpio::bank0::Gpio24, gpio::FunctionPwm>), Gpio25(gpio::Pin<gpio::bank0::Gpio25, gpio::FunctionPwm>),
-        Gpio26(gpio::Pin<gpio::bank0::Gpio26, gpio::FunctionPwm>), Gpio27(gpio::Pin<gpio::bank0::Gpio27, gpio::FunctionPwm>),
-        Gpio28(gpio::Pin<gpio::bank0::Gpio28, gpio::FunctionPwm>), Gpio29(gpio::Pin<gpio::bank0::Gpio29, gpio::FunctionPwm>),
-    }
-
-    pub fn configure_pin_for_pwm(&mut self, pin_id: u8) -> Result<(), &'static str> { /* ... as before ... */ }
-    // Implementation of configure_pin_for_pwm (copied from previous state)
-    pub fn configure_pin_for_pwm(&mut self, pin_id: u8) -> Result<(), &'static str> {
-        if pin_id as usize >= NUM_GPIO_PINS { return Err("Invalid pin_id for PWM"); }
-        self.with_pin_mut(pin_id, |mp| {
-            match mp.current_mode {
-                PinModeState::Disabled | PinModeState::InputFloating | PinModeState::OutputPushPull => {
-                    mp.current_mode = PinModeState::FunctionPwm;
-                    defmt::debug!("GpioManager: Pin {} state set for PWM.", pin_id);
-                    Ok(())
-                }
-                PinModeState::FunctionPwm => Ok(()),
-                _ => { defmt::warn!("GpioManager: Pin {} in incompatible mode {:?} for PWM.", pin_id, mp.current_mode); Err(DynPinModeError::InvalidState) }
-            }
-        })
-    }
-
-    /// Attempts to take a pin and configure it for PWM.
-    /// Uses unsafe new to reconstruct the typed pin.
-    pub fn take_pin_for_pwm(&mut self, pin_id: u8) -> Result<PwmCapablePin, &'static str> {
-        if pin_id as usize >= NUM_GPIO_PINS { return Err("Invalid pin_id"); }
-
-        let managed_pin_entry = &mut self.pins[pin_id as usize];
-        if managed_pin_entry.is_none() { return Err("ManagedPin is None, cannot take for PWM"); }
-
-        let mut managed_pin = managed_pin_entry.take().unwrap(); // Take ownership of ManagedPin
-
-        match managed_pin.current_mode {
-            PinModeState::Disabled | PinModeState::InputFloating | PinModeState::OutputPushPull | PinModeState::FunctionPwm => {
-                // It's okay to reconfigure from these states, or if already PWM.
-                // The `unsafe` reconstruction of the typed pin.
-                // This assumes that the underlying PAC tokens are implicitly available again.
-                // This is a significant HACK for rp2040-hal's typed GPIO system.
-                let typed_pwm_pin_result = match pin_id {
-                    0  => Ok(PwmCapablePin::Gpio0(unsafe { gpio::Pin::new(gpio::bank0::Gpio0::ID) }.into_function())),
-                    1  => Ok(PwmCapablePin::Gpio1(unsafe { gpio::Pin::new(gpio::bank0::Gpio1::ID) }.into_function())),
-                    2  => Ok(PwmCapablePin::Gpio2(unsafe { gpio::Pin::new(gpio::bank0::Gpio2::ID) }.into_function())),
-                    3  => Ok(PwmCapablePin::Gpio3(unsafe { gpio::Pin::new(gpio::bank0::Gpio3::ID) }.into_function())),
-                    4  => Ok(PwmCapablePin::Gpio4(unsafe { gpio::Pin::new(gpio::bank0::Gpio4::ID) }.into_function())),
-                    5  => Ok(PwmCapablePin::Gpio5(unsafe { gpio::Pin::new(gpio::bank0::Gpio5::ID) }.into_function())),
-                    6  => Ok(PwmCapablePin::Gpio6(unsafe { gpio::Pin::new(gpio::bank0::Gpio6::ID) }.into_function())),
-                    7  => Ok(PwmCapablePin::Gpio7(unsafe { gpio::Pin::new(gpio::bank0::Gpio7::ID) }.into_function())),
-                    8  => Ok(PwmCapablePin::Gpio8(unsafe { gpio::Pin::new(gpio::bank0::Gpio8::ID) }.into_function())),
-                    9  => Ok(PwmCapablePin::Gpio9(unsafe { gpio::Pin::new(gpio::bank0::Gpio9::ID) }.into_function())),
-                    10 => Ok(PwmCapablePin::Gpio10(unsafe { gpio::Pin::new(gpio::bank0::Gpio10::ID) }.into_function())),
-                    11 => Ok(PwmCapablePin::Gpio11(unsafe { gpio::Pin::new(gpio::bank0::Gpio11::ID) }.into_function())),
-                    12 => Ok(PwmCapablePin::Gpio12(unsafe { gpio::Pin::new(gpio::bank0::Gpio12::ID) }.into_function())),
-                    13 => Ok(PwmCapablePin::Gpio13(unsafe { gpio::Pin::new(gpio::bank0::Gpio13::ID) }.into_function())),
-                    14 => Ok(PwmCapablePin::Gpio14(unsafe { gpio::Pin::new(gpio::bank0::Gpio14::ID) }.into_function())),
-                    15 => Ok(PwmCapablePin::Gpio15(unsafe { gpio::Pin::new(gpio::bank0::Gpio15::ID) }.into_function())),
-                    16 => Ok(PwmCapablePin::Gpio16(unsafe { gpio::Pin::new(gpio::bank0::Gpio16::ID) }.into_function())),
-                    17 => Ok(PwmCapablePin::Gpio17(unsafe { gpio::Pin::new(gpio::bank0::Gpio17::ID) }.into_function())),
-                    18 => Ok(PwmCapablePin::Gpio18(unsafe { gpio::Pin::new(gpio::bank0::Gpio18::ID) }.into_function())),
-                    19 => Ok(PwmCapablePin::Gpio19(unsafe { gpio::Pin::new(gpio::bank0::Gpio19::ID) }.into_function())),
-                    20 => Ok(PwmCapablePin::Gpio20(unsafe { gpio::Pin::new(gpio::bank0::Gpio20::ID) }.into_function())),
-                    21 => Ok(PwmCapablePin::Gpio21(unsafe { gpio::Pin::new(gpio::bank0::Gpio21::ID) }.into_function())),
-                    22 => Ok(PwmCapablePin::Gpio22(unsafe { gpio::Pin::new(gpio::bank0::Gpio22::ID) }.into_function())),
-                    23 => Ok(PwmCapablePin::Gpio23(unsafe { gpio::Pin::new(gpio::bank0::Gpio23::ID) }.into_function())),
-                    24 => Ok(PwmCapablePin::Gpio24(unsafe { gpio::Pin::new(gpio::bank0::Gpio24::ID) }.into_function())),
-                    25 => Ok(PwmCapablePin::Gpio25(unsafe { gpio::Pin::new(gpio::bank0::Gpio25::ID) }.into_function())),
-                    26 => Ok(PwmCapablePin::Gpio26(unsafe { gpio::Pin::new(gpio::bank0::Gpio26::ID) }.into_function())),
-                    27 => Ok(PwmCapablePin::Gpio27(unsafe { gpio::Pin::new(gpio::bank0::Gpio27::ID) }.into_function())),
-                    28 => Ok(PwmCapablePin::Gpio28(unsafe { gpio::Pin::new(gpio::bank0::Gpio28::ID) }.into_function())),
-                    29 => Ok(PwmCapablePin::Gpio29(unsafe { gpio::Pin::new(gpio::bank0::Gpio29::ID) }.into_function())),
-                    _ => Err("Invalid pin_id for PwmCapablePin reconstruction"), // Should be caught by initial check
-                };
-
-                match typed_pwm_pin_result {
-                    Ok(typed_pin) => {
-                        managed_pin.current_mode = PinModeState::FunctionPwm;
-                        // The original DynPin in managed_pin is now conceptually "gone" because we've
-                        // unsafely reconstructed a typed pin. We put the ManagedPin back with updated state.
-                        // The DynPin field in it is stale if we don't update it from typed_pin.
-                        // For this take model, the caller gets the typed_pin, and this slot becomes empty.
-                        // So, *managed_pin_entry remains None (because we .take() earlier).
-                        defmt::debug!("GpioManager: Pin {} taken for PWM. Manager slot is now None.", pin_id);
-                        Ok(typed_pin)
-                    }
-                    Err(e) => {
-                        *managed_pin_entry = Some(managed_pin); // Put original back on error
-                        Err(e)
-                    }
-                }
-            }
-            _ => {
-                *managed_pin_entry = Some(managed_pin); // Put original back
-                Err("Pin in incompatible mode for PWM")
-            }
-        }
-    }
-
-    /// Releases a pin previously taken for PWM, returning it to the manager in a Disabled state.
-    /// The `_pwm_pin` argument is consumed by the HAL when setting up PWM, so it's mostly a type-state token here.
-    pub fn release_pwm_pin_by_id(&mut self, pin_id: u8) -> Result<(), &'static str> {
-        if pin_id as usize >= NUM_GPIO_PINS {
-            return Err("Invalid pin_id for release");
-        }
-
-        // We expect the slot to be None because take_pin_for_pwm should have emptied it.
-        if self.pins[pin_id as usize].is_some() {
-            // This might indicate the pin was taken, but then the consuming operation failed
-            // before it could be "emptied" from the manager's perspective, or it was never taken.
-            // Or, it means take_pin_for_pwm logic needs adjustment to always None-out the slot.
-            // For now, if it's Some, we'll assume we are resetting an existing ManagedPin.
-            defmt::warn!("release_pwm_pin_by_id: Pin {} slot was not empty. Resetting existing.", pin_id);
-        }
-
-        // Reconstruct a default DynPin for this pin_id and set its state to Disabled.
-        // This uses the same unsafe hack as take_pin_for_pwm to get a typed pin,
-        // then immediately degrades it to DynPin in a default state.
-        let default_dyn_pin = match pin_id {
-            0  => unsafe { gpio::Pin::new(gpio::bank0::Gpio0::ID) }.into_floating_input().into_dyn_pin(),
-            1  => unsafe { gpio::Pin::new(gpio::bank0::Gpio1::ID) }.into_floating_input().into_dyn_pin(),
-            // ... Add all GPIOs 2-29 similarly ...
-            2  => unsafe { gpio::Pin::new(gpio::bank0::Gpio2::ID) }.into_floating_input().into_dyn_pin(),
-            3  => unsafe { gpio::Pin::new(gpio::bank0::Gpio3::ID) }.into_floating_input().into_dyn_pin(),
-            4  => unsafe { gpio::Pin::new(gpio::bank0::Gpio4::ID) }.into_floating_input().into_dyn_pin(),
-            5  => unsafe { gpio::Pin::new(gpio::bank0::Gpio5::ID) }.into_floating_input().into_dyn_pin(),
-            6  => unsafe { gpio::Pin::new(gpio::bank0::Gpio6::ID) }.into_floating_input().into_dyn_pin(),
-            7  => unsafe { gpio::Pin::new(gpio::bank0::Gpio7::ID) }.into_floating_input().into_dyn_pin(),
-            8  => unsafe { gpio::Pin::new(gpio::bank0::Gpio8::ID) }.into_floating_input().into_dyn_pin(),
-            9  => unsafe { gpio::Pin::new(gpio::bank0::Gpio9::ID) }.into_floating_input().into_dyn_pin(),
-            10 => unsafe { gpio::Pin::new(gpio::bank0::Gpio10::ID) }.into_floating_input().into_dyn_pin(),
-            11 => unsafe { gpio::Pin::new(gpio::bank0::Gpio11::ID) }.into_floating_input().into_dyn_pin(),
-            12 => unsafe { gpio::Pin::new(gpio::bank0::Gpio12::ID) }.into_floating_input().into_dyn_pin(),
-            13 => unsafe { gpio::Pin::new(gpio::bank0::Gpio13::ID) }.into_floating_input().into_dyn_pin(),
-            14 => unsafe { gpio::Pin::new(gpio::bank0::Gpio14::ID) }.into_floating_input().into_dyn_pin(),
-            15 => unsafe { gpio::Pin::new(gpio::bank0::Gpio15::ID) }.into_floating_input().into_dyn_pin(),
-            16 => unsafe { gpio::Pin::new(gpio::bank0::Gpio16::ID) }.into_floating_input().into_dyn_pin(),
-            17 => unsafe { gpio::Pin::new(gpio::bank0::Gpio17::ID) }.into_floating_input().into_dyn_pin(),
-            18 => unsafe { gpio::Pin::new(gpio::bank0::Gpio18::ID) }.into_floating_input().into_dyn_pin(),
-            19 => unsafe { gpio::Pin::new(gpio::bank0::Gpio19::ID) }.into_floating_input().into_dyn_pin(),
-            20 => unsafe { gpio::Pin::new(gpio::bank0::Gpio20::ID) }.into_floating_input().into_dyn_pin(),
-            21 => unsafe { gpio::Pin::new(gpio::bank0::Gpio21::ID) }.into_floating_input().into_dyn_pin(),
-            22 => unsafe { gpio::Pin::new(gpio::bank0::Gpio22::ID) }.into_floating_input().into_dyn_pin(),
-            23 => unsafe { gpio::Pin::new(gpio::bank0::Gpio23::ID) }.into_floating_input().into_dyn_pin(),
-            24 => unsafe { gpio::Pin::new(gpio::bank0::Gpio24::ID) }.into_floating_input().into_dyn_pin(),
-            25 => unsafe { gpio::Pin::new(gpio::bank0::Gpio25::ID) }.into_floating_input().into_dyn_pin(),
-            26 => unsafe { gpio::Pin::new(gpio::bank0::Gpio26::ID) }.into_floating_input().into_dyn_pin(),
-            27 => unsafe { gpio::Pin::new(gpio::bank0::Gpio27::ID) }.into_floating_input().into_dyn_pin(),
-            28 => unsafe { gpio::Pin::new(gpio::bank0::Gpio28::ID) }.into_floating_input().into_dyn_pin(),
-            29 => unsafe { gpio::Pin::new(gpio::bank0::Gpio29::ID) }.into_floating_input().into_dyn_pin(),
-            _ => return Err("Invalid pin_id for default DynPin reconstruction"),
-        };
-
-        self.pins[pin_id as usize] = Some(ManagedPin {
-            pin: default_dyn_pin,
-            current_mode: PinModeState::Disabled, // Mark as disabled and ready for reuse
-            id: pin_id,
-        });
-        defmt::debug!("GpioManager: Pin {} released (by ID) from PWM and set to Disabled.", pin_id);
-        Ok(())
     }
 }
+// All other methods (`take_pin_for_...`, `release_pin...`, `configure_pin...`, etc.)
+// and helper enums (`ManagedPin`, `PinModeState`, `...CapablePin`) are now removed.
+// All logic for pin manipulation will now reside in `main.rs::process_command`.

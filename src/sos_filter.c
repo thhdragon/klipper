@@ -29,7 +29,7 @@ struct sos_filter {
     struct sos_filter_section filter[0];
 };
 
-static inline uint8_t
+inline uint8_t
 overflows_int32(int64_t value) {
     return value > (int64_t)INT32_MAX || value < (int64_t)INT32_MIN;
 }
