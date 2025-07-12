@@ -1,354 +1,206 @@
+// src/stepper.rs
 #![cfg_attr(not(test), no_std)]
 
-use bitflags::bitflags;
-use core::marker::PhantomData;
-use heapless::Deque;
+use defmt::Format;
 
-// Assuming HAL traits will be in crate::hal
-use crate::hal::{GpioOut, Timer, Scheduler};
-// Assuming utility functions will be in crate::utils
-use crate::utils::{timer_is_before, timer_from_us};
+/// Represents the direction of stepper motor rotation.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Format)]
+pub enum StepperDirection {
+    Clockwise,
+    CounterClockwise,
+}
 
-
-// --- Constants ---
-pub const STEPPER_STEP_BOTH_EDGE: bool = true;
-const POSITION_BIAS: i32 = 0x40000000;
-
-// --- Enums and Bitflags ---
-bitflags! {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct StepperMoveFlags: u8 { // Made pub
-        const MF_DIR = 1 << 0;
+impl Default for StepperDirection {
+    fn default() -> Self {
+        StepperDirection::Clockwise
     }
 }
 
-bitflags! {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct StepperFlags: u8 { // Made pub
-        const SF_LAST_DIR      = 1 << 0;
-        const SF_NEXT_DIR      = 1 << 1;
-        const SF_INVERT_STEP   = 1 << 2;
-        const SF_NEED_RESET    = 1 << 3;
-        const SF_SINGLE_SCHED  = 1 << 4;
-        const SF_OPTIMIZED_PATH= 1 << 5;
-        const SF_HAVE_ADD      = 1 << 6;
-    }
+/// Represents a single stepper motor axis.
+#[derive(Debug, Format)]
+pub struct Stepper {
+    /// A unique identifier for this stepper instance.
+    pub(crate) id: u32,
+
+    /// The GPIO pin number for the STEP signal.
+    pub(crate) step_pin_id: u8,
+
+    /// The GPIO pin number for the DIR signal.
+    pub(crate) dir_pin_id: u8,
+
+    /// The current configured direction of the motor.
+    pub(crate) current_direction: StepperDirection,
+
+    /// The ID used to register this stepper's tasks with the scheduler.
+    /// This should be unique among all scheduler tasks. It can be derived from `id`.
+    pub(crate) timer_id_for_scheduler: u32,
+
+    /// Number of steps remaining to be executed in the current move.
+    /// When this reaches 0, the current move sequence is complete.
+    pub(crate) steps_to_move: u32,
+
+    /// Duration of the high part of the step pulse, in raw timer ticks.
+    /// (e.g., if timer is 1MHz, 2 ticks = 2 microseconds).
+    pub(crate) pulse_duration_ticks: u32,
+
+    /// The absolute time (in raw timer ticks) for the next event
+    /// (either step pulse rising edge or falling edge).
+    pub(crate) next_step_waketime: u32,
+
+    /// Tracks the state of the step pulse generation.
+    /// `true` if the pulse is currently in its HIGH phase (waiting to go LOW).
+    /// `false` if the pulse is currently in its LOW phase (waiting for the next pulse to start, or move is done).
+    pub(crate) is_pulsing_high: bool,
+
+    /// Period between the start of one step pulse and the start of the next, in timer ticks.
+    /// This determines the step rate (frequency).
+    pub(crate) step_period_ticks: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StepEventResult {
-    Done,
-    Reschedule,
-}
+use crate::gpio_manager::GpioManager; // For GpioManager interaction
+use crate::hal::StepEventResult; // For callback return types, though not used by these methods directly yet
 
-// --- Core Data Structures ---
-#[derive(Debug, Clone, Copy)]
-pub struct StepperMove { // Made pub
-    interval: u32,
-    add: i16,
-    count: u16,
-    flags: StepperMoveFlags,
-}
-
-const MAX_QUEUE_MOVES: usize = 16;
-
-pub struct Stepper<STEP: GpioOut, DIR: GpioOut, T: Timer, SCHED: Scheduler> {
-    timer: T,
-    step_pin: STEP,
-    dir_pin: DIR,
-    flags: StepperFlags,
-    step_pulse_ticks: u32,
-    current_interval: u32,
-    current_add: i16,
-    steps_remaining: u32,
-    next_step_time: u32,
-    position: i32,
-    move_queue: Deque<StepperMove, MAX_QUEUE_MOVES>,
-    stop_requested: bool,
-    _scheduler_phantom: PhantomData<SCHED>,
-}
-
-// --- Stepper Implementation ---
-impl<STEP: GpioOut, DIR: GpioOut, T: Timer, SCHED: Scheduler> Stepper<STEP, DIR, T, SCHED> {
+impl Stepper {
+    /// Creates a new Stepper instance.
+    ///
+    /// `id`: A unique ID for this stepper.
+    /// `timer_id_for_scheduler`: The ID this stepper will use for its scheduler tasks.
+    /// `step_pin_id`, `dir_pin_id`: GPIO pin numbers.
+    /// `gpio_manager`: A mutable reference to configure the pins.
+    ///
+    /// Note: This constructor configures pins as outputs. It might be better
+    /// if pin configuration is handled more explicitly by the caller or a setup command.
     pub fn new(
+        id: u32,
+        timer_id_for_scheduler: u32,
         step_pin_id: u8,
         dir_pin_id: u8,
-        invert_step_setting: i8,
-        step_pulse_ticks: u32,
-        mut step_pin_factory: impl FnMut(u8, bool) -> STEP,
-        mut dir_pin_factory: impl FnMut(u8, bool) -> DIR,
-        mut timer_factory: impl FnMut(fn(&mut Stepper<STEP, DIR, T, SCHED>, &mut SCHED) -> StepEventResult) -> T,
-        _timer_event_handler: fn(&mut Stepper<STEP, DIR, T, SCHED>, &mut SCHED) -> StepEventResult,
-    ) -> Self {
-        let mut flags = StepperFlags::empty();
-        let invert_step_pin_logic = if invert_step_setting > 0 {
-            flags |= StepperFlags::SF_INVERT_STEP;
-            true
-        } else {
-            false
+        gpio_manager: &mut GpioManager,
+    ) -> Result<Self, &'static str> {
+        // Configure step and dir pins as outputs
+        gpio_manager.configure_pin_as_output(step_pin_id)?;
+        gpio_manager.write_pin_output(step_pin_id, false)?; // Start with step pin low
+
+        gpio_manager.configure_pin_as_output(dir_pin_id)?;
+        // Default direction will be set by an explicit call to set_direction or a command.
+        // For now, let's set a default and write it.
+        let initial_direction = StepperDirection::default();
+        let dir_pin_state = match initial_direction {
+            StepperDirection::Clockwise => false, // Assuming LOW for Clockwise, this is arbitrary
+            StepperDirection::CounterClockwise => true,
         };
+        gpio_manager.write_pin_output(dir_pin_id, dir_pin_state)?;
 
-        if invert_step_setting < 0 {
-            flags |= StepperFlags::SF_SINGLE_SCHED;
-        }
+        defmt::info!(
+            "Stepper {} initialized: Step Pin {}, Dir Pin {}. Initial Dir: {:?}",
+            id, step_pin_id, dir_pin_id, initial_direction
+        );
 
-        let step_pin = step_pin_factory(step_pin_id, invert_step_pin_logic);
-        let dir_pin = dir_pin_factory(dir_pin_id, false);
-        let timer = timer_factory(Self::stepper_event_callback); // Pass the static-like callback
-        let position = -POSITION_BIAS;
-
-        Self {
-            timer,
-            step_pin,
-            dir_pin,
-            flags,
-            step_pulse_ticks,
-            current_interval: 0,
-            current_add: 0,
-            steps_remaining: 0,
-            next_step_time: 0,
-            position,
-            move_queue: Deque::new(),
-            stop_requested: false,
-            _scheduler_phantom: PhantomData,
-        }
+        Ok(Self {
+            id,
+            step_pin_id,
+            dir_pin_id,
+            current_direction: initial_direction,
+            timer_id_for_scheduler,
+            steps_to_move: 0,
+            pulse_duration_ticks: 2, // Default 2 ticks (e.g., 2us at 1MHz)
+            next_step_waketime: 0,
+            is_pulsing_high: false,
+            step_period_ticks: 2000, // Default to 2000 ticks period (e.g., 500 Hz at 1MHz)
+        })
     }
 
-    pub fn set_next_step_dir(&mut self, set_forward_dir: bool) {
-        // Assuming cortex_m::interrupt::free is available via `use cortex_m;` if needed
-        // For now, direct modification as critical section handling is context-dependent
-        if set_forward_dir {
-            self.flags |= StepperFlags::SF_NEXT_DIR;
-        } else {
-            self.flags &= !StepperFlags::SF_NEXT_DIR;
-        }
-    }
-
-    pub fn reset_step_clock(&mut self, waketime: u32, _scheduler: &mut SCHED) {
-        // Assuming critical section handled by caller or context
-        if self.steps_remaining > 0 {
-            panic!("Can't reset time when stepper active");
-        }
-        self.next_step_time = waketime;
-        self.timer.set_waketime(waketime);
-        self.flags &= !StepperFlags::SF_NEED_RESET;
-    }
-
-    // This callback signature assumes the scheduler can somehow provide the correct `stepper` instance.
-    // This is a common challenge in embedded Rust event systems.
-    fn stepper_event_callback(stepper: &mut Self, scheduler: &mut SCHED) -> StepEventResult {
-        stepper.handle_stepper_event(scheduler)
-    }
-
-    fn handle_stepper_event(&mut self, scheduler: &mut SCHED) -> StepEventResult {
-        self.step_pin.toggle();
-        let curtime = scheduler.read_time();
-        let min_next_time = curtime.wrapping_add(self.step_pulse_ticks);
-        self.steps_remaining = self.steps_remaining.saturating_sub(1);
-
-        if self.flags.contains(StepperFlags::SF_SINGLE_SCHED) {
-            if self.steps_remaining > 0 {
-                self.next_step_time = self.next_step_time.wrapping_add(self.current_interval);
-                self.current_interval = self.current_interval.wrapping_add(self.current_add as u32);
-                if timer_is_before(self.next_step_time, min_next_time) {
-                    self.timer.set_waketime(min_next_time);
-                } else {
-                    self.timer.set_waketime(self.next_step_time);
-                }
-                StepEventResult::Reschedule
-            } else {
-                self.timer.set_waketime(min_next_time);
-                self.load_next_move(scheduler)
-            }
-        } else {
-            if self.steps_remaining > 0 {
-                if self.steps_remaining % 2 == 1 { // Odd: was step, schedule unstep
-                    self.timer.set_waketime(min_next_time);
-                } else { // Even: was unstep, schedule next step
-                    self.next_step_time = self.next_step_time.wrapping_add(self.current_interval);
-                    self.current_interval = self.current_interval.wrapping_add(self.current_add as u32);
-                    if timer_is_before(self.next_step_time, min_next_time) {
-                        self.timer.set_waketime(min_next_time);
-                    } else {
-                        self.timer.set_waketime(self.next_step_time);
-                    }
-                }
-                StepEventResult::Reschedule
-            } else { // Move finished
-                self.timer.set_waketime(min_next_time); // Ensure pulse for last unstep
-                self.load_next_move(scheduler)
-            }
-        }
-    }
-
-    fn get_current_logical_position(&self) -> i32 {
-        let mut current_val_as_u32 = self.position as u32;
-        let pending_steps_u32 = if self.flags.contains(StepperFlags::SF_SINGLE_SCHED) {
-            self.steps_remaining
-        } else {
-            self.steps_remaining / 2
-        };
-        current_val_as_u32 = current_val_as_u32.wrapping_sub(pending_steps_u32);
-        let effective_biased_pos_u32 = if current_val_as_u32 & 0x8000_0000 != 0 {
-            current_val_as_u32.wrapping_neg()
-        } else {
-            current_val_as_u32
-        };
-        (effective_biased_pos_u32 as i32) - POSITION_BIAS
-    }
-
-    pub fn report_position(&self) -> i32 {
-        // Critical section might be needed around this if called from different contexts
-        self.get_current_logical_position()
-    }
-
-    pub fn stop_stepper(&mut self, scheduler: &mut SCHED) {
-        scheduler.delete_timer(&mut self.timer);
-        self.next_step_time = 0;
-        self.timer.set_waketime(0);
-
-        // Recalculate s->position based on C logic
-        let mut temp_pos_val_u32 = self.position as u32;
-        let pending_steps = if self.flags.contains(StepperFlags::SF_SINGLE_SCHED) {
-            self.steps_remaining
-        } else {
-            self.steps_remaining / 2
-        };
-        temp_pos_val_u32 = temp_pos_val_u32.wrapping_sub(pending_steps);
-
-        let c_stepper_get_pos_equivalent = if temp_pos_val_u32 & 0x8000_0000 != 0 {
-            temp_pos_val_u32.wrapping_neg()
-        } else {
-            temp_pos_val_u32
-        };
-        self.position = (c_stepper_get_pos_equivalent as i32).wrapping_neg();
-
-        self.steps_remaining = 0;
-        let preserved_flags = StepperFlags::SF_INVERT_STEP | StepperFlags::SF_SINGLE_SCHED | StepperFlags::SF_OPTIMIZED_PATH;
-        self.flags = (self.flags & preserved_flags) | StepperFlags::SF_NEED_RESET;
-        self.dir_pin.write(false);
-        let unstep_state = self.flags.contains(StepperFlags::SF_INVERT_STEP);
-        if !self.flags.contains(StepperFlags::SF_SINGLE_SCHED) {
-            self.step_pin.write(unstep_state);
-        }
-        self.move_queue.clear();
-        self.stop_requested = true;
-    }
-
-    pub fn queue_move(
+    /// Sets the direction of the stepper motor.
+    pub fn set_direction(
         &mut self,
-        interval: u32,
-        count: u16,
-        add: i16,
-        scheduler: &mut SCHED,
-    ) {
-        if count == 0 {
-            panic!("Invalid count parameter in queue_move: must be > 0");
+        direction: StepperDirection,
+        gpio_manager: &mut GpioManager,
+    ) -> Result<(), &'static str> {
+        if self.current_direction == direction && !self.is_pulsing_high { // Optimization: only change if different and not mid-pulse
+             // If mid-pulse, changing direction could be problematic. Klipper usually sets dir before stepping.
+            // For now, allow changing anytime but it's better to set dir when not actively pulsing.
+            // return Ok(());
         }
-        let mut move_flags = StepperMoveFlags::empty();
-        // Critical section for modifying flags and queue
-        // cortex_m::interrupt::free(|_cs| { ... }); // If cortex-m is used
-        let last_dir_is_set = self.flags.contains(StepperFlags::SF_LAST_DIR);
-        let next_dir_is_set = self.flags.contains(StepperFlags::SF_NEXT_DIR);
-        if last_dir_is_set != next_dir_is_set {
-            self.flags.toggle(StepperFlags::SF_LAST_DIR);
-            move_flags |= StepperMoveFlags::MF_DIR;
-        }
-        let new_move = StepperMove {
-            interval,
-            count,
-            add,
-            flags: move_flags,
+
+        let dir_pin_state = match direction {
+            StepperDirection::Clockwise => false, // Assuming LOW for Clockwise
+            StepperDirection::CounterClockwise => true,
         };
-        if self.move_queue.push_back(new_move).is_err() {
-            panic!("Stepper move queue full!");
-        }
-        if self.steps_remaining == 0 {
-            if !self.flags.contains(StepperFlags::SF_NEED_RESET) {
-                if self.load_next_move(scheduler) == StepEventResult::Reschedule {
-                    scheduler.add_timer(&mut self.timer);
-                }
+
+        match gpio_manager.write_pin_output(self.dir_pin_id, dir_pin_state) {
+            Ok(()) => {
+                self.current_direction = direction;
+                // defmt::trace!("Stepper {}: Direction set to {:?}", self.id, direction);
+                Ok(())
+            }
+            Err(e) => {
+                defmt::error!("Stepper {}: Failed to set direction pin {}: {}", self.id, self.dir_pin_id, e);
+                Err(e)
             }
         }
-        // }); // End of critical section
     }
 
-    fn load_next_move(&mut self, scheduler: &mut SCHED) -> StepEventResult {
-        if let Some(move_to_load) = self.move_queue.pop_front() {
-            let move_interval = move_to_load.interval;
-            let move_count = move_to_load.count;
-            let move_add = move_to_load.add;
-            let needs_dir_change = move_to_load.flags.contains(StepperMoveFlags::MF_DIR);
+    /// Starts the high phase of a step pulse.
+    pub(crate) fn issue_step_pulse_start(
+        &mut self,
+        gpio_manager: &mut GpioManager,
+    ) -> Result<(), &'static str> {
+        // defmt::trace!("Stepper {}: Pulse START on pin {}", self.id, self.step_pin_id);
+        gpio_manager.write_pin_output(self.step_pin_id, true)
+    }
 
-            if needs_dir_change {
-                self.position = self.position.wrapping_neg();
+    /// Ends the step pulse by setting the step pin low.
+    pub(crate) fn issue_step_pulse_end(
+        &mut self,
+        gpio_manager: &mut GpioManager,
+    ) -> Result<(), &'static str> {
+        // defmt::trace!("Stepper {}: Pulse END on pin {}", self.id, self.step_pin_id);
+        gpio_manager.write_pin_output(self.step_pin_id, false)
+    }
+
+    /// The core stepper event handler, called by the scheduler.
+    /// This generates one step pulse (rising and falling edge) over two scheduler events.
+    pub fn step_event_callback<MasterAlarm: rp2040_hal::timer::Alarm>(
+        &mut self,
+        scheduler: &mut crate::sched::SchedulerState<MasterAlarm>,
+        gpio_manager: &mut GpioManager,
+    ) {
+        if self.is_pulsing_high {
+            // --- End of pulse ---
+            // Set step pin low
+            if self.issue_step_pulse_end(gpio_manager).is_err() {
+                defmt::error!("Stepper {}: Failed to end step pulse!", self.id);
+                // Abort move on error
+                self.steps_to_move = 0;
+                return;
             }
-            self.position = self.position.wrapping_add(move_count as i32);
-            self.current_add = move_add;
-            self.current_interval = move_interval.wrapping_add(move_add as u32); // First interval includes add
+            self.is_pulsing_high = false;
+            self.steps_to_move -= 1;
 
-            let was_active = self.steps_remaining > 0;
-            // If idle, next_step_time is effectively the timer's current waketime (or reset time)
-            // If active, next_step_time was the time of the last scheduled step's high edge.
-            // The C code: s->next_step_time += move_interval;
-            // This assumes s->next_step_time holds the time of the *start* of the pulse for the current step.
-            // For a new move, it should be s->next_step_time (end of last pulse) + new_interval.
-            // Let's assume self.next_step_time is the time the last step *started*.
-            // If was_active is false, self.next_step_time might be a reset_clock time.
-
-            // This part needs careful review against C logic for how s->next_step_time is maintained.
-            // If starting from idle, self.next_step_time might be based on scheduler.read_time() or a reset time.
-            // For now, using self.timer.get_waketime() as a base if idle, or self.next_step_time if active.
-            let base_time = if was_active { self.next_step_time } else { self.timer.get_waketime() };
-            self.next_step_time = base_time.wrapping_add(move_interval);
-            self.timer.set_waketime(self.next_step_time);
-
-            if self.flags.contains(StepperFlags::SF_SINGLE_SCHED) {
-                self.steps_remaining = move_count as u32;
+            if self.steps_to_move > 0 {
+                // Schedule the start of the next pulse
+                let time_between_pulses = self.step_period_ticks.saturating_sub(self.pulse_duration_ticks);
+                self.next_step_waketime = self.next_step_waketime.wrapping_add(time_between_pulses);
+                scheduler.schedule_task(self.timer_id_for_scheduler, self.next_step_waketime);
             } else {
-                self.steps_remaining = (move_count as u32) * 2;
+                // Move complete
+                defmt::info!("Stepper {}: Move complete.", self.id);
             }
-
-            let min_next_time_for_calc = self.timer.get_waketime(); // This is actually the *new* waketime.
-                                                                    // The C code uses the *old* s->time.waketime here.
-                                                                    // Let's assume min_next_time_for_calc should be based on *current time* or *last event time*.
-                                                                    // This needs to be the time of the previous event's completion.
-
-            if was_active && timer_is_before(self.timer.get_waketime(), scheduler.read_time().wrapping_add(self.step_pulse_ticks)) {
-                // This condition is to prevent scheduling in the past if calculations are tight.
-                // The original C code: if (was_active && timer_is_before(s->next_step_time, min_next_time))
-                // min_next_time was s->time.waketime *before* it was updated.
-                // This logic is complex and depends on precise definition of s->next_step_time and s->time.waketime.
-                // For now, this is a simplified check.
-                let diff = self.timer.get_waketime().wrapping_sub(scheduler.read_time()) as i32;
-                if diff < -(timer_from_us(1000, scheduler.get_clock_freq()) as i32) {
-                    panic!("Stepper too far in past");
-                }
-                // self.timer.set_waketime(scheduler.read_time().wrapping_add(self.step_pulse_ticks));
-            }
-
-            if needs_dir_change {
-                // For simplicity, assuming toggle is okay. C code has more complex handling for dir change timing.
-                self.dir_pin.toggle();
-                if was_active {
-                    // Simplified: if dir changed while active, may need to adjust timer to allow settling.
-                    // C code has a spin wait and reschedules if dir change is too close to step.
-                    let settle_time = scheduler.read_time().wrapping_add(self.step_pulse_ticks.max(timer_from_us(10, scheduler.get_clock_freq()))); // Min 10us settle
-                    if timer_is_before(self.timer.get_waketime(), settle_time) {
-                        self.timer.set_waketime(settle_time);
-                    }
-                }
-            }
-            StepEventResult::Reschedule
         } else {
-            self.steps_remaining = 0;
-            StepEventResult::Done
+            // --- Start of pulse ---
+            if self.steps_to_move > 0 {
+                // Set step pin high
+                if self.issue_step_pulse_start(gpio_manager).is_err() {
+                    defmt::error!("Stepper {}: Failed to start step pulse!", self.id);
+                    self.steps_to_move = 0; // Abort
+                    return;
+                }
+                self.is_pulsing_high = true;
+
+                // Schedule the end of this pulse
+                self.next_step_waketime = self.next_step_waketime.wrapping_add(self.pulse_duration_ticks);
+                scheduler.schedule_task(self.timer_id_for_scheduler, self.next_step_waketime);
+            }
         }
     }
 }
-
-// Critical section usage (like cortex_m::interrupt::free) would be added around
-// `set_next_step_dir` and `queue_move`'s shared data access if targeting a specific MCU environment.
-// For now, they are omitted for broader compatibility / initial porting.
-// The `stepper_event_callback` and `handle_stepper_event` are also simplified regarding
-// how the `Stepper` instance is passed to the timer callback.

@@ -32,6 +32,7 @@ use klipper_mcu_lib::{
     sched::{SchedulerState, KlipperSchedulerTrait},
     gpio_manager::{GpioManager, PinModeState, AdcCapablePin as GpioManagerAdcPin, PwmCapablePin as GpioManagerPwmPin},
     command_parser::{parse_gcode_arguments, CommandArgValue, ArgParseError, ParsedArgs},
+    stepper::{Stepper, StepperDirection},
 };
 use klipper_mcu_lib::rp2040_hal_impl::timer::Rp2040Timer;
 use klipper_mcu_lib::rp2040_hal_impl::adc::Rp2040AdcChannel;
@@ -51,7 +52,7 @@ fn panic(info: &PanicInfo) -> ! {
     loop { cortex_m::asm::nop(); }
 }
 
-// --- Globals (as before) ---
+// --- Globals ---
 static mut USB_BUS: Option<UsbBusAllocator<UsbBus>> = None;
 static mut USB_SERIAL: Option<SerialPort<UsbBus>> = None;
 static mut USB_DEVICE: Option<UsbDevice<UsbBus>> = None;
@@ -62,6 +63,11 @@ const TEST_TIMER0_ID: u32 = 0;
 static TEST_TIMER1: InterruptMutex<RefCell<Option<Rp2040Timer<Alarm2>>>> = InterruptMutex::new(RefCell::new(None));
 const TEST_TIMER1_ID: u32 = 1;
 const SCHEDULER_MASTER_TIMER_ID: u32 = 99;
+static STEPPER_X: InterruptMutex<RefCell<Option<Stepper>>> = InterruptMutex::new(RefCell::new(None));
+const STEPPER_X_ID: u32 = 2;
+const STEPPER_X_SCHEDULER_TASK_ID: u32 = 2;
+const STEPPER_X_STEP_PIN: u8 = 16;
+const STEPPER_X_DIR_PIN: u8 = 17;
 const LED_PIN_ID: u8 = 25;
 static SCHEDULER: InterruptMutex<RefCell<Option<SchedulerState<Alarm1>>>> = InterruptMutex::new(RefCell::new(None));
 static GPIO_MANAGER: InterruptMutex<RefCell<Option<GpioManager>>> = InterruptMutex::new(RefCell::new(None));
@@ -69,15 +75,33 @@ static ADC_PERIPHERAL: InterruptMutex<RefCell<Option<RpHalAdc>>> = InterruptMute
 static PWM_SLICES: InterruptMutex<RefCell<Option<RpHalPwmSlices>>> = InterruptMutex::new(RefCell::new(None));
 static SYSTEM_CLOCK_FREQ: InterruptMutex<RefCell<Option<u32>>> = InterruptMutex::new(RefCell::new(None));
 
-// --- Callbacks and Dispatchers (as before) ---
+// --- Callbacks and Dispatchers ---
+// ... (All callback and dispatcher functions as before) ...
 fn test_timer0_callback(timer: &mut Rp2040Timer<Alarm0>) -> StepEventResult { info!("T0 Fire"); let nt = timer.get_waketime().wrapping_add(1_000_000); timer.set_hw_irq_active(false); timer.set_waketime(nt); interrupt_free(|cs| SCHEDULER.borrow(cs).borrow_mut().as_mut().unwrap().add_timer(timer)); debug!("T0 Resched {}", nt); () }
 fn test_timer1_callback(timer: &mut Rp2040Timer<Alarm2>) -> StepEventResult { info!("T1 Fire"); let nt = timer.get_waketime().wrapping_add(1_500_000); timer.set_hw_irq_active(false); timer.set_waketime(nt); interrupt_free(|cs| SCHEDULER.borrow(cs).borrow_mut().as_mut().unwrap().add_timer(timer)); debug!("T1 Resched {}", nt); () }
 fn master_scheduler_timer_callback(_timer: &mut Rp2040Timer<Alarm1>) -> StepEventResult { interrupt_free(|cs| SCHEDULER.borrow(cs).borrow_mut().as_mut().unwrap().service_master_timer()); () }
-pub fn dispatch_klipper_task_from_scheduler(task_id: u32) { match task_id { TEST_TIMER0_ID => interrupt_free(|cs| if let Some(t) = TEST_TIMER0.borrow(cs).borrow_mut().as_mut() { if let Some(cb)=t.get_callback(){(cb)(t);}}), TEST_TIMER1_ID => interrupt_free(|cs| if let Some(t) = TEST_TIMER1.borrow(cs).borrow_mut().as_mut() { if let Some(cb)=t.get_callback(){(cb)(t);}}), _ => warn!("Unknown task ID {}", task_id),}}
+pub fn dispatch_klipper_task_from_scheduler(task_id: u32) {
+    match task_id {
+        TEST_TIMER0_ID => { interrupt_free(|cs| if let Some(t) = TEST_TIMER0.borrow(cs).borrow_mut().as_mut() { if let Some(cb)=t.get_callback(){(cb)(t);}})},
+        TEST_TIMER1_ID => { interrupt_free(|cs| if let Some(t) = TEST_TIMER1.borrow(cs).borrow_mut().as_mut() { if let Some(cb)=t.get_callback(){(cb)(t);}})},
+        STEPPER_X_SCHEDULER_TASK_ID => {
+            interrupt_free(|cs| {
+                let mut scheduler_opt = SCHEDULER.borrow(cs).borrow_mut();
+                let mut gpio_manager_opt = GPIO_MANAGER.borrow(cs).borrow_mut();
+                let mut stepper_x_opt = STEPPER_X.borrow(cs).borrow_mut();
+                if let (Some(ref mut scheduler), Some(ref mut gpio_manager), Some(ref mut stepper_x)) =
+                    (scheduler_opt.as_mut(), gpio_manager_opt.as_mut(), stepper_x_opt.as_mut()) {
+                    stepper_x.step_event_callback(scheduler, gpio_manager);
+                } else { warn!("dispatch: Failed to get resources for STEPPER_X_SCHEDULER_TASK_ID ({})", task_id); }
+            });
+        }
+        _ => warn!("Scheduler: Dispatch for unknown task ID {}", task_id),
+    }
+}
 
-// --- Entry Point & Main Loop (mostly as before) ---
+// --- Entry Point ---
 #[entry]
-fn main() -> ! {
+fn main() -> ! { /* ... peripheral setup, globals init, timer/scheduler/stepper setup as before ... */
     let mut pac_peripherals = pac::Peripherals::take().unwrap();
     let core_peripherals = pac::CorePeripherals::take().unwrap();
     let mut watchdog = Watchdog::new(pac_peripherals.WATCHDOG);
@@ -87,7 +111,7 @@ fn main() -> ! {
     let usb_bus_allocator = UsbBusAllocator::new(UsbBus::new(pac_peripherals.USBCTRL_REGS, pac_peripherals.USBCTRL_DPRAM, clocks.usb_clock, true, &mut pac_peripherals.RESETS,));
     unsafe { USB_BUS = Some(usb_bus_allocator); }
     let bus_ref = unsafe { USB_BUS.as_ref().unwrap() };
-    unsafe { USB_SERIAL = Some(SerialPort::new(bus_ref)); USB_DEVICE = Some(UsbDeviceBuilder::new(bus_ref, UsbVidPid(0x16c0, 0x27dd)).manufacturer("KlipperMCU").product("Klipper Rust Firmware").serial_number("PWM_FINAL_TEST").device_class(usbd_serial::USB_CLASS_CDC).build());}
+    unsafe { USB_SERIAL = Some(SerialPort::new(bus_ref)); USB_DEVICE = Some(UsbDeviceBuilder::new(bus_ref, UsbVidPid(0x16c0, 0x27dd)).manufacturer("KlipperMCU").product("Klipper Rust Firmware").serial_number("STEPPER_TEST").device_class(usbd_serial::USB_CLASS_CDC).build());}
     let adc_peripheral_hal = RpHalAdc::new(pac_peripherals.ADC, &mut pac_peripherals.RESETS);
     interrupt_free(|cs| { ADC_PERIPHERAL.borrow(cs).replace(Some(adc_peripheral_hal)); });
     let pwm_slices_hal = RpHalPwmSlices::new(pac_peripherals.PWM, &mut pac_peripherals.RESETS);
@@ -97,6 +121,7 @@ fn main() -> ! {
     interrupt_free(|cs| { GPIO_MANAGER.borrow(cs).replace(Some(gpio_mgr)); });
     info!("Peripherals Initialized.");
     interrupt_free(|cs| { if let Some(manager) = GPIO_MANAGER.borrow(cs).borrow_mut().as_mut() { if manager.configure_pin_as_output(LED_PIN_ID).is_ok() { let _ = manager.write_pin_output(LED_PIN_ID, false); } else { error!("Failed to configure LED Pin {}.", LED_PIN_ID); } }});
+    interrupt_free(|cs| { if let Some(ref mut manager) = GPIO_MANAGER.borrow(cs).borrow_mut().as_mut() { match Stepper::new(STEPPER_X_ID, STEPPER_X_SCHEDULER_TASK_ID, STEPPER_X_STEP_PIN, STEPPER_X_DIR_PIN, manager,) { Ok(stepper_instance) => { STEPPER_X.borrow(cs).replace(Some(stepper_instance)); info!("STEPPER_X (ID {}) initialized.", STEPPER_X_ID); } Err(e) => { error!("Failed to initialize STEPPER_X: {}", e); } } } else { error!("GpioManager not available for STEPPER_X initialization."); }});
     let rp_hal_timer = RpHalTimer::new(pac_peripherals.TIMER, &mut pac_peripherals.RESETS);
     let alarm0 = rp_hal_timer.alarm_0().unwrap();
     let mut klipper_timer0 = Rp2040Timer::new(alarm0, test_timer0_callback, TEST_TIMER0_ID);
@@ -120,197 +145,118 @@ fn main() -> ! {
     let mut loop_count = 0u32;
     let mut led_state = false;
     let mut delay = cortex_m::delay::Delay::new(core_peripherals.SYST, clocks.system_clock.freq().to_Hz());
-    loop { /* Main loop body as before: LED toggle and USB poll */ }
+    loop { /* Main loop body as before */ }
 }
 
-// --- Interrupt Handlers (TIMER_IRQ_1 only) ---
+// --- Interrupt Handlers ---
 #[allow(non_snake_case)]
 #[interrupt]
 fn TIMER_IRQ_1() { interrupt_free(|cs| { if let Some(s) = SCHEDULER.borrow(cs).borrow_mut().as_mut() {s.master_timer.on_interrupt();}}); }
 
-
 // --- Helper Functions ---
-fn get_pwm_slice_channel_for_pin(pin_id: u8) -> Option<(u8, bool)> { /* ... as defined before ... */ }
-fn calculate_pwm_settings(sys_clk_hz: u32, target_freq_hz: u32) -> (u8, u8, u16) { /* ... as defined before ... */ }
-fn serial_write_line(serial: &mut SerialPort<UsbBus>, data: &str) { /* ... as before ... */ }
+fn get_pwm_slice_channel_for_pin(pin_id: u8) -> Option<(u8, bool)> { /* ... */ }
+fn calculate_pwm_settings(sys_clk_hz: u32, target_freq_hz: u32) -> (u8, u8, u16) { /* ... */ }
+fn serial_write_line(serial: &mut SerialPort<UsbBus>, data: &str) { /* ... */ }
 // Full bodies for helper functions (copied from previous state)
 fn get_pwm_slice_channel_for_pin(pin_id: u8) -> Option<(u8, bool)> { match pin_id { 0..=15 => Some((pin_id/2, (pin_id%2)==1)), 16..=29 => Some(((pin_id-16)/2, ((pin_id-16)%2)==1)), _ => None } }
 fn calculate_pwm_settings(sys_clk_hz: u32, target_freq_hz: u32) -> (u8, u8, u16) { if target_freq_hz == 0 { return (1,0,u16::MAX); } let mut top=u16::MAX; let mut div_fp=(sys_clk_hz as f32)/(target_freq_hz as f32*((top as f32)+1.0)); if div_fp<1.0{div_fp=1.0; let ntf=(sys_clk_hz as f32/target_freq_hz as f32)-1.0; if ntf<=0.0{top=1;}else if ntf>u16::MAX as f32{top=u16::MAX;}else{top=ntf as u16;}}else if div_fp>=256.0{div_fp=255.0+(15.0/16.0); let ntf=(sys_clk_hz as f32/(target_freq_hz as f32*div_fp))-1.0; if ntf<=0.0{top=1;}else if ntf>u16::MAX as f32{top=u16::MAX;}else{top=ntf as u16;}} let di=div_fp as u8; let df=((div_fp-(di as f32))*16.0)as u8; (if di==0{1}else{di},df,top) }
 fn serial_write_line(serial: &mut SerialPort<UsbBus>, data: &str) { let bytes=data.as_bytes();let mut written=0; while written<bytes.len(){match serial.write(&bytes[written..]){Ok(len)if len>0=>{written+=len;}Ok(_)=>{}Err(UsbError::WouldBlock)=>{}Err(_)=>{break;}}}}
 
-
-// --- process_command (with SET_PWM updated for robust release) ---
+// --- process_command (with DEBUG_STEPPER command) ---
 fn process_command(line: &str, serial: &mut SerialPort<UsbBus>) {
     let mut parts = line.trim().splitn(2, |c: char| c.is_whitespace());
     let command = parts.next().unwrap_or("").to_ascii_uppercase();
     let args_str = parts.next().unwrap_or("");
-
-    let parsed_args_result = if !args_str.is_empty() {
-        parse_gcode_arguments(args_str)
-    } else { Ok(ParsedArgs::new()) };
+    let parsed_args_result = if !args_str.is_empty() { parse_gcode_arguments(args_str) } else { Ok(ParsedArgs::new()) };
 
     match parsed_args_result {
         Ok(args) => {
-            if command == "PING" { serial_write_line(serial, "PONG\r\n"); }
-            else if command == "ID" { serial_write_line(serial, "KlipperRustRP2040_StarStringParser_v1\r\n"); } // Updated ID
-            else if command == "ECHO" {
-                // Expects ECHO *<message_string>
-                // The parser with '*' key will place the rest of the line into args map with key '*'.
-                if let Some(arg_val) = args.get(&'*') {
-                    match arg_val {
-                        CommandArgValue::String(s) => {
-                            serial_write_line(serial, s.as_str());
-                            serial_write_line(serial, "\r\n");
-                        }
-                        _ => {
-                            // Should not happen if '*' always produces a String or parsing fails earlier.
-                            serial_write_line(serial, "Error: ECHO expected string for * arg\r\n");
-                        }
-                    }
-                } else {
-                    // No '*' argument means the arg_str after "ECHO" was empty or only whitespace.
-                    // Or the command was just "ECHO".
-                    // Standard M117 with no message often clears the display or does nothing.
-                    // Let's send an empty line (just CRLF).
-                    serial_write_line(serial, "\r\n");
-                }
-            }
-            else if command == "SET_PIN" { /* ... SET_PIN logic from previous state ... */ }
-            else if command == "GET_PIN" { /* ... GET_PIN logic from previous state ... */ }
-            else if command == "QUERY_ADC" { /* ... QUERY_ADC logic from previous state, ensure release_pin_from_adc is used ... */ }
-            else if command == "SET_PWM" {
-                let pin_num_opt = args.get(&'P').and_then(|val| match val { /* ... */ });
-                let duty_percent_opt = args.get(&'S').and_then(|val| match val { /* ... */ });
-                let freq_hz_opt = args.get(&'F').and_then(|val| match val { /* ... */ });
+            if command == "PING" { /* ... */ }
+            else if command == "ID" { serial_write_line(serial, "KlipperRustRP2040_Stepper_v1\r\n"); }
+            else if command == "ECHO" { /* ... */ }
+            else if command == "SET_PIN" { /* ... */ }
+            else if command == "GET_PIN" { /* ... */ }
+            else if command == "QUERY_ADC" { /* ... */ }
+            else if command == "SET_PWM" { /* ... */ }
+            else if command == "DEBUG_STEPPER" {
+                let steps_opt = args.get(&'S').and_then(|val| match val {
+                    CommandArgValue::UInteger(u) => Some(*u),
+                    CommandArg_Value::Integer(i) if *i > 0 => Some(*i as u32),
+                    _ => None,
+                });
+                let dir_opt = args.get(&'D').and_then(|val| match val {
+                    CommandArgValue::UInteger(u) => Some(*u == 1),
+                    CommandArgValue::Integer(i) => Some(*i == 1),
+                    _ => None,
+                });
+                let rate_hz_opt = args.get(&'R').and_then(|val| match val {
+                    CommandArgValue::UInteger(u) => Some(*u),
+                    CommandArgValue::Integer(i) if *i > 0 => Some(*i as u32),
+                    _ => None,
+                });
+                let pulse_width_us_opt = args.get(&'W').and_then(|val| match val {
+                    CommandArgValue::UInteger(u) => Some(*u),
+                    CommandArgValue::Integer(i) if *i > 0 => Some(*i as u32),
+                    _ => None,
+                });
 
-                // Re-inserting full SET_PIN, GET_PIN, QUERY_ADC logic from prior state for completeness of process_command
-                // For SET_PIN:
-                // if let (Some(pin_num), Some(value)) = (pin_num_opt, value_opt) { ... } else { serial_write_line(serial, "Error: Missing P/S for SET_PIN\r\n"); }
-                // For GET_PIN:
-                // if let Some(pin_num) = pin_num_opt { ... } else { serial_write_line(serial, "Error: Missing P for GET_PIN\r\n"); }
-                // For QUERY_ADC:
-                // if let Some(pin_num) = pin_num_opt { /* ... if !(26..=29).contains(&pin_num) ... */ let adc_read_result = interrupt_free(|cs| { /* ... manager.take_pin_for_adc ... manager.release_pin_from_adc ... */ }); /* ... match adc_read_result ... */ } else { serial_write_line(serial, "Error: Missing P for QUERY_ADC\r\n"); }
+                if let Some(steps) = steps_opt {
+                    interrupt_free(|cs| {
+                        let mut scheduler_opt = SCHEDULER.borrow(cs).borrow_mut();
+                        let mut gpio_manager_opt = GPIO_MANAGER.borrow(cs).borrow_mut();
+                        let mut stepper_x_opt = STEPPER_X.borrow(cs).borrow_mut();
 
-                // Actual SET_PWM logic with robust release
-                if let (Some(pin_num), Some(duty_val_percent)) = (pin_num_opt, duty_percent_opt) {
-                    if !(0.0..=100.0).contains(&duty_val_percent) {
-                        serial_write_line(serial, "Error: Duty S must be 0.0-100.0\r\n");
-                    } else {
-                        let duty_float_0_1 = duty_val_percent / 100.0;
-                        let freq_hz = freq_hz_opt.unwrap_or(500);
+                        if let (Some(ref mut scheduler), Some(ref mut gpio_manager), Some(ref mut stepper_x)) =
+                            (scheduler_opt.as_mut(), gpio_manager_opt.as_mut(), stepper_x_opt.as_mut()) {
 
-                        let mut pin_taken_for_pwm = false; // Flag to track if pin was successfully taken
+                            // Check if stepper is already moving
+                            if stepper_x.steps_to_move > 0 {
+                                serial_write_line(serial, "Error: Stepper X is already moving\r\n");
+                                return;
+                            }
 
-                        let result: Result<(), &'static str> = interrupt_free(|cs| {
-                            let mut gpio_manager_opt = GPIO_MANAGER.borrow(cs).borrow_mut();
-                            let mut pwm_slices_opt = PWM_SLICES.borrow(cs).borrow_mut();
-                            let sys_clk_opt = SYSTEM_CLOCK_FREQ.borrow(cs).borrow();
-
-                            if let (Some(manager), Some(slices), Some(sys_clk_hz)) =
-                                (gpio_manager_opt.as_mut(), pwm_slices_opt.as_mut(), sys_clk_opt.as_ref()) {
-
-                                let typed_pwm_pin_token = manager.take_pin_for_pwm(pin_num)?;
-                                pin_taken_for_pwm = true; // Mark pin as taken
-
-                                let (slice_idx, is_chan_b) = get_pwm_slice_channel_for_pin(pin_num)
-                                    .ok_or("Pin not valid for PWM or mapping undefined")?;
-
-                                let (div_int, div_frac, top_val) = calculate_pwm_settings(*sys_clk_hz, freq_hz);
-                                let duty_raw = (duty_float_0_1 * top_val as f32) as u16;
-
-                                let slice_mut_ref = match slice_idx {
-                                    0 => &mut slices.slice0, 1 => &mut slices.slice1, 2 => &mut slices.slice2, 3 => &mut slices.slice3,
-                                    4 => &mut slices.slice4, 5 => &mut slices.slice5, 6 => &mut slices.slice6, 7 => &mut slices.slice7,
-                                    _ => return Err("Invalid Slice Index derived from Pin"),
-                                };
-
-                                slice_mut_ref.set_top(top_val);
-                                slice_mut_ref.set_div_int(div_int);
-                                slice_mut_ref.set_div_frac(div_frac);
-                                slice_mut_ref.enable();
-                                let actual_max_duty = slice_mut_ref.get_top();
-
-                                let setup_channel_result: Result<_, _> = if is_chan_b {
-                                    let mut ch_b = slice_mut_ref.channel_b;
-                                    match typed_pwm_pin_token {
-                                        GpioManagerPwmPin::Gpio1(p) if pin_num == 1 => Ok(ch_b.input_from_gpio(&p)),
-                                        GpioManagerPwmPin::Gpio3(p) if pin_num == 3 => Ok(ch_b.input_from_gpio(&p)),
-                                        GpioManagerPwmPin::Gpio5(p) if pin_num == 5 => Ok(ch_b.input_from_gpio(&p)),
-                                        GpioManagerPwmPin::Gpio7(p) if pin_num == 7 => Ok(ch_b.input_from_gpio(&p)),
-                                        GpioManagerPwmPin::Gpio9(p) if pin_num == 9 => Ok(ch_b.input_from_gpio(&p)),
-                                        GpioManagerPwmPin::Gpio11(p) if pin_num == 11 => Ok(ch_b.input_from_gpio(&p)),
-                                        GpioManagerPwmPin::Gpio13(p) if pin_num == 13 => Ok(ch_b.input_from_gpio(&p)),
-                                        GpioManagerPwmPin::Gpio15(p) if pin_num == 15 => Ok(ch_b.input_from_gpio(&p)),
-                                        GpioManagerPwmPin::Gpio17(p) if pin_num == 17 => Ok(ch_b.input_from_gpio(&p)),
-                                        GpioManagerPwmPin::Gpio19(p) if pin_num == 19 => Ok(ch_b.input_from_gpio(&p)),
-                                        GpioManagerPwmPin::Gpio21(p) if pin_num == 21 => Ok(ch_b.input_from_gpio(&p)),
-                                        GpioManagerPwmPin::Gpio23(p) if pin_num == 23 => Ok(ch_b.input_from_gpio(&p)),
-                                        GpioManagerPwmPin::Gpio25(p) if pin_num == 25 => Ok(ch_b.input_from_gpio(&p)),
-                                        GpioManagerPwmPin::Gpio27(p) if pin_num == 27 => Ok(ch_b.input_from_gpio(&p)),
-                                        GpioManagerPwmPin::Gpio29(p) if pin_num == 29 => Ok(ch_b.input_from_gpio(&p)),
-                                        _ => Err("Mismatched pin token for selected PWM Channel B"),
-                                    }.map(|ch| Rp2040PwmChannel::new(ch, actual_max_duty))
-                                } else {
-                                    let mut ch_a = slice_mut_ref.channel_a;
-                                     match typed_pwm_pin_token {
-                                        GpioManagerPwmPin::Gpio0(p) if pin_num == 0 => Ok(ch_a.input_from_gpio(&p)),
-                                        GpioManagerPwmPin::Gpio2(p) if pin_num == 2 => Ok(ch_a.input_from_gpio(&p)),
-                                        GpioManagerPwmPin::Gpio4(p) if pin_num == 4 => Ok(ch_a.input_from_gpio(&p)),
-                                        GpioManagerPwmPin::Gpio6(p) if pin_num == 6 => Ok(ch_a.input_from_gpio(&p)),
-                                        GpioManagerPwmPin::Gpio8(p) if pin_num == 8 => Ok(ch_a.input_from_gpio(&p)),
-                                        GpioManagerPwmPin::Gpio10(p) if pin_num == 10 => Ok(ch_a.input_from_gpio(&p)),
-                                        GpioManagerPwmPin::Gpio12(p) if pin_num == 12 => Ok(ch_a.input_from_gpio(&p)),
-                                        GpioManagerPwmPin::Gpio14(p) if pin_num == 14 => Ok(ch_a.input_from_gpio(&p)),
-                                        GpioManagerPwmPin::Gpio16(p) if pin_num == 16 => Ok(ch_a.input_from_gpio(&p)),
-                                        GpioManagerPwmPin::Gpio18(p) if pin_num == 18 => Ok(ch_a.input_from_gpio(&p)),
-                                        GpioManagerPwmPin::Gpio20(p) if pin_num == 20 => Ok(ch_a.input_from_gpio(&p)),
-                                        GpioManagerPwmPin::Gpio22(p) if pin_num == 22 => Ok(ch_a.input_from_gpio(&p)),
-                                        GpioManagerPwmPin::Gpio24(p) if pin_num == 24 => Ok(ch_a.input_from_gpio(&p)),
-                                        GpioManagerPwmPin::Gpio26(p) if pin_num == 26 => Ok(ch_a.input_from_gpio(&p)),
-                                        GpioManagerPwmPin::Gpio28(p) if pin_num == 28 => Ok(ch_a.input_from_gpio(&p)),
-                                        _ => Err("Mismatched pin token for selected PWM Channel A"),
-                                    }.map(|ch| Rp2040PwmChannel::new(ch, actual_max_duty))
-                                };
-
-                                match setup_channel_result {
-                                    Ok(mut pwm_wrapper) => {
-                                        pwm_wrapper.set_duty_cycle_raw(duty_raw).map_err(|_| "PWM SetDuty Err")?;
-                                        pwm_wrapper.enable().map_err(|_| "PWM Enable Err")
-                                    }
-                                    Err(e_str) => Err(e_str),
-                                }
-                            } else { Err("Manager, Slices, or SysClk not initialized") }
-                        }); // End of interrupt_free block for main logic
-
-                        // Always attempt to release the pin if it was successfully taken
-                        if pin_taken_for_pwm {
-                            let release_res = interrupt_free(|cs| {
-                                GPIO_MANAGER.borrow(cs).borrow_mut().as_mut()
-                                    .ok_or("GPIO Manager gone during release")?
-                                    .release_pin_from_pwm(pin_num)
-                            });
-                            if release_res.is_err() {
-                                // If main result was Ok, but release failed, this is the final error.
-                                // If main result was Err, we prioritize that.
-                                if result.is_ok() {
-                                    serial_write_line(serial, "Error: PWM OK, but pin release failed\r\n");
-                                    return; // Exit process_command
-                                } else {
-                                     warn!("SET_PWM: Primary error occurred, AND pin release also failed for P{}", pin_num);
+                            // 1. Set direction if provided
+                            if let Some(dir_is_ccw) = dir_opt {
+                                let dir = if dir_is_ccw { StepperDirection::CounterClockwise } else { StepperDirection::Clockwise };
+                                if stepper_x.set_direction(dir, gpio_manager).is_err() {
+                                    serial_write_line(serial, "Error: Failed to set stepper direction\r\n");
+                                    return;
                                 }
                             }
-                        }
 
-                        match result {
-                            Ok(()) => serial_write_line(serial, "ok\r\n"),
-                            Err(e_str) => { serial_write_line(serial, "Error: "); serial_write_line(serial, e_str); serial_write_line(serial, "\r\n");}
+                            // 2. Set movement parameters
+                            let rate_hz = rate_hz_opt.unwrap_or(100); // Default 100 Hz
+                            if rate_hz == 0 { serial_write_line(serial, "Error: Rate R cannot be 0\r\n"); return; }
+                            stepper_x.step_period_ticks = 1_000_000 / rate_hz; // Assumes 1MHz timer
+
+                            let pulse_width_us = pulse_width_us_opt.unwrap_or(2); // Default 2us
+                            stepper_x.pulse_duration_ticks = pulse_width_us; // Assumes 1MHz timer
+
+                            if stepper_x.step_period_ticks <= stepper_x.pulse_duration_ticks {
+                                serial_write_line(serial, "Error: Pulse width must be less than step period\r\n");
+                                return;
+                            }
+
+                            stepper_x.steps_to_move = steps;
+                            stepper_x.is_pulsing_high = false; // Ensure we start with a rising edge
+
+                            // 3. Kick off the first step event with the scheduler
+                            let now = scheduler.read_time();
+                            stepper_x.next_step_waketime = now.wrapping_add(100); // Add small delay before first step
+                            scheduler.schedule_task(stepper_x.timer_id_for_scheduler, stepper_x.next_step_waketime);
+
+                            serial_write_line(serial, "ok\r\n");
+                        } else {
+                            serial_write_line(serial, "Error: Stepper/Scheduler/GPIO not initialized\r\n");
                         }
-                    }
-                } else { serial_write_line(serial, "Error: Missing P (pin) or S (duty) for SET_PWM\r\n"); }
+                    });
+                } else {
+                    serial_write_line(serial, "Error: Missing required S (steps) argument\r\n");
+                }
             }
             else if command.is_empty() && args_str.is_empty() { /* Ignore */ }
-            else { /* Unknown command (existing logic) */ }
+            else { /* Unknown command */ }
         }
-        Err(e) => { /* Arg parsing error (existing logic) */ }
+        Err(e) => { /* Arg parsing error */ }
     }
 }

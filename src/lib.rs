@@ -32,6 +32,9 @@ pub mod gpio_manager;
 // --- Command Parsing ---
 pub mod command_parser;
 
+// --- Stepper Motor Control ---
+pub mod stepper;
+
 
 // --- Global/shared items can be re-exported if needed ---
 // pub use stepper::Stepper; // Example
