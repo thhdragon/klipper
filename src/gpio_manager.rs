@@ -161,59 +161,121 @@ impl GpioManager {
 
 
     // --- ADC Pin Handling ---
-    pub enum AdcCapablePin { /* ... as before ... */ }
-    pub fn take_pin_for_adc(&mut self, pin_id: u8) -> Result<AdcCapablePin, &'static str> { /* ... as before ... */ }
-    pub fn release_adc_pin(&mut self, pin_id: u8, _adc_capable_pin: AdcCapablePin) -> Result<(), &'static str> { /* ... as before ... */ }
-    // Implementations for AdcCapablePin, take_pin_for_adc, release_adc_pin (copied from previous state)
+    // AdcCapablePin enum definition remains as before.
     pub enum AdcCapablePin {
         Gpio26(gpio::Pin<gpio::bank0::Gpio26, gpio::FloatingInput>),
         Gpio27(gpio::Pin<gpio::bank0::Gpio27, gpio::FloatingInput>),
         Gpio28(gpio::Pin<gpio::bank0::Gpio28, gpio::FloatingInput>),
         Gpio29(gpio::Pin<gpio::bank0::Gpio29, gpio::FloatingInput>),
     }
+
+    /// Attempts to take an ADC-capable pin from the manager.
+    /// If successful, the pin's slot in the manager becomes `None`, and the typed pin is returned.
+    /// The caller is responsible for calling `release_adc_pin_by_id` to return it.
+    /// The `unsafe` block for pin reconstruction remains for this phase.
     pub fn take_pin_for_adc(&mut self, pin_id: u8) -> Result<AdcCapablePin, &'static str> {
-        if !(26..=29).contains(&pin_id) { return Err("Pin is not ADC capable"); }
-        let managed_pin_entry = &mut self.pins[pin_id as usize];
-        if managed_pin_entry.is_none() { return Err("ManagedPin is None"); }
-        let mut managed_pin = managed_pin_entry.take().unwrap();
-        match managed_pin.current_mode {
-            PinModeState::Disabled | PinModeState::InputFloating => {
-                let result_pin = match pin_id {
-                    26 => Ok(AdcCapablePin::Gpio26(unsafe { gpio::Pin::new(gpio::bank0::Gpio26::ID) }.into_floating_input())),
-                    27 => Ok(AdcCapablePin::Gpio27(unsafe { gpio::Pin::new(gpio::bank0::Gpio27::ID) }.into_floating_input())),
-                    28 => Ok(AdcCapablePin::Gpio28(unsafe { gpio::Pin::new(gpio::bank0::Gpio28::ID) }.into_floating_input())),
-                    29 => Ok(AdcCapablePin::Gpio29(unsafe { gpio::Pin::new(gpio::bank0::Gpio29::ID) }.into_floating_input())),
-                    _ => unreachable!(),
-                };
-                if result_pin.is_ok() {
-                    managed_pin.current_mode = PinModeState::FunctionAdc;
-                    *managed_pin_entry = Some(managed_pin);
-                } else { *managed_pin_entry = Some(managed_pin); }
-                result_pin
-            }
-            PinModeState::FunctionAdc => { *managed_pin_entry = Some(managed_pin); Err("Pin already configured for ADC") }
-            _ => { *managed_pin_entry = Some(managed_pin); Err("Pin in incompatible mode for ADC") }
+        if !(26..=29).contains(&pin_id) {
+            return Err("Pin is not ADC capable (must be GPIO26-29)");
         }
-    }
-    pub fn release_adc_pin(&mut self, pin_id: u8, _adc_capable_pin: AdcCapablePin) -> Result<(), &'static str> {
-        if pin_id as usize >= NUM_GPIO_PINS { return Err("Invalid pin_id"); }
-        match self.pins[pin_id as usize].as_mut() {
-            Some(managed_pin) => {
-                if managed_pin.current_mode == PinModeState::FunctionAdc {
-                    let temp_dyn_pin = core::mem::replace(&mut managed_pin.pin, unsafe { core::mem::zeroed() });
-                    managed_pin.pin = temp_dyn_pin.into_floating_input().into_dyn_pin();
-                    managed_pin.current_mode = PinModeState::Disabled;
-                    Ok(())
-                } else { Err("Pin not in FunctionAdc mode") }
+
+        let managed_pin_slot = &mut self.pins[pin_id as usize];
+
+        if let Some(managed_pin) = managed_pin_slot.as_ref() {
+            // Check current mode before taking
+            match managed_pin.current_mode {
+                PinModeState::Disabled | PinModeState::InputFloating => {
+                    // Mode is compatible, proceed to take.
+                }
+                PinModeState::FunctionAdc => {
+                    // This could mean it's already taken for ADC by another part of the code,
+                    // or it was released without state reset. For safety, error out.
+                    return Err("Pin already marked as FunctionAdc; release first or check for concurrent use.");
+                }
+                _ => {
+                    return Err("Pin in incompatible mode for ADC");
+                }
             }
-            None => Err("Pin not found to release"),
+        } else {
+            return Err("Pin slot is already empty (pin taken and not released?)");
+        }
+
+        // If we reach here, the pin exists and is in a compatible mode. Now take it.
+        // The `take()` here removes the ManagedPin from the array, leaving None.
+        if let Some(mut taken_managed_pin) = managed_pin_slot.take() {
+            // Perform the unsafe reconstruction to get the typed pin.
+            let typed_adc_pin_result = match pin_id {
+                26 => Ok(AdcCapablePin::Gpio26(unsafe { gpio::Pin::new(gpio::bank0::Gpio26::ID) }.into_floating_input())),
+                27 => Ok(AdcCapablePin::Gpio27(unsafe { gpio::Pin::new(gpio::bank0::Gpio27::ID) }.into_floating_input())),
+                28 => Ok(AdcCapablePin::Gpio28(unsafe { gpio::Pin::new(gpio::bank0::Gpio28::ID) }.into_floating_input())),
+                29 => Ok(AdcCapablePin::Gpio29(unsafe { gpio::Pin::new(gpio::bank0::Gpio29::ID) }.into_floating_input())),
+                _ => unreachable!("ADC pin_id validation failed earlier or logic error"),
+            };
+
+            match typed_adc_pin_result {
+                Ok(typed_pin) => {
+                    // Update the state of the (now conceptually separate) ManagedPin before it's dropped.
+                    // Or, rather, the GpioManager no longer holds this ManagedPin.
+                    // The state tracking of "FunctionAdc" is implicit by it being taken.
+                    // When release_adc_pin_by_id is called, a *new* ManagedPin in Disabled state is created.
+                    defmt::debug!("GpioManager: Pin {} taken for ADC. Slot is now None.", pin_id);
+                    Ok(typed_pin)
+                }
+                Err(e) => {
+                    // If reconstruction failed (though unsafe new shouldn't directly error here like this)
+                    // put the original ManagedPin back.
+                    *managed_pin_slot = Some(taken_managed_pin);
+                    Err(e) // Should be a specific error from the match if one branch failed.
+                }
+            }
+        } else {
+            // This case should have been caught by the `is_some()` check at the start of the function,
+            // but as a fallback.
+            Err("Failed to take ManagedPin from slot (was None unexpectedly)")
         }
     }
 
+    // release_adc_pin is renamed to release_adc_pin_by_id and modified later.
+    // For now, ensure the old release_adc_pin is correctly updated if it was used.
+    // The plan is to use release_adc_pin_by_id.
+    // Removing the old `release_adc_pin` that took `AdcCapablePin`.
+    // pub fn release_adc_pin(&mut self, pin_id: u8, _adc_capable_pin: AdcCapablePin) -> Result<(), &'static str> { /* ... old ... */ }
+
+    /// Releases a pin previously taken for ADC use by its ID, returning it to the manager in a Disabled state.
+    /// This reconstructs a default DynPin for the slot.
+    pub fn release_adc_pin_by_id(&mut self, pin_id: u8) -> Result<(), &'static str> {
+        if !(26..=29).contains(&pin_id) { // Ensure it's an ADC pin ID being released this way
+            return Err("Invalid pin_id for ADC release (not 26-29)");
+        }
+        if pin_id as usize >= NUM_GPIO_PINS { // General bounds check
+            return Err("Invalid pin_id (out of bounds)");
+        }
+
+        if self.pins[pin_id as usize].is_some() {
+            defmt::warn!("GpioManager: Attempted to release pin {} (ADC) which was not None (already present). State: {:?}", pin_id, self.pins[pin_id as usize].as_ref().unwrap().current_mode);
+            return Err("Pin slot not empty; was it actually taken by take_pin_for_adc, or already released?");
+        }
+
+        // Reconstruct a default DynPin for this pin_id and set its state to Disabled.
+        let default_dyn_pin = match pin_id {
+            26 => unsafe { gpio::Pin::new(gpio::bank0::Gpio26::ID) }.into_floating_input().into_dyn_pin(),
+            27 => unsafe { gpio::Pin::new(gpio::bank0::Gpio27::ID) }.into_floating_input().into_dyn_pin(),
+            28 => unsafe { gpio::Pin::new(gpio::bank0::Gpio28::ID) }.into_floating_input().into_dyn_pin(),
+            29 => unsafe { gpio::Pin::new(gpio::bank0::Gpio29::ID) }.into_floating_input().into_dyn_pin(),
+            _ => unreachable!("ADC pin_id validation failed earlier or logic error during release"),
+        };
+
+        self.pins[pin_id as usize] = Some(ManagedPin {
+            pin: default_dyn_pin,
+            current_mode: PinModeState::Disabled,
+            id: pin_id,
+        });
+        defmt::debug!("GpioManager: Pin {} released from ADC and set to Disabled.", pin_id);
+        Ok(())
+    }
+
+
     // --- PWM Pin Handling ---
-    #[allow(missing_docs)]
-    pub enum PwmCapablePin { /* ... as defined before ... */ }
-    // Enum definition for PwmCapablePin (copied from previous state)
+    // PwmCapablePin enum definition remains as before.
     #[allow(missing_docs)]
     pub enum PwmCapablePin {
         Gpio0(gpio::Pin<gpio::bank0::Gpio0, gpio::FunctionPwm>), Gpio1(gpio::Pin<gpio::bank0::Gpio1, gpio::FunctionPwm>),
