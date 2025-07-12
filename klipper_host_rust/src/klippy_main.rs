@@ -1,14 +1,14 @@
 // klipper_host_rust/src/klippy_main.rs
 
-use klipper_host_rust::{
+use crate::{
     configfile::{self, Configfile},
     gcode::{GCode, CommandError},
     toolhead::{ToolHead, PrinterUtility, DEFAULT_HOMING_SPEED,
                X_MACHINE_POSITION_AT_ENDSTOP, Y_MACHINE_POSITION_AT_ENDSTOP, Z_MACHINE_POSITION_AT_ENDSTOP,
                X_GCODE_POSITION_AFTER_HOMING, Y_GCODE_POSITION_AFTER_HOMING, Z_GCODE_POSITION_AFTER_HOMING,
                DEFAULT_HOMING_RETRACT_DIST, DEFAULT_SECOND_HOMING_SPEED_RATIO},
-    reactor::Reactor,
-    mcu::Mcu,
+    reactor::{Reactor, TimerHandle}, // Added TimerHandle
+    core_traits::Mcu, // Corrected path from previous step, assuming Mcu trait is in core_traits
     heaters::Heater,
     extras::fan::Fan,
     kinematics::cartesian::{CartesianKinematics, DEFAULT_ROTATION_DISTANCE, DEFAULT_FULL_STEPS_PER_ROTATION, DEFAULT_MICROSTEPS},
@@ -18,19 +18,26 @@ use klipper_host_rust::{
 struct MainReactor;
 impl Reactor for MainReactor {
     fn monotonic(&self) -> f64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64() }
-    fn register_timer(&mut self, _time: f64, _callback: Box<dyn FnMut(f64) -> Option<f64>>) -> usize { 0 }
+    fn register_timer(&mut self, _eventtime: f64, _callback: Box<dyn FnMut(f64) -> Option<f64>>) -> TimerHandle { TimerHandle(0) } // Changed return
+    fn unregister_timer(&mut self, _handle: TimerHandle) {} // Changed param type
+    fn update_timer(&mut self, _handle: TimerHandle, _eventtime: f64) {} // Added
+
     fn register_fd(&mut self, _fd: i32, _callback: Box<dyn FnMut(f64)>) -> usize {0}
     fn unregister_fd(&mut self, _handle_id: usize) {}
-    fn unregister_timer(&mut self, _handle_id: usize) {}
+
     fn is_shutdown(&self) -> bool {false}
     fn run(&mut self) { println!("MainReactor: run called"); }
-    fn pause(&mut self, _waketime: f64) {}
+    fn pause(&self, _waketime: f64) {} // Changed to &self
     fn _check_timers(&mut self, _eventtime: f64, _idle: bool) {}
 }
 
 struct MainMcu;
 impl Mcu for MainMcu {
-    fn estimated_print_time(&self, _curtime: f64) -> f64 { _curtime }
+    fn get_name(&self) -> String { "mcu".to_string() }
+    fn register_config_callback(&self, _callback: Box<dyn Fn() + Send + Sync>) {}
+    fn create_oid(&self) -> u8 { 0 }
+    fn add_config_cmd(&self, _cmd: &str, _is_init: bool) {}
+    fn estimated_print_time(&self, curtime: f64) -> f64 { curtime }
 }
 
 struct MainPrinterUtility;
@@ -133,7 +140,7 @@ kick_start_time: 0.15
     println!("Initial ToolHead Position: {:?}", toolhead.get_position());
     println!("Initial Extruder Target: {:.1}, Bed Target: {:.1}", toolhead.extruder_heater.target_temp, toolhead.bed_heater.target_temp);
     println!("Initial Fan Speed: {:.2}", toolhead.part_cooling_fan.speed);
-    println!("X Endstop Homing Speed: {}", toolhead.x_endstop_internal_for_test().homing_speed); // Temporary access for verification
+    // println!("X Endstop Homing Speed: {}", toolhead.x_endstop_internal_for_test().homing_speed); // Temporary access for verification - REMOVED
 
     let gcode_lines = vec![
         "G1 X1 Y1 F3000",           // Attempt move before homing (should fail)

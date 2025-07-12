@@ -4,6 +4,7 @@
 // Logging
 use log;
 use std::sync::Arc;
+use crate::core_traits::ButtonReactor; // Added import
 use std::collections::HashMap; // For PrinterButtons's mcu_buttons, adc_buttons
 
 // Core traits from the main library
@@ -58,7 +59,7 @@ struct DebounceButton<R: Reactor + ?Sized> {
     // For now, we'll rely on the logic inside _debounce_event to check latest_eventtime.
 }
 
-impl<R: ButtonReactor + Send + Sync + 'static> DebounceButton<R> {
+impl<R: Reactor + ButtonReactor + Send + Sync + 'static> DebounceButton<R> { // Added Reactor bound
     // In Python, `config` is used to get `debounce_delay`.
     // We'll pass debounce_delay directly for now, or a Config object later.
     fn new(

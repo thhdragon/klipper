@@ -3,6 +3,8 @@
 
 use std::collections::HashMap;
 use crate::toolhead::ToolHead; // Assuming ToolHead is in the crate root or accessible
+use crate::heaters::Heater; // Added for M104, M109, M140, M190
+use crate::reactor::Reactor; // Added for wait_for_temperature and tests
 
 // Represents the current position of the toolhead
 // In Klipper, this is often managed within the GCodeMove class or similar state holders.
@@ -71,6 +73,35 @@ pub struct GCodeCommand<'a> {
     pub raw_line: &'a str,
     pub params: HashMap<char, f64>,
     // TODO: Add any other fields needed from Klipper's GCodeCommand if necessary
+}
+
+impl<'a> GCodeCommand<'a> {
+    // Helper to get a float parameter, returning None if not present or NaN
+    // This is slightly different from get_float_param_opt in GCode struct, as it's on GCodeCommand itself
+    pub fn get_float_param(&self, key: char) -> Option<f64> {
+        self.params.get(&key).copied().filter(|&v| !v.is_nan())
+    }
+
+    // Helper to get an int parameter
+    pub fn get_int_param(&self, key: char) -> Option<i64> {
+        self.params.get(&key).copied().filter(|&v| !v.is_nan()).map(|v| v as i64)
+    }
+
+    // Helper to get a boolean parameter (assuming 1.0 is true, 0.0 is false)
+    // Flags (NaN) are not considered true/false by this.
+    pub fn get_bool_param(&self, key: char) -> Option<bool> {
+        self.params.get(&key).copied().filter(|&v| !v.is_nan()).map(|v| v != 0.0)
+    }
+
+    // Helper to check for a flag parameter (NaN means present)
+    pub fn has_flag(&self, key: char) -> bool {
+        self.params.get(&key).map_or(false, |v| v.is_nan())
+    }
+
+    // Error message formatting helper
+    pub fn error_msg(&self, message: &str) -> String {
+        format!("Error in GCode command {}{}: {}", self.command_letter, self.command_number, message)
+    }
 }
 
 
@@ -201,7 +232,7 @@ impl<'a> GCode<'a> {
 
     // G0/G1: Move
     fn cmd_g0_g1(&mut self, cmd: &GCodeCommand, toolhead: &mut ToolHead<'a>) -> Result<(), CommandError> {
-        if let Some(f_val) = self.get_float_param_opt(&cmd.params, 'F') {
+        if let Some(f_val) = cmd.get_float_param('F') { // Use cmd.get_float_param
             self.state.speed = f_val; // F value is typically in mm/min
         }
 
@@ -219,29 +250,29 @@ impl<'a> GCode<'a> {
         let gcode_off_e = self.state.gcode_offset.e.unwrap_or(0.0);
 
         if self.state.absolute_coord {
-            target_pos.x = self.get_float_param_opt(&cmd.params, 'X').map(|v| v - gcode_off_x).or(target_pos.x);
-            target_pos.y = self.get_float_param_opt(&cmd.params, 'Y').map(|v| v - gcode_off_y).or(target_pos.y);
-            target_pos.z = self.get_float_param_opt(&cmd.params, 'Z').map(|v| v - gcode_off_z).or(target_pos.z);
+            target_pos.x = cmd.get_float_param('X').map(|v| v - gcode_off_x).or(target_pos.x);
+            target_pos.y = cmd.get_float_param('Y').map(|v| v - gcode_off_y).or(target_pos.y);
+            target_pos.z = cmd.get_float_param('Z').map(|v| v - gcode_off_z).or(target_pos.z);
 
-            new_base_pos.x = self.get_float_param_opt(&cmd.params, 'X').or(self.state.base_position.x);
-            new_base_pos.y = self.get_float_param_opt(&cmd.params, 'Y').or(self.state.base_position.y);
-            new_base_pos.z = self.get_float_param_opt(&cmd.params, 'Z').or(self.state.base_position.z);
+            new_base_pos.x = cmd.get_float_param('X').or(self.state.base_position.x);
+            new_base_pos.y = cmd.get_float_param('Y').or(self.state.base_position.y);
+            new_base_pos.z = cmd.get_float_param('Z').or(self.state.base_position.z);
         } else { // Relative coordinates
-            target_pos.x = Some(cur_x + self.get_float_param_opt(&cmd.params, 'X').unwrap_or(0.0));
-            target_pos.y = Some(cur_y + self.get_float_param_opt(&cmd.params, 'Y').unwrap_or(0.0));
-            target_pos.z = Some(cur_z + self.get_float_param_opt(&cmd.params, 'Z').unwrap_or(0.0));
+            target_pos.x = Some(cur_x + cmd.get_float_param('X').unwrap_or(0.0));
+            target_pos.y = Some(cur_y + cmd.get_float_param('Y').unwrap_or(0.0));
+            target_pos.z = Some(cur_z + cmd.get_float_param('Z').unwrap_or(0.0));
 
-            new_base_pos.x = Some(self.state.base_position.x.unwrap_or(0.0) + self.get_float_param_opt(&cmd.params, 'X').unwrap_or(0.0));
-            new_base_pos.y = Some(self.state.base_position.y.unwrap_or(0.0) + self.get_float_param_opt(&cmd.params, 'Y').unwrap_or(0.0));
-            new_base_pos.z = Some(self.state.base_position.z.unwrap_or(0.0) + self.get_float_param_opt(&cmd.params, 'Z').unwrap_or(0.0));
+            new_base_pos.x = Some(self.state.base_position.x.unwrap_or(0.0) + cmd.get_float_param('X').unwrap_or(0.0));
+            new_base_pos.y = Some(self.state.base_position.y.unwrap_or(0.0) + cmd.get_float_param('Y').unwrap_or(0.0));
+            new_base_pos.z = Some(self.state.base_position.z.unwrap_or(0.0) + cmd.get_float_param('Z').unwrap_or(0.0));
         }
 
         if self.state.absolute_extrude {
-            target_pos.e = self.get_float_param_opt(&cmd.params, 'E').map(|v| v - gcode_off_e).or(target_pos.e);
-            new_base_pos.e = self.get_float_param_opt(&cmd.params, 'E').or(self.state.base_position.e);
+            target_pos.e = cmd.get_float_param('E').map(|v| v - gcode_off_e).or(target_pos.e);
+            new_base_pos.e = cmd.get_float_param('E').or(self.state.base_position.e);
         } else { // Relative extrusion
-            target_pos.e = Some(cur_e + self.get_float_param_opt(&cmd.params, 'E').unwrap_or(0.0));
-            new_base_pos.e = Some(self.state.base_position.e.unwrap_or(0.0) + self.get_float_param_opt(&cmd.params, 'E').unwrap_or(0.0));
+            target_pos.e = Some(cur_e + cmd.get_float_param('E').unwrap_or(0.0));
+            new_base_pos.e = Some(self.state.base_position.e.unwrap_or(0.0) + cmd.get_float_param('E').unwrap_or(0.0));
         }
 
         // Klipper's toolhead.move takes [x, y, z, e] and speed (mm/sec)
@@ -279,7 +310,7 @@ impl<'a> GCode<'a> {
     // G92 X10 Y20 ; set current X to 10, Y to 20
     // G92 ; reset all axis offsets to zero (equivalent to G92 X0 Y0 Z0 E0 if current pos is 0,0,0,0)
     // G92 E0 ; reset only extruder offset
-    fn cmd_g92(&mut self, cmd: &GCodeCommand) -> Result<(), CommandError> {
+    fn cmd_g92(&mut self, cmd: &GCodeCommand, toolhead: &mut ToolHead<'a>) -> Result<(), CommandError> {
         let mut new_offsets = self.state.gcode_offset;
         let mut new_base_pos = self.state.base_position;
 
@@ -292,19 +323,19 @@ impl<'a> GCode<'a> {
             new_offsets = Coord::new(Some(0.0), Some(0.0), Some(0.0), Some(0.0));
             new_base_pos = self.state.last_position; // base_pos becomes current machine pos
         } else {
-            if let Some(x_val) = self.get_float_param_opt(&cmd.params, 'X') {
+            if let Some(x_val) = cmd.get_float_param('X') {
                 new_offsets.x = Some(current_mpos_x - x_val);
                 new_base_pos.x = Some(x_val);
             }
-            if let Some(y_val) = self.get_float_param_opt(&cmd.params, 'Y') {
+            if let Some(y_val) = cmd.get_float_param('Y') {
                 new_offsets.y = Some(current_mpos_y - y_val);
                 new_base_pos.y = Some(y_val);
             }
-            if let Some(z_val) = self.get_float_param_opt(&cmd.params, 'Z') {
+            if let Some(z_val) = cmd.get_float_param('Z') {
                 new_offsets.z = Some(current_mpos_z - z_val);
                 new_base_pos.z = Some(z_val);
             }
-            if let Some(e_val) = self.get_float_param_opt(&cmd.params, 'E') {
+            if let Some(e_val) = cmd.get_float_param('E') {
                 new_offsets.e = Some(current_mpos_e - e_val);
                 new_base_pos.e = Some(e_val);
             }
@@ -350,23 +381,23 @@ impl<'a> GCode<'a> {
         // We'll use the constants defined in ToolHead for G-code positions after homing for now.
         // These would typically come from printer config ([stepper_x] position_endstop etc.)
 
-        let home_x = self.get_flag_param(&cmd.params, 'X');
-        let home_y = self.get_flag_param(&cmd.params, 'Y');
-        let home_z = self.get_flag_param(&cmd.params, 'Z');
+        let home_x = cmd.has_flag('X'); // Use cmd.has_flag
+        let home_y = cmd.has_flag('Y');
+        let home_z = cmd.has_flag('Z');
 
         let home_all = !home_x && !home_y && !home_z;
 
         let axes_to_home: Vec<(usize, f64)> = if home_all {
             vec![
-                (0, toolhead::X_GCODE_POSITION_AFTER_HOMING), // Axis index, G-code position to set
-                (1, toolhead::Y_GCODE_POSITION_AFTER_HOMING),
-                (2, toolhead::Z_GCODE_POSITION_AFTER_HOMING),
+                (0, crate::toolhead::X_GCODE_POSITION_AFTER_HOMING), // Axis index, G-code position to set
+                (1, crate::toolhead::Y_GCODE_POSITION_AFTER_HOMING),
+                (2, crate::toolhead::Z_GCODE_POSITION_AFTER_HOMING),
             ]
         } else {
             let mut axes = Vec::new();
-            if home_x { axes.push((0, toolhead::X_GCODE_POSITION_AFTER_HOMING)); }
-            if home_y { axes.push((1, toolhead::Y_GCODE_POSITION_AFTER_HOMING)); }
-            if home_z { axes.push((2, toolhead::Z_GCODE_POSITION_AFTER_HOMING)); }
+            if home_x { axes.push((0, crate::toolhead::X_GCODE_POSITION_AFTER_HOMING)); }
+            if home_y { axes.push((1, crate::toolhead::Y_GCODE_POSITION_AFTER_HOMING)); }
+            if home_z { axes.push((2, crate::toolhead::Z_GCODE_POSITION_AFTER_HOMING)); }
             axes
         };
 
@@ -435,7 +466,7 @@ impl<'a> GCode<'a> {
     // G4: Dwell
     // Klipper's G4 P specifies milliseconds.
     fn cmd_g4(&mut self, cmd: &GCodeCommand, toolhead: &mut ToolHead<'a>) -> Result<(), CommandError> {
-        let p_val_ms = self.get_float_param_opt(&cmd.params, 'P').unwrap_or(0.0);
+        let p_val_ms = cmd.get_float_param('P').unwrap_or(0.0); // Use cmd.get_float_param
         // Klipper's get_float with minval=0 ensures non-negative.
         // Our get_float_param_opt doesn't do that yet, so add a check.
         let delay_ms = if p_val_ms < 0.0 { 0.0 } else { p_val_ms };
@@ -447,7 +478,7 @@ impl<'a> GCode<'a> {
 
     // M104: Set Extruder Temperature (and continue)
     fn cmd_m104(&mut self, cmd: &GCodeCommand, toolhead: &mut ToolHead<'a>) -> Result<(), CommandError> {
-        let target_temp = self.get_float_param_opt(&cmd.params, 'S')
+        let target_temp = cmd.get_float_param('S') // Use cmd.get_float_param
             .ok_or_else(|| CommandError("Missing S (temperature) parameter for M104".to_string()))?;
 
         // TODO: Handle T parameter for selecting extruder if multiple extruders are supported.
@@ -458,7 +489,7 @@ impl<'a> GCode<'a> {
 
     // M140: Set Bed Temperature (and continue)
     fn cmd_m140(&mut self, cmd: &GCodeCommand, toolhead: &mut ToolHead<'a>) -> Result<(), CommandError> {
-        let target_temp = self.get_float_param_opt(&cmd.params, 'S')
+        let target_temp = cmd.get_float_param('S') // Use cmd.get_float_param
             .ok_or_else(|| CommandError("Missing S (temperature) parameter for M140".to_string()))?;
 
         toolhead.bed_heater.set_target_temp(target_temp);
@@ -469,7 +500,7 @@ impl<'a> GCode<'a> {
     fn wait_for_temperature(
         &mut self,
         heater: &mut Heater, // Mutable reference to the specific heater
-        toolhead_reactor: &mut dyn Reactor, // Reactor from ToolHead for pausing
+        toolhead_reactor: &dyn Reactor, // Changed to &dyn Reactor
         target_temp: f64,
         tolerance: f64, // e.g., PID_SETTLE_DELTA from Klipper
         wait_interval_s: f64, // How often to check, e.g., 1.0 second
@@ -524,10 +555,10 @@ impl<'a> GCode<'a> {
         // - Klipper default tolerance for PID is PID_SETTLE_DELTA = 1.0 degree.
         let mut target_temp_opt: Option<f64> = None;
 
-        if let Some(s_val) = self.get_float_param_opt(&cmd.params, 'S') {
+        if let Some(s_val) = cmd.get_float_param('S') { // Use cmd.get_float_param
             target_temp_opt = Some(s_val);
         }
-        if let Some(r_val) = self.get_float_param_opt(&cmd.params, 'R') {
+        if let Some(r_val) = cmd.get_float_param('R') { // Use cmd.get_float_param
             // If S was also present, R might override or be for a different condition (cooling).
             // For simplicity, if S is set, we use S. If only R, use R.
             // Klipper's logic is: if S, target is S. If R, target is R. If both, it's more complex (usually S for heat, R for cool).
@@ -557,7 +588,7 @@ impl<'a> GCode<'a> {
 
         self.wait_for_temperature(
             &mut toolhead.extruder_heater,
-            toolhead.get_reactor_mut(), // Need a way to get reactor mutably
+            toolhead.get_reactor(), // Changed to get_reactor
             final_target_temp,
             tolerance,
             wait_interval_s,
@@ -568,10 +599,10 @@ impl<'a> GCode<'a> {
     fn cmd_m190(&mut self, cmd: &GCodeCommand, toolhead: &mut ToolHead<'a>) -> Result<(), CommandError> {
         let mut target_temp_opt: Option<f64> = None;
 
-        if let Some(s_val) = self.get_float_param_opt(&cmd.params, 'S') {
+        if let Some(s_val) = cmd.get_float_param('S') { // Use cmd.get_float_param
             target_temp_opt = Some(s_val);
         }
-        if let Some(r_val) = self.get_float_param_opt(&cmd.params, 'R') {
+        if let Some(r_val) = cmd.get_float_param('R') { // Use cmd.get_float_param
             if target_temp_opt.is_none() {
                 target_temp_opt = Some(r_val);
             }
@@ -587,7 +618,7 @@ impl<'a> GCode<'a> {
 
          self.wait_for_temperature(
             &mut toolhead.bed_heater,
-            toolhead.get_reactor_mut(),
+            toolhead.get_reactor(), // Changed to get_reactor
             final_target_temp,
             tolerance,
             wait_interval_s,
@@ -595,7 +626,7 @@ impl<'a> GCode<'a> {
     }
 
     // M114: Get Current Position
-    fn cmd_m114(&self, _cmd: &GCodeCommand, toolhead: &ToolHead<'a>) -> Result<(), CommandError> {
+    fn cmd_m114(&self, _cmd: &GCodeCommand, toolhead: &ToolHead<'a>) -> Result<(), CommandError> { // toolhead already present, good.
         let pos = toolhead.get_position(); // This is toolhead.commanded_pos, which are G-code coordinates
 
         // In Klipper, gcode.get_position() also returns gcode coordinates (base_position).
@@ -619,7 +650,7 @@ impl<'a> GCode<'a> {
     // M106: Set Fan Speed
     fn cmd_m106(&mut self, cmd: &GCodeCommand, toolhead: &mut ToolHead<'a>) -> Result<(), CommandError> {
         // Klipper's M106 S<value> uses value from 0-255. Default is 255 if S is not specified.
-        let s_value = self.get_float_param_opt(&cmd.params, 'S').unwrap_or(255.0);
+        let s_value = cmd.get_float_param('S').unwrap_or(255.0); // Use cmd.get_float_param
 
         if s_value < 0.0 || s_value > 255.0 {
             return Err(CommandError(format!(
@@ -666,8 +697,8 @@ impl From<String> for CommandError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reactor::Reactor; // Mock or simple reactor needed for ToolHead
-    use crate::mcu::Mcu; // Mock Mcu
+    use crate::reactor::{Reactor, TimerHandle, TimerCallback}; // Updated import
+    use crate::core_traits::Mcu; // Changed from crate::mcu::Mcu
     use crate::configfile::Configfile; // Mock Configfile
 
 
@@ -698,21 +729,37 @@ mod tests {
         }
     }
      // Minimal Reactor for ToolHead instantiation
-    struct MockReactor;
+    struct MockReactor {
+        next_handle: usize,
+    }
+    impl MockReactor {
+        fn new() -> Self { MockReactor { next_handle: 0 } }
+    }
     impl Reactor for MockReactor {
         fn monotonic(&self) -> f64 { 0.0 }
-        fn register_timer(&mut self, _time: f64, _callback: Box<dyn FnMut(f64) -> Option<f64>>) -> usize { 0 }
-        fn register_fd(&mut self, _fd: i32, _callback: Box<dyn FnMut(f64)>) -> usize {0}
+        fn register_timer(&mut self, _eventtime: f64, _callback: TimerCallback) -> TimerHandle {
+            let handle = TimerHandle(self.next_handle);
+            self.next_handle += 1;
+            handle
+        }
+        fn unregister_timer(&mut self, _handle: TimerHandle) {}
+        fn update_timer(&mut self, _handle: TimerHandle, _eventtime: f64) {}
+
+        fn register_fd(&mut self, _fd: i32, _callback: Box<dyn FnMut(f64)>) -> usize { self.next_handle +=1; self.next_handle-1 }
         fn unregister_fd(&mut self, _handle_id: usize) {}
-        fn unregister_timer(&mut self, _handle_id: usize) {}
+
+        fn pause(&self, _waketime: f64) {} // Changed to &self
         fn is_shutdown(&self) -> bool {false}
         fn run(&mut self) {}
-        fn pause(&mut self, _waketime: f64) {}
         fn _check_timers(&mut self, _eventtime: f64, _idle: bool) {}
     }
      // Minimal Mcu for ToolHead instantiation
     struct MockMcu;
     impl Mcu for MockMcu {
+        fn get_name(&self) -> String { "mcu_mock_gcode".to_string() }
+        fn register_config_callback(&self, _callback: Box<dyn Fn() + Send + Sync>) {}
+        fn create_oid(&self) -> u8 { 0 }
+        fn add_config_cmd(&self, _cmd: &str, _is_init: bool) {}
         fn estimated_print_time(&self, _curtime: f64) -> f64 {0.0}
         // Other methods as needed by ToolHead, or ensure ToolHead mock doesn't call them
     }
@@ -732,7 +779,7 @@ mod tests {
         config.set("printer", "max_accel", "3000");
         // config.set("printer", "kinematics", "cartesian"); // This would trigger kinematic loading
 
-        let reactor = Box::new(MockReactor); // This needs to be a stable reference
+        let reactor = Box::new(MockReactor::new()); // This needs to be a stable reference
         let mcu = Box::new(MockMcu);
 
         // Hack: Use Box::leak to get a 'static reference. This is not ideal for general code.
@@ -1048,9 +1095,9 @@ mod tests {
 
         // Check toolhead's commanded position reflects the new G-code coordinates
         let th_pos = toolhead.get_position();
-        assert_eq!(th_pos[0], toolhead::X_GCODE_POSITION_AFTER_HOMING);
-        assert_eq!(th_pos[1], toolhead::Y_GCODE_POSITION_AFTER_HOMING);
-        assert_eq!(th_pos[2], toolhead::Z_GCODE_POSITION_AFTER_HOMING);
+        assert_eq!(th_pos[0], crate::toolhead::X_GCODE_POSITION_AFTER_HOMING);
+        assert_eq!(th_pos[1], crate::toolhead::Y_GCODE_POSITION_AFTER_HOMING);
+        assert_eq!(th_pos[2], crate::toolhead::Z_GCODE_POSITION_AFTER_HOMING);
 
         let kin_limits = toolhead.kin.get_axis_limits_for_test();
         assert_eq!(kin_limits[0], (0.0, 200.0), "X axis limits after G28 all");
@@ -1077,9 +1124,9 @@ mod tests {
         assert_eq!(gcode.state.last_position, Coord::new(Some(0.0), Some(20.0), Some(0.0), Some(0.0))); // Y last_pos is original
 
         let th_pos = toolhead.get_position();
-        assert_eq!(th_pos[0], toolhead::X_GCODE_POSITION_AFTER_HOMING);
+        assert_eq!(th_pos[0], crate::toolhead::X_GCODE_POSITION_AFTER_HOMING);
         assert_eq!(th_pos[1], 20.0); // Y unchanged
-        assert_eq!(th_pos[2], toolhead::Z_GCODE_POSITION_AFTER_HOMING);
+        assert_eq!(th_pos[2], crate::toolhead::Z_GCODE_POSITION_AFTER_HOMING);
 
         let kin_limits = toolhead.kin.get_axis_limits_for_test();
         assert_eq!(kin_limits[0], (0.0, 200.0), "X axis limits after G28 X Z");
@@ -1120,7 +1167,7 @@ mod tests {
 
         let th_pos = toolhead.get_position();
         assert_eq!(th_pos[0], 10.0); // X unchanged
-        assert_eq!(th_pos[1], toolhead::Y_GCODE_POSITION_AFTER_HOMING);
+        assert_eq!(th_pos[1], crate::toolhead::Y_GCODE_POSITION_AFTER_HOMING);
         assert_eq!(th_pos[2], 5.0);  // Z unchanged
     }
 

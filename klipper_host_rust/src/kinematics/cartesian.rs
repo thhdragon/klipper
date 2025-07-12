@@ -205,13 +205,13 @@ impl CartesianKinematics {
     /// This method assumes that the `position_steps` in each stepper accurately reflects
     /// its current physical state, and `mcu_position_offset` correctly maps this
     /// to the G-code coordinate system.
-    pub fn calc_position_from_steppers(&self) -> Result<[f64; 3], String> {
-        Ok([
-            self.rails[0].get_rail_position_gcode()?,
-            self.rails[1].get_rail_position_gcode()?,
-            self.rails[2].get_rail_position_gcode()?,
-        ])
-    }
+    // pub fn calc_position_from_steppers(&self) -> Result<[f64; 3], String> { // Moved to impl Kinematics
+    //     Ok([
+    //         self.rails[0].get_rail_position_gcode()?,
+    //         self.rails[1].get_rail_position_gcode()?,
+    //         self.rails[2].get_rail_position_gcode()?,
+    //     ])
+    // }
 
     /// Simulates moving steppers to a G-code target.
     /// This is for host-side simulation/state tracking, not actual motion planning.
@@ -297,6 +297,14 @@ impl Kinematics for CartesianKinematics {
         self.limits
     }
 
+    fn calc_position_from_steppers(&self) -> Result<[f64; 3], String> {
+        Ok([
+            self.rails[0].get_rail_position_gcode()?,
+            self.rails[1].get_rail_position_gcode()?,
+            self.rails[2].get_rail_position_gcode()?,
+        ])
+    }
+
     fn set_steppers_to_gcode_target(&mut self, target_gcode_pos: [f64;3]) -> Result<(), String> {
         self.rails[0].move_steppers_to_gcode_coord(target_gcode_pos[0])?;
         self.rails[1].move_steppers_to_gcode_coord(target_gcode_pos[1])?;
@@ -309,7 +317,8 @@ impl Kinematics for CartesianKinematics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::toolhead::Move;
+    // use crate::toolhead::Move; // Move is already imported at the top of the file
+    use crate::test_utils::create_test_move;
 
 
     #[test]

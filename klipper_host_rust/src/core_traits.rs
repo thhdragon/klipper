@@ -48,53 +48,6 @@ pub trait PinController: Send + Sync {
     // fn setup_pin_adc(&self, params: PinParams) -> Result<Arc<dyn AdcPin>, String>;
 }
 
-// --- GCodeCommand Struct ---
-/// Represents a parsed G-code command.
-pub struct GCodeCommand {
-    pub command: String,          // e.g., "G1"
-    pub command_letter: char,     // e.g., 'G'
-    pub command_number: i32,      // e.g., 1
-    pub params: std::collections::HashMap<char, String>, // Param letter -> Value string
-    // TODO: raw line, etc.
-}
-
-impl GCodeCommand {
-    // Helper methods similar to Python's gcmd.get_float(), gcmd.get_int()
-    pub fn get_float(&self, name: char, default: Option<f64>) -> Result<f64, String> {
-        match self.params.get(&name) {
-            Some(s) => s.parse::<f64>().map_err(|e| format!("Error parsing float for param {}: {}", name, e)),
-            None => default.ok_or_else(|| format!("Missing required float parameter {}", name)),
-        }
-    }
-    pub fn get_int(&self, name: char, default: Option<i32>) -> Result<i32, String> {
-        match self.params.get(&name) {
-            Some(s) => s.parse::<i32>().map_err(|e| format!("Error parsing int for param {}: {}", name, e)),
-            None => default.ok_or_else(|| format!("Missing required int parameter {}", name)),
-        }
-    }
-    pub fn get_str(&self, name: char, default: Option<String>) -> Result<String, String> {
-        match self.params.get(&name) {
-            Some(s) => Ok(s.clone()),
-            None => default.ok_or_else(|| format!("Missing required string parameter {}", name)),
-        }
-    }
-    pub fn get_bool(&self, name: char, default: Option<bool>) -> Result<bool, String> {
-        match self.params.get(&name) {
-            Some(s) => match s.to_lowercase().as_str() {
-                "1" | "true" | "on" => Ok(true),
-                "0" | "false" | "off" => Ok(false),
-                _=> Err(format!("Invalid boolean value for param {}: {}", name, s))
-            }
-            None => default.ok_or_else(|| format!("Missing required bool parameter {}", name)),
-        }
-    }
-    // error method
-    pub fn error(&self, message: &str) -> String { // Returns String to be used in Result::Err
-        format!("Error in GCode command {}{}: {}", self.command_letter, self.command_number, message)
-    }
-}
-
-
 // --- GCodeDispatcher Trait ---
 /// For registering G-code command handlers.
 pub trait GCodeDispatcher: Send + Sync {
@@ -126,6 +79,7 @@ pub trait Mcu: Send + Sync {
     fn register_config_callback(&self, callback: Box<dyn Fn() + Send + Sync>); // Simplified
     fn create_oid(&self) -> u8; // Simplified
     fn add_config_cmd(&self, cmd: &str, is_init: bool);
+    fn estimated_print_time(&self, curtime: f64) -> f64; // Added
     // alloc_command_queue, lookup_command, get_query_slot, seconds_to_clock, register_response etc.
     // These are more complex and will be detailed when mcu.rs is properly ported/designed.
     // For now, methods needed by buttons.py (if any direct ones beyond config) would go here.
@@ -159,6 +113,28 @@ pub trait Printer: Send + Sync {
 //         Err(arc_any)
 //     }
 // }
+
+// --- PrintKObject Trait ---
+/// Trait for Klipper objects that can provide status information.
+/// Corresponds to Klipper's PrintKObject class.
+pub trait PrintKObject: Send + Sync {
+    // In Klipper, get_status(eventtime) returns a dict.
+    // Using serde_json::Value for flexibility, or a custom Status struct.
+    fn get_status(&self, eventtime: f64) -> Result<serde_json::Value, String>;
+    // Add other common methods from PrintKObject if needed, e.g., for logging.
+}
+
+// --- ButtonReactor Trait ---
+/// Trait for reactor functionality specific to button handling (debouncing, callbacks).
+/// This might be merged into the main Reactor trait or kept separate.
+pub trait ButtonReactor: Send + Sync {
+    // TODO: Define methods needed by extras/buttons.rs, e.g.,
+    // fn register_button_callback(&mut self, ...) -> ButtonTimerHandle;
+    // fn update_button_timer(&mut self, handle: ButtonTimerHandle, eventtime: f64);
+    // fn unregister_button_timer(&mut self, handle: ButtonTimerHandle);
+    // For now, it can be an empty marker trait if buttons.rs only needs it as a bound.
+}
+
 
 #[cfg(test)]
 mod tests {

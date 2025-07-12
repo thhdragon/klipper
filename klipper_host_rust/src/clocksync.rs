@@ -111,7 +111,7 @@ impl ClockSync {
     // If Reactor is shared (e.g. Arc<Mutex<Reactor>>), the signature would change.
     pub fn connect(
         &mut self,
-        reactor: &mut Reactor, // Changed: reactor passed as arg
+        reactor: &mut dyn Reactor,
         serial: Arc<SerialHdl>,
         // To enable closures that capture `self`, we'd typically need ClockSync to be
         // wrapped in Arc<Mutex<>>. For now, we'll make the methods on ClockSync `&mut self`
@@ -368,7 +368,7 @@ impl ClockSync {
     }
 
     // Port of connect_file
-    pub fn connect_file(&mut self, reactor: &mut Reactor, serial: Arc<SerialHdl>, pace: bool) { // Added reactor
+    pub fn connect_file(&mut self, reactor: &mut dyn Reactor, serial: Arc<SerialHdl>, pace: bool) { // Changed to dyn Reactor
         self.serial = Some(Arc::clone(&serial)); // Use Arc::clone
         let serial_ref = self.serial.as_ref().unwrap();
 
@@ -548,7 +548,7 @@ mod tests {
         assert_eq!(cs.clock32_to_clock64(clock32_ahead), 0x1_000000F5);
 
         // Test case 2: clock32 has wrapped around (is smaller than last_clock's lower 32 bits)
-        cs.last_clock = 0x1_FFFFFF潛行0; // Lower part is near wrap
+        cs.last_clock = 0x1_FFFFFFF0; // Lower part is near wrap
         let clock32_wrapped = 0x00000010; // Wrapped around
         assert_eq!(cs.clock32_to_clock64(clock32_wrapped), 0x2_00000010); // Should increment upper part
 
@@ -892,7 +892,7 @@ impl SecondarySync {
     }
 
     // connect is overridden from ClockSync
-    pub fn connect(&mut self, reactor: &mut Reactor, serial: Arc<SerialHdl>) -> Result<(), ClockSyncError> {
+    pub fn connect(&mut self, reactor: &mut dyn Reactor, serial: Arc<SerialHdl>) -> Result<(), ClockSyncError> { // Changed to dyn Reactor
         self.clock_sync.connect(reactor, Arc::clone(&serial))?; // Propagate error
         self.clock_adj = (0.0, self.clock_sync.mcu_freq);
 
@@ -908,7 +908,7 @@ impl SecondarySync {
     // connect_file is also overridden
     // Assuming connect_file in the base class doesn't return Result, or we'd match that.
     // For now, keeping it simple as it mostly sets up initial state.
-    pub fn connect_file(&mut self, reactor: &mut Reactor, serial: Arc<SerialHdl>, pace: bool) {
+    pub fn connect_file(&mut self, reactor: &mut dyn Reactor, serial: Arc<SerialHdl>, pace: bool) { // Changed to dyn Reactor
         self.clock_sync.connect_file(reactor, Arc::clone(&serial), pace); // Pass reactor
         self.clock_adj = (0.0, self.clock_sync.mcu_freq);
     }

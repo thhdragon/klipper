@@ -47,294 +47,6 @@ impl Move {
         }
     }
 
-    #[cfg(feature = "alloc")]
-    mod trapq_set_position_tests {
-        use super::*;
-
-        fn non_null_move(print_time: f64, move_t: f64, start_pos: Coord) -> Move {
-            Move::new(print_time, move_t, 1.0, 0.5, start_pos, Coord::new(1.0,0.0,0.0))
-        }
-
-        #[test]
-        fn set_position_empty_queue() {
-            let mut tq = new_test_tq();
-            let pos = Coord::new(10.0, 20.0, 30.0);
-            tq.set_position(5.0, pos);
-
-            assert!(tq.moves.is_empty());
-            assert_eq!(tq.history.len(), 1);
-            let marker = &tq.history[0];
-            assert_approx_eq!(f64, marker.print_time, 5.0);
-            assert_approx_eq!(f64, marker.move_t, 0.0);
-            assert_eq!(marker.start_pos, pos);
-            assert_eq!(marker.axes_r, Coord::new(0.0,0.0,0.0));
-        }
-
-        #[test]
-        fn set_position_flushes_moves_and_adds_marker() {
-            let mut tq = new_test_tq();
-            tq.moves.push(non_null_move(0.0, 1.0, Coord::new(0.,0.,0.)));
-            tq.moves.push(non_null_move(1.0, 1.0, Coord::new(1.,0.,0.)));
-
-            let set_pos_time = 0.5;
-            let new_pos = Coord::new(10.0, 0.0, 0.0);
-            tq.set_position(set_pos_time, new_pos);
-
-            assert!(tq.moves.is_empty(), "Moves queue should be empty after set_position");
-
-            // Finalize_moves(LARGE_TIME, 0.0) is called first.
-            // m(0,1) ends 1.0. m(1,1) ends 2.0. Both expire.
-            // History before pruning: [m(1,1) at pos(1,0,0), m(0,1) at pos(0,0,0)]
-            // clear_history_time = 0.0 means all but head (m(1,1)) are pruned.
-            // So, history before set_pos pruning: [m(1,1) at pos(1,0,0)]
-
-            // Now, set_position's pruning logic for history:
-            // Head of history is m(1,1) (print_time 1.0). set_pos_time is 0.5.
-            // head_hist_move.print_time (1.0) is NOT < set_pos_time (0.5). So, remove it.
-            // History becomes empty.
-            // Then marker is added.
-
-            assert_eq!(tq.history.len(), 1, "History should contain only the new marker");
-            let marker = &tq.history[0];
-            assert_approx_eq!(f64, marker.print_time, set_pos_time);
-            assert_eq!(marker.start_pos, new_pos);
-        }
-
-        #[test]
-        fn set_position_truncates_history_move() {
-            let mut tq = new_test_tq();
-            // History (head to tail): [m(1.0, 2.0, pos2), m(0.0, 1.0, pos1)]
-            // m_hist_1: pt=0.0, mt=1.0, end_t=1.0, pos=(0,0,0)
-            // m_hist_0: pt=1.0, mt=2.0, end_t=3.0, pos=(1,0,0)
-            let pos1 = Coord::new(0.,0.,0.);
-            let pos2 = Coord::new(1.,0.,0.);
-            tq.history.push(non_null_move(0.0, 1.0, pos1)); // Tail
-            tq.history.push(non_null_move(1.0, 2.0, pos2)); // Head
-
-            // Current history (idx 0 is head):
-            // 0: Move { print_time: 1.0, move_t: 2.0, ... } // ends at 3.0
-            // 1: Move { print_time: 0.0, move_t: 1.0, ... } // ends at 1.0
-
-            let set_pos_time = 1.5; // This time is within m_hist_0
-            let new_pos = Coord::new(10.0, 0.0, 0.0);
-            tq.set_position(set_pos_time, new_pos);
-
-            // finalize_moves(LARGE, 0.0) is called:
-            // History: [m(1,2,pos2)] (m(0,1,pos1) is pruned as it's not head and clear_history_time=0)
-
-            // set_position pruning:
-            // Head is m(1,2,pos2). print_time 1.0 < set_pos_time 1.5.
-            // print_time (1.0) + move_t (2.0) = 3.0 > set_pos_time (1.5). So truncate.
-            // new move_t = 1.5 - 1.0 = 0.5.
-            // History becomes: [truncated_m(1,0.5,pos2)]
-            // Then marker is added at head.
-            // History: [marker, truncated_m(1,0.5,pos2)]
-
-            assert_eq!(tq.history.len(), 2);
-
-            let marker = &tq.history[0];
-            assert_approx_eq!(f64, marker.print_time, set_pos_time);
-            assert_eq!(marker.start_pos, new_pos);
-
-            let truncated_move = &tq.history[1];
-            assert_approx_eq!(f64, truncated_move.print_time, 1.0);
-            assert_approx_eq!(f64, truncated_move.move_t, 0.5); // Original 2.0, truncated
-            assert_eq!(truncated_move.start_pos, pos2);
-        }
-
-        #[test]
-        fn set_position_keeps_history_move_before_set_time() {
-            let mut tq = new_test_tq();
-            // History (head to tail): [m(1.0,1.0,pos2), m(0.0,1.0,pos1)]
-             let pos1 = Coord::new(0.,0.,0.);
-             let pos2 = Coord::new(1.,0.,0.);
-            tq.history.push(non_null_move(0.0, 1.0, pos1)); // ends 1.0
-            tq.history.push(non_null_move(1.0, 1.0, pos2)); // ends 2.0 (Head)
-
-            let set_pos_time = 2.5; // After all history moves
-            let new_pos = Coord::new(10.0, 0.0, 0.0);
-            tq.set_position(set_pos_time, new_pos);
-
-            // finalize_moves(LARGE, 0.0) -> history: [m(1,1,pos2)]
-            // set_position pruning:
-            // Head is m(1,1,pos2). print_time 1.0 < set_pos_time 2.5.
-            // print_time (1.0) + move_t (1.0) = 2.0 <= set_pos_time (2.5). Not truncated. Kept.
-            // History: [m(1,1,pos2)]
-            // Then marker added at head.
-            // History: [marker, m(1,1,pos2)]
-
-            assert_eq!(tq.history.len(), 2);
-            let marker = &tq.history[0];
-            assert_approx_eq!(f64, marker.print_time, set_pos_time);
-            assert_eq!(marker.start_pos, new_pos);
-
-            let kept_move = &tq.history[1];
-            assert_approx_eq!(f64, kept_move.print_time, 1.0);
-            assert_approx_eq!(f64, kept_move.move_t, 1.0); // Not truncated
-            assert_eq!(kept_move.start_pos, pos2);
-        }
-         #[test]
-        fn set_position_removes_history_moves_after_set_time() {
-            let mut tq = new_test_tq();
-            // History (head to tail): [m(2.0,1.0,pos3), m(1.0,1.0,pos2), m(0.0,1.0,pos1)]
-            let pos1 = Coord::new(0.,0.,0.);
-            let pos2 = Coord::new(1.,0.,0.);
-            let pos3 = Coord::new(2.,0.,0.);
-            tq.history.push(non_null_move(0.0, 1.0, pos1)); // ends 1.0
-            tq.history.push(non_null_move(1.0, 1.0, pos2)); // ends 2.0
-            tq.history.push(non_null_move(2.0, 1.0, pos3)); // ends 3.0 (Head)
-
-            let set_pos_time = 0.5; // Before all history moves
-            let new_pos = Coord::new(10.0, 0.0, 0.0);
-            tq.set_position(set_pos_time, new_pos);
-
-            // finalize_moves(LARGE,0.0) -> history: [m(2,1,pos3)]
-            // set_position pruning:
-            // Head is m(2,1,pos3). print_time 2.0 is NOT < set_pos_time 0.5. Remove.
-            // History becomes empty.
-            // Marker added.
-            // History: [marker]
-
-            assert_eq!(tq.history.len(), 1);
-            let marker = &tq.history[0];
-            assert_approx_eq!(f64, marker.print_time, set_pos_time);
-            assert_eq!(marker.start_pos, new_pos);
-        }
-    }
-
-    #[cfg(feature = "alloc")]
-    mod trapq_finalize_moves_tests {
-        use super::*;
-
-        fn non_null_move(print_time: f64, move_t: f64) -> Move {
-            Move::new(print_time, move_t, 1.0, 0.5, Coord::default(), Coord::default())
-        }
-        fn null_move_obj(print_time: f64, move_t: f64) -> Move { // Renamed to avoid conflict
-            Move::new(print_time, move_t, 0.0, 0.0, Coord::default(), Coord::default())
-        }
-
-        #[test]
-        fn finalize_empty_queue() {
-            let mut tq = new_test_tq();
-            tq.finalize_moves(10.0, 5.0);
-            assert!(tq.moves.is_empty());
-            assert!(tq.history.is_empty());
-        }
-
-        #[test]
-        fn finalize_all_moves_expired_to_history() {
-            let mut tq = new_test_tq();
-            tq.moves.push(non_null_move(0.0, 1.0)); // Ends at 1.0
-            tq.moves.push(non_null_move(1.0, 1.0)); // Ends at 2.0
-
-            tq.finalize_moves(2.5, 0.0); // Expire up to 2.5, clear history before time 0
-
-            assert!(tq.moves.is_empty());
-            assert_eq!(tq.history.len(), 2);
-            // Moves are added to head of history, so order is reversed
-            assert_approx_eq!(f64, tq.history[0].print_time, 1.0); // m2
-            assert_approx_eq!(f64, tq.history[1].print_time, 0.0); // m1
-        }
-
-        #[test]
-        fn finalize_null_moves_are_discarded() {
-            let mut tq = new_test_tq();
-            tq.moves.push(null_move_obj(0.0, 1.0));
-            tq.moves.push(non_null_move(1.0, 1.0));
-            tq.moves.push(null_move_obj(2.0, 1.0));
-
-            tq.finalize_moves(3.5, 0.0);
-
-            assert!(tq.moves.is_empty());
-            assert_eq!(tq.history.len(), 1); // Only non-null move goes to history
-            assert_approx_eq!(f64, tq.history[0].print_time, 1.0);
-        }
-
-        #[test]
-        fn finalize_some_moves_expired() {
-            let mut tq = new_test_tq();
-            let m1 = non_null_move(0.0, 1.0); // Ends 1.0
-            let m2 = non_null_move(1.0, 1.0); // Ends 2.0
-            let m3 = non_null_move(2.0, 1.0); // Ends 3.0
-            tq.moves.push(m1.clone());
-            tq.moves.push(m2.clone());
-            tq.moves.push(m3.clone());
-
-            tq.finalize_moves(1.5, 0.0); // Expire m1 (ends at 1.0 < 1.5)
-
-            assert_eq!(tq.moves.len(), 2);
-            assert_eq!(tq.moves[0], m2); // m2 is now at the head of moves
-            assert_eq!(tq.moves[1], m3);
-
-            assert_eq!(tq.history.len(), 1);
-            assert_eq!(tq.history[0], m1);
-        }
-
-        #[test]
-        fn finalize_history_pruning_none_old_enough() {
-            let mut tq = new_test_tq();
-            tq.history.push(non_null_move(0.0, 1.0)); // Ends 1.0
-            tq.history.push(non_null_move(1.0, 1.0)); // Ends 2.0 (head of history)
-                                                      // History: [m(1.0,1.0), m(0.0,1.0)]
-
-            tq.finalize_moves(0.0, 0.5); // clear_history_time = 0.5. Both moves end after this.
-
-            assert_eq!(tq.history.len(), 2);
-        }
-
-        #[test]
-        fn finalize_history_pruning_one_old_enough_but_is_head() {
-            let mut tq = new_test_tq();
-            // History will be [m(0.0,1.0)]
-            tq.history.push(non_null_move(0.0, 1.0)); // Ends 1.0. This is the head.
-
-            // clear_history_time = 1.5. Move ends before this, so it's "old".
-            // But it's the only item (head), so it should be kept.
-            tq.finalize_moves(0.0, 1.5);
-
-            assert_eq!(tq.history.len(), 1);
-            assert_approx_eq!(f64, tq.history[0].print_time, 0.0);
-        }
-
-        #[test]
-        fn finalize_history_pruning_some_old_enough_from_tail() {
-            let mut tq = new_test_tq();
-            // History (head to tail): [m(2,1), m(1,1), m(0,1)]
-            // Times (end):              3.0      2.0      1.0
-            tq.history.push(non_null_move(0.0, 1.0)); // Tail: Ends 1.0
-            tq.history.push(non_null_move(1.0, 1.0)); // Middle: Ends 2.0
-            tq.history.push(non_null_move(2.0, 1.0)); // Head: Ends 3.0
-
-            // clear_history_time = 1.5.
-            // m(0,1) ends at 1.0 <= 1.5, so it's old and not head. Remove.
-            // m(1,1) ends at 2.0 > 1.5. Keep. Stop.
-            tq.finalize_moves(0.0, 1.5);
-
-            assert_eq!(tq.history.len(), 2);
-            // Expected history (head to tail): [m(2,1), m(1,1)]
-            assert_approx_eq!(f64, tq.history[0].print_time, 2.0);
-            assert_approx_eq!(f64, tq.history[1].print_time, 1.0);
-        }
-
-        #[test]
-        fn finalize_history_pruning_all_but_head_old_enough() {
-            let mut tq = new_test_tq();
-            // History (head to tail): [m(2,1), m(1,1), m(0,1)]
-            tq.history.push(non_null_move(0.0, 1.0));
-            tq.history.push(non_null_move(1.0, 1.0));
-            tq.history.push(non_null_move(2.0, 1.0));
-
-            // clear_history_time = 2.5
-            // m(0,1) ends 1.0 <= 2.5. Remove.
-            // m(1,1) ends 2.0 <= 2.5. Remove.
-            // m(2,1) is head. Keep.
-            tq.finalize_moves(0.0, 2.5);
-
-            assert_eq!(tq.history.len(), 1);
-            assert_approx_eq!(f64, tq.history[0].print_time, 2.0); // Only head remains
-        }
-    }
-
     /// Calculate the distance covered during this move up to a given move_time.
     /// Equivalent to C: double move_get_distance(struct move *m, double move_time)
     pub fn get_distance(&self, time_into_move: f64) -> f64 {
@@ -587,60 +299,11 @@ impl TrapQ {
         // The C code has a peculiar condition: `m == latest` where `latest` is the first entry.
         // This means it doesn't remove the very first item in history, even if it's too old.
         // Let's try to replicate: retain elements if they are newer than clear_history_time OR if it's the first element.
+        // The line below is not used by the current while loop logic, can be removed if not needed elsewhere.
+        // let latest_history_print_time = self.history.first().map_or(0.0, |m| m.print_time + m.move_t);
 
-        let latest_history_print_time = self.history.first().map_or(0.0, |m| m.print_time + m.move_t);
-
-        self.history.retain(|m_hist| {
-            let is_latest_equivalent = self.history.first().map_or(false, |first| {
-                // Compare by content or a unique ID if available. Pointers in C made this easy.
-                // For Vec<Move>, if Move is PartialEq, we can compare.
-                // However, the C logic is `m == latest` (pointer comparison).
-                // This means it protects the *current first element* of the history list.
-                // So, if m_hist is the current first element during `retain`, it's kept.
-                // This is tricky with `retain`. A simpler interpretation for `retain` might be:
-                // keep if (m_hist.print_time + m_hist.move_t > clear_history_time)
-                // The C code's `m == latest` check within the loop `list_last_entry` means it stops
-                // before removing the head of the history queue.
-                // So, we want to remove from the end of history, stopping if we hit the current head,
-                // or if the move is new enough.
-                // `retain` processes from the beginning.
-                // Let's re-evaluate. C iterates from the *end* of history.
-                // `list_last_entry(&tq->history, struct move, node);`
-                // `if (m == latest || m->print_time + m->move_t > clear_history_time) break;`
-                // `list_del(&m->node); free(m);`
-                // This means it removes from the tail until it finds one that is either the head OR new enough.
-                false // placeholder, this logic needs to be correct
-            });
-
-            // Corrected logic for pruning history:
-            // We remove from the end of history (older moves) as long as:
-            // 1. The history is not empty.
-            // 2. The move to remove is NOT the head of the history list.
-            // 3. The move IS older than clear_history_time.
-            // This loop continues until one of these conditions fails.
-            // This is easier done with a `while let Some(last_move) = self.history.last()` loop.
-            // However, we must ensure not to remove the head if it's the only one left and too old.
-            // C code: `struct move *latest = list_first_entry(&tq->history, struct move, node);`
-            // `struct move *m = list_last_entry(&tq->history, struct move, node);`
-            // `if (m == latest || ...)`
-            // This means if history has only one element, `m == latest` is true, so it's not removed.
-
-            // Let's try with `pop` from the end.
-            while self.history.len() > 1 { // Ensure there's more than one element before considering removal of last.
-                if let Some(last_move_in_history) = self.history.last() {
-                    if last_move_in_history.print_time + last_move_in_history.move_t <= clear_history_time {
-                        self.history.pop(); // Remove the last (oldest among those eligible for removal)
-                    } else {
-                        break; // Last move is new enough, stop
-                    }
-                } else {
-                    break; // Should not happen if len > 1
-                }
-            }
-            // After the loop, if history still has one element (len == 1),
-            // that single element is the 'latest' and was protected by `len > 1`.
-            // This matches the C logic of not removing `latest`.
-        //}); // The retain call was incorrect, replaced by loop below.
+        // The original `self.history.retain(...)` call was problematic and its body was commented out.
+        // The intended logic is implemented by the `while` loop below.
 
         // Corrected loop for pruning history based on C logic:
         // Remove from tail, but don't remove the head of history.
@@ -1076,6 +739,229 @@ mod tests {
             assert_approx_eq!(f64, null_move.print_time, 4.0);
             assert_approx_eq!(f64, null_move.move_t, 1.0);
             assert_eq!(null_move.start_pos, m_actual_pos);
+        }
+    }
+
+    #[cfg(feature = "alloc")]
+    mod trapq_set_position_tests {
+        use super::*;
+
+        fn non_null_move(print_time: f64, move_t: f64, start_pos: Coord) -> Move {
+            Move::new(print_time, move_t, 1.0, 0.5, start_pos, Coord::new(1.0,0.0,0.0))
+        }
+
+        #[test]
+        fn set_position_empty_queue() {
+            let mut tq = new_test_tq();
+            let pos = Coord::new(10.0, 20.0, 30.0);
+            tq.set_position(5.0, pos);
+
+            assert!(tq.moves.is_empty());
+            assert_eq!(tq.history.len(), 1);
+            let marker = &tq.history[0];
+            assert_approx_eq!(f64, marker.print_time, 5.0);
+            assert_approx_eq!(f64, marker.move_t, 0.0);
+            assert_eq!(marker.start_pos, pos);
+            assert_eq!(marker.axes_r, Coord::new(0.0,0.0,0.0));
+        }
+
+        #[test]
+        fn set_position_flushes_moves_and_adds_marker() {
+            let mut tq = new_test_tq();
+            tq.moves.push(non_null_move(0.0, 1.0, Coord::new(0.,0.,0.)));
+            tq.moves.push(non_null_move(1.0, 1.0, Coord::new(1.,0.,0.)));
+
+            let set_pos_time = 0.5;
+            let new_pos = Coord::new(10.0, 0.0, 0.0);
+            tq.set_position(set_pos_time, new_pos);
+
+            assert!(tq.moves.is_empty(), "Moves queue should be empty after set_position");
+            assert_eq!(tq.history.len(), 1, "History should contain only the new marker");
+            let marker = &tq.history[0];
+            assert_approx_eq!(f64, marker.print_time, set_pos_time);
+            assert_eq!(marker.start_pos, new_pos);
+        }
+
+        #[test]
+        fn set_position_truncates_history_move() {
+            let mut tq = new_test_tq();
+            let pos1 = Coord::new(0.,0.,0.);
+            let pos2 = Coord::new(1.,0.,0.);
+            tq.history.push(non_null_move(0.0, 1.0, pos1));
+            tq.history.push(non_null_move(1.0, 2.0, pos2));
+
+            let set_pos_time = 1.5;
+            let new_pos = Coord::new(10.0, 0.0, 0.0);
+            tq.set_position(set_pos_time, new_pos);
+
+            assert_eq!(tq.history.len(), 2);
+
+            let marker = &tq.history[0];
+            assert_approx_eq!(f64, marker.print_time, set_pos_time);
+            assert_eq!(marker.start_pos, new_pos);
+
+            let truncated_move = &tq.history[1];
+            assert_approx_eq!(f64, truncated_move.print_time, 1.0);
+            assert_approx_eq!(f64, truncated_move.move_t, 0.5);
+            assert_eq!(truncated_move.start_pos, pos2);
+        }
+
+        #[test]
+        fn set_position_keeps_history_move_before_set_time() {
+            let mut tq = new_test_tq();
+             let pos1 = Coord::new(0.,0.,0.);
+             let pos2 = Coord::new(1.,0.,0.);
+            tq.history.push(non_null_move(0.0, 1.0, pos1));
+            tq.history.push(non_null_move(1.0, 1.0, pos2));
+
+            let set_pos_time = 2.5;
+            let new_pos = Coord::new(10.0, 0.0, 0.0);
+            tq.set_position(set_pos_time, new_pos);
+
+            assert_eq!(tq.history.len(), 2);
+            let marker = &tq.history[0];
+            assert_approx_eq!(f64, marker.print_time, set_pos_time);
+            assert_eq!(marker.start_pos, new_pos);
+
+            let kept_move = &tq.history[1];
+            assert_approx_eq!(f64, kept_move.print_time, 1.0);
+            assert_approx_eq!(f64, kept_move.move_t, 1.0);
+            assert_eq!(kept_move.start_pos, pos2);
+        }
+         #[test]
+        fn set_position_removes_history_moves_after_set_time() {
+            let mut tq = new_test_tq();
+            let pos1 = Coord::new(0.,0.,0.);
+            let pos2 = Coord::new(1.,0.,0.);
+            let pos3 = Coord::new(2.,0.,0.);
+            tq.history.push(non_null_move(0.0, 1.0, pos1));
+            tq.history.push(non_null_move(1.0, 1.0, pos2));
+            tq.history.push(non_null_move(2.0, 1.0, pos3));
+
+            let set_pos_time = 0.5;
+            let new_pos = Coord::new(10.0, 0.0, 0.0);
+            tq.set_position(set_pos_time, new_pos);
+
+            assert_eq!(tq.history.len(), 1);
+            let marker = &tq.history[0];
+            assert_approx_eq!(f64, marker.print_time, set_pos_time);
+            assert_eq!(marker.start_pos, new_pos);
+        }
+    }
+
+    #[cfg(feature = "alloc")]
+    mod trapq_finalize_moves_tests {
+        use super::*;
+
+        fn non_null_move(print_time: f64, move_t: f64) -> Move {
+            Move::new(print_time, move_t, 1.0, 0.5, Coord::default(), Coord::default())
+        }
+        fn null_move_obj(print_time: f64, move_t: f64) -> Move {
+            Move::new(print_time, move_t, 0.0, 0.0, Coord::default(), Coord::default())
+        }
+
+        #[test]
+        fn finalize_empty_queue() {
+            let mut tq = new_test_tq();
+            tq.finalize_moves(10.0, 5.0);
+            assert!(tq.moves.is_empty());
+            assert!(tq.history.is_empty());
+        }
+
+        #[test]
+        fn finalize_all_moves_expired_to_history() {
+            let mut tq = new_test_tq();
+            tq.moves.push(non_null_move(0.0, 1.0));
+            tq.moves.push(non_null_move(1.0, 1.0));
+
+            tq.finalize_moves(2.5, 0.0);
+
+            assert!(tq.moves.is_empty());
+            assert_eq!(tq.history.len(), 2);
+            assert_approx_eq!(f64, tq.history[0].print_time, 1.0);
+            assert_approx_eq!(f64, tq.history[1].print_time, 0.0);
+        }
+
+        #[test]
+        fn finalize_null_moves_are_discarded() {
+            let mut tq = new_test_tq();
+            tq.moves.push(null_move_obj(0.0, 1.0));
+            tq.moves.push(non_null_move(1.0, 1.0));
+            tq.moves.push(null_move_obj(2.0, 1.0));
+
+            tq.finalize_moves(3.5, 0.0);
+
+            assert!(tq.moves.is_empty());
+            assert_eq!(tq.history.len(), 1);
+            assert_approx_eq!(f64, tq.history[0].print_time, 1.0);
+        }
+
+        #[test]
+        fn finalize_some_moves_expired() {
+            let mut tq = new_test_tq();
+            let m1 = non_null_move(0.0, 1.0);
+            let m2 = non_null_move(1.0, 1.0);
+            let m3 = non_null_move(2.0, 1.0);
+            tq.moves.push(m1.clone());
+            tq.moves.push(m2.clone());
+            tq.moves.push(m3.clone());
+
+            tq.finalize_moves(1.5, 0.0);
+
+            assert_eq!(tq.moves.len(), 2);
+            assert_eq!(tq.moves[0], m2);
+            assert_eq!(tq.moves[1], m3);
+
+            assert_eq!(tq.history.len(), 1);
+            assert_eq!(tq.history[0], m1);
+        }
+
+        #[test]
+        fn finalize_history_pruning_none_old_enough() {
+            let mut tq = new_test_tq();
+            tq.history.push(non_null_move(0.0, 1.0));
+            tq.history.push(non_null_move(1.0, 1.0));
+
+            tq.finalize_moves(0.0, 0.5);
+
+            assert_eq!(tq.history.len(), 2);
+        }
+
+        #[test]
+        fn finalize_history_pruning_one_old_enough_but_is_head() {
+            let mut tq = new_test_tq();
+            tq.history.push(non_null_move(0.0, 1.0));
+            tq.finalize_moves(0.0, 1.5);
+
+            assert_eq!(tq.history.len(), 1);
+            assert_approx_eq!(f64, tq.history[0].print_time, 0.0);
+        }
+
+        #[test]
+        fn finalize_history_pruning_some_old_enough_from_tail() {
+            let mut tq = new_test_tq();
+            tq.history.push(non_null_move(0.0, 1.0));
+            tq.history.push(non_null_move(1.0, 1.0));
+            tq.history.push(non_null_move(2.0, 1.0));
+
+            tq.finalize_moves(0.0, 1.5);
+
+            assert_eq!(tq.history.len(), 2);
+            assert_approx_eq!(f64, tq.history[0].print_time, 2.0);
+            assert_approx_eq!(f64, tq.history[1].print_time, 1.0);
+        }
+
+        #[test]
+        fn finalize_history_pruning_all_but_head_old_enough() {
+            let mut tq = new_test_tq();
+            tq.history.push(non_null_move(0.0, 1.0));
+            tq.history.push(non_null_move(1.0, 1.0));
+            tq.history.push(non_null_move(2.0, 1.0));
+
+            tq.finalize_moves(0.0, 2.5);
+
+            assert_eq!(tq.history.len(), 1);
+            assert_approx_eq!(f64, tq.history[0].print_time, 2.0);
         }
     }
 

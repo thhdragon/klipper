@@ -235,6 +235,27 @@ impl Configfile {
         self.data.entry(section_lower).or_insert_with(HashMap::new).insert(option_lower, value.to_string());
     }
 
+    pub fn has_section(&self, section_name: &str) -> bool {
+        self.data.contains_key(&section_name.to_lowercase())
+    }
+
+    // Simplified getchoice - Klipper's version has more complex choice map handling
+    pub fn getchoice<'a>(&self, section: &str, option: &str, choices: &[&str], default: Option<&'a str>) -> Result<String, ConfigError> {
+        let val = self.get(section, option, default)?;
+        if choices.contains(&val.as_str()) {
+            Ok(val)
+        } else {
+            Err(ConfigError::ValidationError(format!(
+                "Option '{}' in section '[{}]' must be one of {:?}, got '{}'",
+                option, section, choices, val
+            )))
+        }
+    }
+
+    // Simplified get_template_str - Klipper returns a GCodeTemplate object
+    pub fn get_template_str<'a>(&self, section: &str, option: &str, default: Option<&'a str>) -> Result<String, ConfigError> {
+        self.get(section, option, default)
+    }
 }
 
 #[cfg(test)]
