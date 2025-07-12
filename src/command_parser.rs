@@ -6,16 +6,16 @@ use defmt::Format; // For deriving defmt::Format on CommandArgValue
 
 // Maximum number of arguments a single command can have (e.g., G1 X10 Y20 Z5 F3000 -> 4 args)
 pub const MAX_ARGS_PER_COMMAND: usize = 8;
-// Maximum length for string argument values, if we support them.
-// const MAX_STRING_ARG_LEN: usize = 64;
+/// Maximum length for string argument values.
+pub const MAX_STRING_ARG_LEN: usize = 64;
 
 /// Represents the value of a parsed command argument.
 #[derive(Clone, Debug, Format, PartialEq)] // PartialEq for testing
 pub enum CommandArgValue {
     Float(f32),
-    Integer(i32), // Using i32 to accommodate potential negative values if needed
+    Integer(i32),
     UInteger(u32),
-    // String(String<MAX_STRING_ARG_LEN>), // Add later if needed
+    String(String<MAX_STRING_ARG_LEN>), // Added String variant
     // Bool(bool), // Often represented as UInteger(0) or UInteger(1)
 }
 
@@ -158,5 +158,10 @@ fn parse_value(value_str: &str) -> Result<CommandArgValue, ArgParseError> {
         return Ok(CommandArgValue::UInteger(u_val));
     }
 
-    Err(ArgParseError::ValueParseError) // Could not parse as any known numeric type
+    // If all numeric parsing fails, treat it as a string.
+    // Ensure it fits into our heapless::String.
+    match String::from_str(trimmed_val) {
+        Ok(s) => Ok(CommandArgValue::String(s)),
+        Err(_) => Err(ArgParseError::ValueParseError), // Or a more specific "StringTooLong" or "InvalidString"
+    }
 }

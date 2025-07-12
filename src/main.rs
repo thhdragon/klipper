@@ -152,8 +152,56 @@ fn process_command(line: &str, serial: &mut SerialPort<UsbBus>) {
     match parsed_args_result {
         Ok(args) => {
             if command == "PING" { serial_write_line(serial, "PONG\r\n"); }
-            else if command == "ID" { serial_write_line(serial, "KlipperRustRP2040_PWM_HW_Final_v1\r\n"); }
-            else if command == "ECHO" { serial_write_line(serial, args_str); serial_write_line(serial, "\r\n"); }
+            else if command == "ID" { serial_write_line(serial, "KlipperRustRP2040_ParserStr_v1\r\n"); } // Updated ID
+            else if command == "ECHO" {
+                // Expects ECHO U<string_value>
+                // The new parser will put the <string_value> into args map with key 'U'.
+                // If no 'U' is found, or if it's not a string, it's an error or no-op.
+                if let Some(arg_val) = args.get(&'U') {
+                    match arg_val {
+                        CommandArgValue::String(s) => {
+                            serial_write_line(serial, s.as_str());
+                            serial_write_line(serial, "\r\n");
+                        }
+                        // Handle cases where U is not a string, e.g. ECHO U123 (parses as number)
+                        CommandArgValue::Integer(i) => {
+                            let mut temp_s = heapless::String::<12>::new(); // Buffer for int string
+                            use core::fmt::Write;
+                            if write!(temp_s, "{}", i).is_ok() {
+                                serial_write_line(serial, temp_s.as_str());
+                                serial_write_line(serial, "\r\n");
+                            } else {
+                                serial_write_line(serial, "Error: ECHO U<int> formatting failed\r\n");
+                            }
+                        }
+                        CommandArgValue::UInteger(u) => {
+                             let mut temp_s = heapless::String::<12>::new();
+                            use core::fmt::Write;
+                            if write!(temp_s, "{}", u).is_ok() {
+                                serial_write_line(serial, temp_s.as_str());
+                                serial_write_line(serial, "\r\n");
+                            } else {
+                                serial_write_line(serial, "Error: ECHO U<uint> formatting failed\r\n");
+                            }
+                        }
+                        CommandArgValue::Float(f) => {
+                            // Formatting floats without std is tricky. For now, just indicate it was a float.
+                            // Or use a simple custom float-to-string if available.
+                            // Using defmt's formatting for this would be ideal but can't directly send to serial.
+                            // Let's send a placeholder.
+                            serial_write_line(serial, "ECHO U<float_value_received>\r\n");
+                            // Alternatively, a more complex float to string can be implemented or found.
+                            // For now, this shows it got a float.
+                        }
+                        // Not expecting other types for 'U' with current parser, but good to be exhaustive.
+                    }
+                } else {
+                    // No 'U' argument, maybe echo nothing or an error.
+                    // Klipper's M117 (similar to echo) with no message might clear display or do nothing.
+                    // Let's just send an empty line or a specific message.
+                    serial_write_line(serial, "ECHO: No U<message> argument provided\r\n");
+                }
+            }
             else if command == "SET_PIN" { /* ... SET_PIN logic from previous state ... */ }
             else if command == "GET_PIN" { /* ... GET_PIN logic from previous state ... */ }
             else if command == "QUERY_ADC" { /* ... QUERY_ADC logic from previous state, ensure release_pin_from_adc is used ... */ }
