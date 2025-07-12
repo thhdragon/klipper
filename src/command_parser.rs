@@ -2,166 +2,109 @@
 #![cfg_attr(not(test), no_std)]
 
 use heapless::{String, FnvIndexMap};
-use defmt::Format; // For deriving defmt::Format on CommandArgValue
+use defmt::Format;
 
-// Maximum number of arguments a single command can have (e.g., G1 X10 Y20 Z5 F3000 -> 4 args)
 pub const MAX_ARGS_PER_COMMAND: usize = 8;
-/// Maximum length for string argument values.
 pub const MAX_STRING_ARG_LEN: usize = 64;
 
-/// Represents the value of a parsed command argument.
-#[derive(Clone, Debug, Format, PartialEq)] // PartialEq for testing
+#[derive(Clone, Debug, Format, PartialEq)]
 pub enum CommandArgValue {
     Float(f32),
     Integer(i32),
     UInteger(u32),
-    String(String<MAX_STRING_ARG_LEN>), // Added String variant
-    // Bool(bool), // Often represented as UInteger(0) or UInteger(1)
+    String(String<MAX_STRING_ARG_LEN>),
 }
 
-// Type alias for the structure that holds parsed arguments.
-// Maps a character key (e.g., 'X', 'Y', 'P', 'S') to its CommandArgValue.
 pub type ParsedArgs = FnvIndexMap<char, CommandArgValue, MAX_ARGS_PER_COMMAND>;
 
-// Helper methods for ParsedArgs could be added here or as trait impls if needed,
-// e.g., to get a value as a specific type with error handling or defaults.
-// Example:
-// impl ParsedArgs {
-//     pub fn get_f32(&self, key: char) -> Option<f32> {
-//         self.get(&key).and_then(|val| match val {
-//             CommandArgValue::Float(f) => Some(*f),
-//             _ => None,
-//         })
-//     }
-//     // Similar for get_i32, get_u32 etc.
-// }
-
-// Error type for parsing
 #[derive(Debug, Format, PartialEq, Eq)]
 pub enum ArgParseError {
-    MalformedArgument,      // e.g., "X" without a value, or "X=Y"
-    ValueParseError,        // e.g., "Xabc" when number expected
-    TooManyArguments,       // Exceeded MAX_ARGS_PER_COMMAND
-    InvalidArgumentKey,     // Key is not a valid char or format
-    // Add more specific errors as needed
+    MalformedArgument,
+    ValueParseError,
+    TooManyArguments,
+    InvalidArgumentKey,
 }
 
-// Basic parser function declaration (implementation in next step)
 pub fn parse_gcode_arguments(arg_str: &str) -> Result<ParsedArgs, ArgParseError> {
     let mut parsed_args = ParsedArgs::new();
-    let mut current_key: Option<char> = None;
-    let mut current_value_str = String::<32>::new(); // Buffer for value part, 32 chars max for a value
+    let mut chars = arg_str.trim().chars().peekable();
 
-    for char_code in arg_str.chars() {
-        match char_code {
-            'A'..='Z' | 'a'..='z' => { // Start of a new key
-                // Process previous key-value pair if any
-                if let Some(key) = current_key {
-                    if current_value_str.is_empty() {
-                        return Err(ArgParseError::MalformedArgument); // Key without value e.g. "X Y"
-                    }
-                    let value = parse_value(&current_value_str)?;
-                    if parsed_args.insert(key.to_ascii_uppercase(), value).is_err() {
-                        return Err(ArgParseError::TooManyArguments);
-                    }
-                    current_value_str.clear();
-                }
-                current_key = Some(char_code.to_ascii_uppercase());
-            }
-            '.' | '-' | '+' | '0'..='9' => { // Part of a value
-                if current_key.is_none() {
-                    // Value char before any key, e.g. " 123" or "G1 123"
-                    // Depending on strictness, this could be an error or ignored.
-                    // For G-code, usually values are attached to keys. Let's error.
-                    if !char_code.is_whitespace() { // Ignore leading whitespace if no key yet
-                        // return Err(ArgParseError::MalformedArgument); // Value without preceding key
-                    }
-                }
-                if current_value_str.push(char_code).is_err() {
-                    // Value string too long, should be handled by parse_value if it truncates
-                    // or return an error specific to value length.
-                    // For now, assume parse_value handles this or it's an implicit error.
-                    // This buffer is small (32), real values might be longer.
-                    // Let's return an error here.
-                    return Err(ArgParseError::ValueParseError); // Or a new "ValueTooLong"
+    while let Some(key_char_candidate) = chars.next() {
+        if key_char_candidate.is_whitespace() {
+            continue;
+        }
+
+        let key = key_char_candidate.to_ascii_uppercase();
+
+        if key == '*' {
+            let mut value_buffer_for_star = String::<MAX_STRING_ARG_LEN>::new();
+            for rest_char in chars {
+                if value_buffer_for_star.push(rest_char).is_err() {
+                    // String collected so far might be useful for error message, but ValueParseError is generic
+                    return Err(ArgParseError::ValueParseError); // String too long
                 }
             }
-            ' ' | '\t' | '\r' | '\n' => { // Whitespace, acts as separator or end of value
-                if let Some(key) = current_key {
-                    if !current_value_str.is_empty() {
-                        let value = parse_value(&current_value_str)?;
-                        if parsed_args.insert(key.to_ascii_uppercase(), value).is_err() {
-                            return Err(ArgParseError::TooManyArguments);
-                        }
-                        current_value_str.clear();
-                        current_key = None; // Reset key after processing value
-                    } else {
-                        // Key followed by whitespace without value, e.g. "X "
-                        // This could be an error if values are mandatory for keys.
-                        // Or it could mean the key is a flag (not supported by CommandArgValue yet)
-                        // For now, if a key was set, whitespace means end of its value.
-                        // If value_str is empty, it means error like "X Y" handled above.
-                    }
-                }
-                // Ignore whitespace if no current key.
+
+            let trimmed_star_value_str = value_buffer_for_star.as_str().trim();
+            let final_star_value = String::from_str(trimmed_star_value_str)
+                .map_err(|_| ArgParseError::ValueParseError)?; // Error if trim results in > MAX_LEN (unlikely) or other issue
+
+            if parsed_args.insert(key, CommandArgValue::String(final_star_value)).is_err() {
+                return Err(ArgParseError::TooManyArguments);
             }
-            _ => {
-                // Invalid character in argument string
+            break;
+        } else if key.is_ascii_alphabetic() {
+            let mut value_str_buffer = String::<32>::new();
+
+            while let Some(&peek_char) = chars.peek() {
+                if peek_char.is_whitespace() || peek_char.is_ascii_alphabetic() || peek_char == '*' {
+                    break;
+                }
+                if value_str_buffer.push(chars.next().unwrap()).is_err() {
+                    return Err(ArgParseError::ValueParseError);
+                }
+            }
+
+            if value_str_buffer.is_empty() {
                 return Err(ArgParseError::MalformedArgument);
             }
+
+            let value = parse_value(&value_str_buffer)?;
+            if parsed_args.insert(key, value).is_err() {
+                return Err(ArgParseError::TooManyArguments);
+            }
+        } else {
+            if !key_char_candidate.is_whitespace() {
+                 return Err(ArgParseError::InvalidArgumentKey);
+            }
         }
     }
-
-    // Process the last key-value pair if any
-    if let Some(key) = current_key {
-        if current_value_str.is_empty() {
-            return Err(ArgParseError::MalformedArgument); // Key at end of string without value
-        }
-        let value = parse_value(&current_value_str)?;
-        if parsed_args.insert(key.to_ascii_uppercase(), value).is_err() {
-            return Err(ArgParseError::TooManyArguments);
-        }
-    }
-
     Ok(parsed_args)
 }
 
-/// Parses a string value into a CommandArgValue.
-/// Heuristic: if it contains '.', parse as f32. Otherwise, try i32 then u32.
 fn parse_value(value_str: &str) -> Result<CommandArgValue, ArgParseError> {
-    if value_str.is_empty() {
-        return Err(ArgParseError::ValueParseError); // Should not happen if called correctly
-    }
-
-    // Trim whitespace just in case, though outer parser should handle most.
+    if value_str.is_empty() { return Err(ArgParseError::ValueParseError); }
     let trimmed_val = value_str.trim();
-    if trimmed_val.is_empty() {
-        return Err(ArgParseError::ValueParseError);
-    }
+    if trimmed_val.is_empty() { return Err(ArgParseError::ValueParseError); }
 
-    // Heuristic for float: presence of '.'
     if trimmed_val.contains('.') {
         if let Ok(f_val) = trimmed_val.parse::<f32>() {
             return Ok(CommandArgValue::Float(f_val));
-        } else {
-            return Err(ArgParseError::ValueParseError); // Failed to parse as f32
+        }
+        // If it has a '.' but doesn't parse as f32, it will fall through to string.
+    }
+
+    if !trimmed_val.contains('.') { // Only try int/uint if no decimal point
+        if let Ok(i_val) = trimmed_val.parse::<i32>() {
+            return Ok(CommandArgValue::Integer(i_val));
+        }
+        if let Ok(u_val) = trimmed_val.parse::<u32>() {
+            return Ok(CommandArgValue::UInteger(u_val));
         }
     }
 
-    // Try parsing as i32 (allows negative integers)
-    if let Ok(i_val) = trimmed_val.parse::<i32>() {
-        return Ok(CommandArgValue::Integer(i_val));
-    }
-
-    // Try parsing as u32 (for positive integers, e.g. pin numbers, speeds)
-    if let Ok(u_val) = trimmed_val.parse::<u32>() {
-        return Ok(CommandArgValue::UInteger(u_val));
-    }
-
-    // If all numeric parsing fails, treat it as a string.
-    // Ensure it fits into our heapless::String.
-    match String::from_str(trimmed_val) {
+    match String::<MAX_STRING_ARG_LEN>::from_str(trimmed_val) {
         Ok(s) => Ok(CommandArgValue::String(s)),
-        Err(_) => Err(ArgParseError::ValueParseError), // Or a more specific "StringTooLong" or "InvalidString"
+        Err(_) => Err(ArgParseError::ValueParseError),
     }
 }
