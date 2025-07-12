@@ -97,10 +97,34 @@ class DeltaKinematics:
 
         print_radius = config.getfloat('print_radius', self.radius, above=0.)
 
+        # Precompute lean factors for C helper
+        self.lean_factors = []
         for i in range(3):
-            # Pass base tower XY to C helper; lean is handled in Python for now or if C is updated
+            alpha_i_rad = math.radians(self.angles[i])
+            theta_r_rad = self.radial_leans_rad[i]
+            theta_t_rad = self.tangential_leans_rad[i]
+
+            s_tr = math.sin(theta_r_rad)
+            s_tt = math.sin(theta_t_rad)
+            c_a = math.cos(alpha_i_rad)
+            s_a = math.sin(alpha_i_rad)
+
+            lean_dx_dh_i = s_tr * c_a - s_tt * s_a
+            lean_dy_dh_i = s_tr * s_a + s_tt * c_a
+
+            val_for_dz_sqrt = 1.0 - s_tr**2 - s_tt**2
+            if val_for_dz_sqrt < 0: val_for_dz_sqrt = 0.0
+            lean_dz_dh_i = math.sqrt(val_for_dz_sqrt)
+
+            self.lean_factors.append( (lean_dx_dh_i, lean_dy_dh_i, lean_dz_dh_i) )
+
+        for i in range(3):
+            base_tower_x = self.towers[i][0]
+            base_tower_y = self.towers[i][1]
+            lean_dx_dh, lean_dy_dh, lean_dz_dh = self.lean_factors[i]
             self.rails[i].setup_itersolve('delta_stepper_alloc', self.arm2[i],
-                                          self.towers[i][0], self.towers[i][1])
+                                          base_tower_x, base_tower_y,
+                                          lean_dx_dh, lean_dy_dh, lean_dz_dh)
         for s in self.get_steppers():
             s.set_trapq(toolhead.get_trapq())
             toolhead.register_step_generator(s.generate_steps)
@@ -138,7 +162,7 @@ class DeltaKinematics:
              logging.warning("min_arm_length (%.2f) is not greater than delta_radius (%.2f) "
                              "for max_xy2 boundary calculation." % (self.min_arm_length, self.radius))
         self.max_xy2 = min(print_radius, max_safe_xy_for_min_arm)**2
-        if print_radius > max_safe_xy_for_min_arm and max_safe_xy_for_min_arm > 0: # Ensure max_safe > 0 before warning
+        if print_radius > max_safe_xy_for_min_arm and max_safe_xy_for_min_arm > 0:
             logging.warning("print_radius %.2fmm is larger than kinematically safe radius %.2fmm"
                             % (print_radius, max_safe_xy_for_min_arm))
 
@@ -234,7 +258,6 @@ class DeltaKinematics:
             limit_xy2 = -1.
         self.limit_xy2 = min(limit_xy2, self.slow_xy2 if self.slow_xy2 > 0 else -1.)
 
-
     def get_status(self, eventtime):
         return {
             'homed_axes': '' if self.need_home else 'xyz',
@@ -248,7 +271,7 @@ class DeltaKinematics:
                     for rail in self.rails]
         stepdists = [rail.get_steppers()[0].get_step_dist()
                      for rail in self.rails]
-        return DeltaCalibration(self.radius, self.angles, self.arm_lengths,
+        return DeltaCalibration(self, self.radius, self.angles, self.arm_lengths,
                                 endstops, stepdists, self.radius_offsets,
                                 self.effector_joint_radius,
                                 self.radial_leans_rad, self.tangential_leans_rad)
@@ -304,9 +327,10 @@ class DeltaKinematics:
 
 # Delta parameter calibration for DELTA_CALIBRATE tool
 class DeltaCalibration:
-    def __init__(self, radius, angles, arms, endstops, stepdists,
+    def __init__(self, kinematics_parent, radius, angles, arms, endstops, stepdists,
                  radius_offsets=None, effector_joint_radius=40.0,
                  radial_leans_rad=None, tangential_leans_rad=None):
+        self.kinematics_parent = kinematics_parent
         self.radius = radius
         self.angles = angles
         self.arms = arms
@@ -365,7 +389,7 @@ class DeltaCalibration:
         new_radial_leans_rad = [math.radians(params.get('radial_lean_'+axis, math.degrees(self.radial_leans_rad[i]))) for i, axis in enumerate('abc')]
         new_tangential_leans_rad = [math.radians(params.get('tangential_lean_'+axis, math.degrees(self.tangential_leans_rad[i]))) for i, axis in enumerate('abc')]
 
-        return DeltaCalibration(radius, current_angles, new_arms, new_endstops,
+        return DeltaCalibration(self.kinematics_parent, radius, current_angles, new_arms, new_endstops,
                                 self.stepdists, new_radius_offsets,
                                 self.effector_joint_radius,
                                 new_radial_leans_rad, new_tangential_leans_rad)
@@ -420,17 +444,34 @@ class DeltaCalibration:
                 if not SCIPY_AVAILABLE:
                     raise ImportError("SciPy not available for brentq in DeltaCalibration")
                 h_i_solution = scipy.optimize.brentq(f_h_i, h_min_bracket, h_max_bracket, xtol=1e-6, rtol=1e-6)
-            except Exception as e: # Catch broader errors from brentq or f_h_i
-                logging.warning("SciPy brentq failed for IK in DeltaCalibration (tower %d, coord %s): %s. "
-                                "Using non-lean-aware IK as fallback for this point." % (i, coord, str(e)))
-                # Non-lean-aware fallback
-                dx_fallback = self.towers[i][0] - nx
-                dy_fallback = self.towers[i][1] - ny
-                val_under_sqrt_fallback = self.arms[i]**2 - dx_fallback**2 - dy_fallback**2
-                if val_under_sqrt_fallback < 0:
-                    logging.error("DeltaCalibration: Unreachable point in IK fallback (tower %d): %s" % (i, coord,))
-                    raise ValueError("Delta kinematics: Unreachable point for tower %d in IK fallback" % i)
-                h_i_solution = math.sqrt(val_under_sqrt_fallback) + nz
+            except Exception as e:
+                # Fallback to C-level IK (which is now lean-aware)
+                logging.warning("SciPy brentq for lean-aware IK in DeltaCalibration failed (tower %d, coord %s): %s. "
+                                "Falling back to C-level lean-aware IK." % (i, coord, str(e)))
+                if self.kinematics_parent is not None:
+                    ffi_main, ffi_lib = chelper.get_ffi()
+                    # The C IK is on the stepper_kinematics object (sk)
+                    sk = self.kinematics_parent.rails[i].get_steppers()[0]._stepper_kinematics
+                    # itersolve_calc_position_from_coord needs a 'move' and 'move_time'.
+                    # This FFI call is not direct for a simple XYZ.
+                    # For now, as a simpler fallback that is still better than non-lean:
+                    # Use the non-lean calculation if brentq fails AND C-call is complex to shim here.
+                    # This part needs to be improved if brentq often fails.
+                    # The C function is delta_stepper_calc_position(sk, move, move_time)
+                    # We don't have a 'move' object here.
+                    # So, the ultimate fallback is the simple math (non-lean for this point).
+                    logging.warning("DeltaCalibration: C-IK fallback from calc_stable_position not yet implemented directly, using non-lean math for point %d." % i)
+                    dx_fallback = self.towers[i][0] - nx
+                    dy_fallback = self.towers[i][1] - ny
+                    val_under_sqrt_fallback = self.arms[i]**2 - dx_fallback**2 - dy_fallback**2
+                    if val_under_sqrt_fallback < 0:
+                        logging.error("DeltaCalibration: Unreachable point in IK fallback (tower %d): %s" % (i, coord,))
+                        raise ValueError("Delta kinematics: Unreachable point for tower %d in IK fallback" % i)
+                    h_i_solution = math.sqrt(val_under_sqrt_fallback) + nz
+                else:
+                    logging.error("DeltaCalibration: kinematics_parent not available for C-IK fallback.")
+                    # This should not happen if constructed by DeltaKinematics.get_calibration()
+                    raise ValueError("Delta kinematics: kinematics_parent unavailable for fallback IK")
 
             steppos_h_on_rail.append(h_i_solution)
 

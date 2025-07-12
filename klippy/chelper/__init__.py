@@ -122,8 +122,9 @@ defs_kin_corexz = """
 """
 
 defs_kin_delta = """
-    struct stepper_kinematics *delta_stepper_alloc(double arm2
-        , double tower_x, double tower_y);
+    struct stepper_kinematics *delta_stepper_alloc(double arm2,
+        double base_tower_x, double base_tower_y,
+        double lean_dx_dh, double lean_dy_dh, double lean_dz_dh);
 """
 
 defs_kin_deltesian = """
