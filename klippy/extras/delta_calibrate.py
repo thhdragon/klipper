@@ -7,6 +7,13 @@ import math, logging, collections
 import mathutil
 from . import probe
 
+try:
+    import scipy.optimize
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+    logging.info("SciPy library not found, advanced delta calibration optimizer will be disabled if not installed.")
+
 # A "stable position" is a 3-tuple containing the number of steps
 # taken since hitting the endstop on each delta tower.  Delta
 # calibration uses this coordinate system because it allows a position
@@ -91,6 +98,20 @@ class DeltaCalibrate:
         self.probe_helper = probe.ProbePointsHelper(
             config, self.probe_finalize, default_points=points)
         self.probe_helper.minimum_points(3)
+
+        # Multi-Z probing heights
+        self.probe_z_heights = config.getfloatlist('probe_z_heights', None)
+        if self.probe_z_heights is None:
+            # Default to using the horizontal_move_z from the [probe] section,
+            # or a sensible default if that's not available.
+            # This will be resolved during actual probing cmd.
+            pass
+        elif len(self.probe_z_heights) > 1:
+            logging.info("Multi-Z height probing requested for DELTA_CALIBRATE. "
+                         "Full implementation of probing at multiple Z levels is pending.")
+            # For now, we'll just use the first Z height if multiple are given,
+            # until the probing loop is refactored.
+
         # Restore probe stable positions
         self.last_probe_positions = []
         for i in range(999):
@@ -154,50 +175,196 @@ class DeltaCalibrate:
                            "%.3f,%.3f,%.3f" % tuple(spos2))
     def probe_finalize(self, offsets, positions):
         # Convert positions into (z_offset, stable_position) pairs
-        z_offset = offsets[2]
-        kin = self.printer.lookup_object('toolhead').get_kinematics()
-        delta_params = kin.get_calibration()
-        probe_positions = [(z_offset, delta_params.calc_stable_position(p))
-                           for p in positions]
+        # offsets = (probe_x_offset, probe_y_offset, probe_z_offset_from_config)
+        # positions = list of (uncorrected_probe_tip_x, uncorrected_probe_tip_y, bed_z_at_that_xy)
+
+        probe_x_offset, probe_y_offset, probe_z_offset_config = offsets
+        toolhead = self.printer.lookup_object('toolhead')
+        kin = toolhead.get_kinematics()
+        delta_params = kin.get_calibration() # Current delta parameters
+
+        corrected_probe_positions_for_stable_calc = []
+        logging.info("Probe tilt compensation: Applying corrections...")
+
+        for i, (px_uncorrected, py_uncorrected, pz_bed) in enumerate(positions):
+            # Estimate nozzle XYZ at the moment of probe trigger
+            noz_x_at_trigger = px_uncorrected - probe_x_offset
+            noz_y_at_trigger = py_uncorrected - probe_y_offset
+            noz_z_at_trigger = pz_bed + probe_z_offset_config
+
+            nx, ny, nz = kin.get_effector_normal(noz_x_at_trigger, noz_y_at_trigger, noz_z_at_trigger)
+
+            x_displacement, y_displacement = 0.0, 0.0 # Initialize here
+            apply_tilt_xy_correction = True
+            # If probe_z_offset_config is very small (e.g. manual probing), skip XY correction part of tilt.
+            if abs(probe_z_offset_config) < 0.5: # Threshold for "negligible" Z offset, e.g., 0.5mm
+                apply_tilt_xy_correction = False
+                logging.debug(
+                    "Point %d: Probe Z offset (%.3f) is small, XY tilt correction heuristically skipped."
+                    % (i, probe_z_offset_config))
+
+            if apply_tilt_xy_correction and abs(nz) < 1e-6:
+                logging.warning("Probe tilt: Effector normal Z component is near zero (nz=%.3e) at point %d. Skipping XY tilt correction for this point." % (nz, i))
+                apply_tilt_xy_correction = False
+
+            if apply_tilt_xy_correction:
+                physical_probe_extension = -probe_z_offset_config
+                x_displacement = physical_probe_extension * (nx / nz)
+                y_displacement = physical_probe_extension * (ny / nz)
+                corrected_px = (noz_x_at_trigger + probe_x_offset) + x_displacement
+                corrected_py = (noz_y_at_trigger + probe_y_offset) + y_displacement
+            else:
+                # No XY correction applied (either due to small z_offset or vertical effector normal)
+                corrected_px = px_uncorrected
+                corrected_py = py_uncorrected
+
+            logging.debug(
+                "Point %d: Nozzle(%.3f,%.3f,%.3f) UncorrectedProbe(%.3f,%.3f) Normal(%.3f,%.3f,%.3f) Disp(%.4f,%.4f) CorrectedProbe(%.3f,%.3f)" %
+                (i, noz_x_at_trigger, noz_y_at_trigger, noz_z_at_trigger,
+                    px_uncorrected, py_uncorrected, nx, ny, nz,
+                    x_displacement, y_displacement, corrected_px, corrected_py))
+
+            corrected_probe_positions_for_stable_calc.append( (corrected_px, corrected_py, pz_bed) )
+
+        final_probe_data_for_calc = []
+        for (cpx, cpy, cpz_bed) in corrected_probe_positions_for_stable_calc:
+            stable_pos = delta_params.calc_stable_position( (cpx, cpy, cpz_bed) )
+            final_probe_data_for_calc.append( (cpz_bed, stable_pos) )
+
         # Perform analysis
-        self.calculate_params(probe_positions, self.last_distances)
+        self.calculate_params(final_probe_data_for_calc, self.last_distances)
+
     def calculate_params(self, probe_positions, distances):
         height_positions = self.manual_heights + probe_positions
+        if not height_positions:
+            self.gcode.respond_info("No probe positions available for calibration.")
+            return
+
         # Setup for coordinate descent analysis
-        kin = self.printer.lookup_object('toolhead').get_kinematics()
+        toolhead = self.printer.lookup_object('toolhead')
+        kin = toolhead.get_kinematics()
         orig_delta_params = odp = kin.get_calibration()
-        adj_params, params = odp.coordinate_descent_params(distances)
-        logging.info("Calculating delta_calibrate with:\n%s\n%s\n"
-                     "Initial delta_calibrate parameters: %s",
-                     height_positions, distances, params)
-        z_weight = 1.
-        if distances:
+        adj_params, params = odp.coordinate_descent_params(is_extended=True)
+
+        logging.info("Calculating delta_calibrate with %d height points and %d distance points."
+                     % (len(height_positions), len(distances)))
+        logging.info("Initial delta_calibrate parameters: %s" % (params,))
+        logging.info("Parameters to be adjusted: %s" % (adj_params,))
+
+        z_weight = 1.0
+        if distances and probe_positions:
             z_weight = len(distances) / (MEASURE_WEIGHT * len(probe_positions))
-        # Perform coordinate descent
-        def delta_errorfunc(params):
+        elif distances and not probe_positions:
+            z_weight = 0.0
+
+        def delta_errorfunc(current_iter_params_dict):
             try:
-                # Build new delta_params for params under test
-                delta_params = orig_delta_params.new_calibration(params)
-                getpos = delta_params.get_position_from_stable
-                # Calculate z height errors
+                temp_delta_params = orig_delta_params.new_calibration(current_iter_params_dict)
+                getpos = temp_delta_params.get_position_from_stable
                 total_error = 0.
-                for z_offset, stable_pos in height_positions:
-                    x, y, z = getpos(stable_pos)
-                    total_error += (z - z_offset)**2
-                total_error *= z_weight
-                # Calculate distance errors
-                for dist, stable_pos1, stable_pos2 in distances:
-                    x1, y1, z1 = getpos(stable_pos1)
-                    x2, y2, z2 = getpos(stable_pos2)
-                    d = math.sqrt((x1-x2)**2 + (y1-y2)**2 + (z1-z2)**2)
-                    total_error += (d - dist)**2
+                if height_positions:
+                    height_error_sum = 0.
+                    for z_offset, stable_pos in height_positions:
+                        x, y, z = getpos(stable_pos)
+                        height_error_sum += (z - z_offset)**2
+                    total_error += height_error_sum * z_weight
+                if distances:
+                    distance_error_sum = 0.
+                    for dist, stable_pos1, stable_pos2 in distances:
+                        x1, y1, z1 = getpos(stable_pos1)
+                        x2, y2, z2 = getpos(stable_pos2)
+                        d = math.sqrt((x1-x2)**2 + (y1-y2)**2 + (z1-z2)**2)
+                        distance_error_sum += (d - dist)**2
+                    total_error += distance_error_sum
                 return total_error
-            except ValueError:
-                return 9999999999999.9
-        new_params = mathutil.background_coordinate_descent(
-            self.printer, adj_params, params, delta_errorfunc)
+            except ValueError as e:
+                logging.debug("Math error in delta_errorfunc: %s with params %s" % (str(e), current_iter_params_dict))
+                return float('inf')
+            except Exception as e:
+                logging.exception("Unexpected error in delta_errorfunc with params %s" % (current_iter_params_dict,))
+                return float('inf')
+
+        if SCIPY_AVAILABLE:
+            initial_values = [params[key] for key in adj_params]
+            bounds = []
+            for key in adj_params:
+                if 'arm_' in key: bounds.append((50.0, None))
+                elif key == 'radius' and 'offset' not in key: bounds.append((50.0, None))
+                elif 'lean' in key: bounds.append((-5.0, 5.0)) # Degrees
+                else: bounds.append((None, None))
+
+            def objective_func_for_scipy(x_values_array):
+                current_iter_params_dict = dict(zip(adj_params, x_values_array))
+                full_params_for_iter = dict(params)
+                full_params_for_iter.update(current_iter_params_dict)
+                return delta_errorfunc(full_params_for_iter)
+
+            # Store initial error for comparison if SciPy fails badly
+            # Note: delta_errorfunc expects a full dict.
+            # Create a temporary full dict with initial values for this call.
+            initial_full_params_dict = dict(params)
+            for idx, key in enumerate(adj_params): # Ensure all adj_params are in initial_full_params_dict
+                initial_full_params_dict[key] = initial_values[idx]
+            initial_error_val = delta_errorfunc(initial_full_params_dict)
+            logging.info("Initial error before SciPy: %.3e" % initial_error_val)
+
+
+            logging.info("Attempting optimization with scipy.optimize.minimize (L-BFGS-B)...")
+            try:
+                opt_result = scipy.optimize.minimize(
+                    objective_func_for_scipy, initial_values, method='L-BFGS-B', bounds=bounds,
+                    options={'maxiter': 3000, 'disp': False, 'ftol': 1e-10, 'gtol': 1e-8, 'eps': 1e-9} )
+            except Exception as e:
+                logging.error("SciPy L-BFGS-B optimization threw an exception: %s" % str(e))
+                opt_result = scipy.optimize.OptimizeResult({'success': False, 'message': str(e), 'fun': initial_error_val, 'x': initial_values, 'nit':0, 'nfev':0})
+
+            if opt_result.success:
+                logging.info("SciPy L-BFGS-B optimization successful. Final error: %.3e, Iterations: %d, FuncEvals: %d",
+                             opt_result.fun, getattr(opt_result, 'nit', -1), getattr(opt_result, 'nfev', -1))
+                final_param_values = opt_result.x
+                new_params_dict = dict(zip(adj_params, final_param_values))
+                final_params_for_klipper = dict(params)
+                final_params_for_klipper.update(new_params_dict)
+                new_params = final_params_for_klipper
+            else:
+                logging.warning("SciPy L-BFGS-B optimization failed or did not converge: %s. Trying Nelder-Mead...", opt_result.message)
+                try:
+                    opt_result_nm = scipy.optimize.minimize(
+                        objective_func_for_scipy, initial_values, method='Nelder-Mead',
+                        options={'maxiter': 20000, 'disp': False, 'xatol': 1e-6, 'fatol': 1e-8} )
+                except Exception as e:
+                    logging.error("SciPy Nelder-Mead optimization threw an exception: %s" % str(e))
+                    opt_result_nm = scipy.optimize.OptimizeResult({'success': False, 'message': str(e), 'fun': initial_error_val, 'x': initial_values, 'nit':0, 'nfev':0})
+
+                if opt_result_nm.success:
+                    logging.info("SciPy Nelder-Mead optimization successful. Final error: %.3e, Iterations: %d, FuncEvals: %d",
+                                 opt_result_nm.fun, getattr(opt_result_nm, 'nit', -1), getattr(opt_result_nm, 'nfev', -1))
+                    final_param_values = opt_result_nm.x
+                    new_params_dict = dict(zip(adj_params, final_param_values))
+                    final_params_for_klipper = dict(params)
+                    final_params_for_klipper.update(new_params_dict)
+                    new_params = final_params_for_klipper
+                else:
+                    logging.error("SciPy Nelder-Mead optimization also failed: %s.", opt_result_nm.message)
+                    current_best_fun = opt_result.fun if hasattr(opt_result, 'fun') else initial_error_val
+                    if hasattr(opt_result, 'x') and current_best_fun < initial_error_val :
+                        logging.warning("Falling back to L-BFGS-B result as it was better or Nelder-Mead failed critically.")
+                        final_param_values = opt_result.x
+                        new_params_dict = dict(zip(adj_params, final_param_values))
+                        final_params_for_klipper = dict(params)
+                        final_params_for_klipper.update(new_params_dict)
+                        new_params = final_params_for_klipper
+                    else:
+                        logging.error("All SciPy optimization attempts failed or did not improve significantly. Reverting to initial parameters for safety.")
+                        new_params = dict(params)
+        else:
+            logging.warning("SciPy library not available. Using existing coordinate descent optimizer."
+                            " This may be less effective for the full parameter set including tower leans.")
+            new_params = mathutil.background_coordinate_descent(
+                self.printer, adj_params, params, delta_errorfunc)
+
         # Log and report results
-        logging.info("Calculated delta_calibrate parameters: %s", new_params)
+        logging.info("Final Calculated delta_calibrate parameters: %s", new_params)
         new_delta_params = orig_delta_params.new_calibration(new_params)
         for z_offset, spos in height_positions:
             logging.info("height orig: %.6f new: %.6f goal: %.6f",

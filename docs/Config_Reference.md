@@ -284,6 +284,13 @@ delta_radius:
 #   axis towers. This parameter may also be calculated as:
 #    delta_radius = smooth_rod_offset - effector_offset - carriage_offset
 #   This parameter must be provided.
+#delta_effector_radius: 40.0
+#   The distance (in mm) from the nozzle tip to the center of the
+#   effector's arm joints (eg, U-joints or ball bearings), measured
+#   in the plane of the effector. This value is important for accurate
+#   probe tilt compensation. If not specified, a default of 40.0mm is
+#   used along with a warning. It is recommended to measure this from
+#   your specific effector and set it.
 #print_radius:
 #   The radius (in mm) of valid toolhead XY coordinates. One may use
 #   this setting to customize the range checking of toolhead moves. If
@@ -311,6 +318,22 @@ arm_length:
 #   This option specifies the angle (in degrees) that the tower is
 #   at. The default is 210 for stepper_a, 330 for stepper_b, and 90
 #   for stepper_c.
+#delta_radius_offset: 0.0
+#   A per-tower offset (in mm) to be added to the global 'delta_radius'
+#   when calculating this tower's effective radial position. This allows
+#   calibration to account for slight differences in actual tower radii.
+#   The default is 0.0.
+#radial_lean: 0.0
+#   The angle (in degrees) that this tower leans along its radial line
+#   from the printer center. Positive values indicate the tower leans
+#   outwards from the center. This parameter helps compensate for towers
+#   that are not perfectly vertical. The default is 0.0.
+#tangential_lean: 0.0
+#   The angle (in degrees) that this tower leans tangentially
+#   (perpendicular to its radial line). Positive values indicate lean
+#   in the counter-clockwise (CCW) direction when viewed from above.
+#   This parameter also helps compensate for non-vertical towers.
+#   The default is 0.0.
 
 # The stepper_b section describes the stepper controlling the front
 # right tower (at 330 degrees).

@@ -19,3 +19,5 @@ python-can==3.3.4
 setuptools==78.1.1 ; python_version >= '3.12' # Needed by python-can
 # msgspec is an optional dependency of webhooks.py
 msgspec==0.19.0 ; python_version >= '3.9'
+# scipy is used for advanced optimization in delta_calibrate.py
+scipy>=1.9.0

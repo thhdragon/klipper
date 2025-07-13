@@ -1,6 +1,6 @@
 # Test case for basic movement on delta printers
 CONFIG delta_calibrate.cfg
-DICTIONARY atmega2560.dict
+DICTIONARY klippy/chelper/atmega2560.dict
 
 # Start by homing the printer.
 G28

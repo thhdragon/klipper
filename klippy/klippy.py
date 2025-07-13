@@ -1,4 +1,4 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python3
 # Main code for host side printer firmware
 #
 # Copyright (C) 2016-2024  Kevin O'Connor <kevin@koconnor.net>
@@ -295,6 +295,9 @@ def main():
         start_args['gcode_fd'] = util.create_pty(options.inputtty)
     if options.debugoutput:
         start_args['debugoutput'] = options.debugoutput
+        # Ensure options.dictionary is at least an empty dict if None
+        if options.dictionary is None:
+            options.dictionary = {}
         start_args.update(options.dictionary)
     bglogger = None
     if options.logfile:

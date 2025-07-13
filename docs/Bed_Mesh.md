@@ -580,8 +580,13 @@ gcode:
 
 `BED_MESH_OUTPUT PGP=[0 | 1]`
 
-Outputs the current mesh state to the terminal.  Note that the mesh itself
-is output
+Outputs the current mesh state to the terminal. When `PGP=0` (the default),
+the command first prints metadata about the mesh (dimensions, algorithm, etc.)
+followed by the Z-values of the interpolated mesh. For circular beds defined
+with `mesh_radius`, points outside the circle (which are part of an internal
+rectangular representation) will be output with a Z-value of "nan". This helps
+visualization tools correctly render the circular shape. Each data point is
+output in the format: `Bed X: X.XXX Y: Y.YYY Z: Z.ZZZZZZ` (or `nan` for Z).
 
 The PGP parameter is shorthand for "Print Generated Points".  If `PGP=1` is
 set, the generated probed points will be output to the terminal:

@@ -11,15 +11,25 @@ OUT=out/
 export KCONFIG_CONFIG     := $(CURDIR)/.config
 -include $(KCONFIG_CONFIG)
 
-# Common command definitions
-CC=$(CROSS_PREFIX)gcc
-AS=$(CROSS_PREFIX)as
-LD=$(CROSS_PREFIX)ld
-OBJCOPY=$(CROSS_PREFIX)objcopy
-OBJDUMP=$(CROSS_PREFIX)objdump
-STRIP=$(CROSS_PREFIX)strip
-CPP=cpp
-PYTHON=python3
+# Common command definitions moved after KCONFIG_CONFIG include
+ifeq ($(CONFIG_MACH_AVR),y)
+CC:=avr-gcc
+AS:=avr-as
+LD:=avr-ld
+OBJCOPY:=avr-objcopy
+OBJDUMP:=avr-objdump
+STRIP:=avr-strip
+else
+# Default/Host compiler if not AVR (or other cross-compile targets)
+CC:=gcc
+AS:=as
+LD:=ld
+OBJCOPY:=objcopy
+OBJDUMP:=objdump
+STRIP:=strip
+endif
+CPP:=cpp
+PYTHON:=python3
 
 # Source files
 src-y =
@@ -35,7 +45,12 @@ CFLAGS := -iquote $(OUT) -iquote src -iquote $(OUT)board-generic/ \
     -ffunction-sections -fdata-sections -fno-delete-null-pointer-checks
 CFLAGS += -flto=auto -fwhole-program -fno-use-linker-plugin -ggdb3
 
-OBJS_klipper.elf = $(patsubst %.c, $(OUT)src/%.o,$(src-y))
+ifeq ($(CONFIG_MACH_AVR),y)
+MCU_NAME_FOR_MAKE := $(patsubst "%",%,$(CONFIG_MCU))
+CFLAGS += -mmcu=$(MCU_NAME_FOR_MAKE) -DF_CPU=$(CONFIG_CLOCK_FREQ)
+endif
+
+OBJS_klipper.elf = $(patsubst %.c, $(OUT)src/%.o,$(sort $(src-y)))
 OBJS_klipper.elf += $(OUT)compile_time_request.o
 CFLAGS_klipper.elf = $(CFLAGS) -Wl,--gc-sections
 
@@ -58,10 +73,30 @@ endif
 include src/Makefile
 -include src/$(patsubst "%",%,$(CONFIG_BOARD_DIRECTORY))/Makefile
 
+# Explicitly add linux/main.c if CONFIG_MACH_LINUX is set, to ensure main() is found
+# This is a diagnostic step / workaround if src/linux/Makefile isn't populating src-y correctly.
+ifeq ($(CONFIG_MACH_LINUX),y)
+src-y += linux/main.c linux/timer.c linux/console.c linux/watchdog.c \
+         linux/pca9685.c linux/spidev.c linux/analog.c linux/hard_pwm.c \
+         linux/i2c.c linux/gpio.c generic/crc16_ccitt.c generic/alloc.c \
+         linux/sensor_ds18b20.c
+endif
+
+# AVR specific sources
+ifeq ($(CONFIG_MACH_AVR),y)
+src-y += avr/main.c avr/timer.c avr/gpio.c avr/adc.c avr/spi.c avr/i2c.c \
+         avr/hard_pwm.c avr/watchdog.c avr/serial.c generic/serial_irq.c
+src-y += $(if $(filter y,$(CONFIG_USBSTD_SERIAL)),avr/usbserial.c)
+endif
+
+# Workaround for CONFIG_HAVE_GPIO based sources
+src-y += $(if $(filter y,$(CONFIG_HAVE_GPIO)),initial_pins.c gpiocmds.c stepper.c endstop.c trsync.c)
+
 ################ Main build rules
 
 $(OUT)%.o: %.c $(OUT)autoconf.h
 	@echo "  Compiling $@"
+	$(Q)mkdir -p $(dir $@)
 	$(Q)$(CC) $(CFLAGS) -c $< -o $@
 
 $(OUT)%.ld: %.lds.S $(OUT)autoconf.h
@@ -80,8 +115,8 @@ $(OUT)%.o.ctr: $(OUT)%.o
 
 $(OUT)compile_time_request.o: $(patsubst %.c, $(OUT)src/%.o.ctr,$(src-y)) ./scripts/buildcommands.py
 	@echo "  Building $@"
-	$(Q)cat $(patsubst %.c, $(OUT)src/%.o.ctr,$(src-y)) | tr -s '\0' '\n' > $(OUT)compile_time_request.txt
-	$(Q)$(PYTHON) ./scripts/buildcommands.py -d $(OUT)klipper.dict -t "$(CC);$(AS);$(LD);$(OBJCOPY);$(OBJDUMP);$(STRIP)" $(OUT)compile_time_request.txt $(OUT)compile_time_request.c
+	$(Q)cat $(patsubst %.c, $(OUT)src/%.o.ctr,$(sort $(src-y))) | tr -s '\0' '\n' > $(OUT)compile_time_request.txt
+	$(Q)$(PYTHON) ./scripts/buildcommands.py -d klippy/chelper/atmega2560.dict -t "$(CC);$(AS);$(LD);$(OBJCOPY);$(OBJDUMP);$(STRIP)" $(OUT)compile_time_request.txt $(OUT)compile_time_request.c
 	$(Q)$(CC) $(CFLAGS) -c $(OUT)compile_time_request.c -o $@
 
 ################ Auto generation of "board/" include file link
