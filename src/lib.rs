@@ -41,6 +41,9 @@ pub mod endstop;
 // --- Motion Queue ---
 pub mod move_queue;
 
+// --- TMC Stepper Drivers ---
+pub mod tmc2209;
+
 
 // --- Global/shared items can be re-exported if needed ---
 // pub use stepper::Stepper; // Example
