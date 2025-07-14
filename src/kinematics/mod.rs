@@ -1,4 +1,6 @@
 // src/kinematics/mod.rs
+
+pub mod cartesian;
 // Main module for kinematics.
 #![cfg_attr(not(test), no_std)]
 

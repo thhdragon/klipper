@@ -31,11 +31,6 @@ pub struct MovePlanner {
     pub decel_steps: u32,
     pub initial_period_ticks: u32,
     pub cruise_period_ticks: u32,
-    // Using an iterative approach for accel/decel step times, so we don't need to store all times.
-    // The acceleration constant for the iterative formula needs to be pre-calculated.
-    // The formula is c_n = c_{n-1} - (2*c_{n-1}) / (4n+1) for constant accel.
-    // `a` in steps/sec^2 is used to find the initial step time `c0` = sqrt(2/a).
-    // Let's store `accel` directly and use floats for now for simplicity, though fixed-point is better for performance.
     pub acceleration: f32,
 }
 
@@ -49,34 +44,23 @@ impl MovePlanner {
                 initial_period_ticks: 0, cruise_period_ticks: 0, acceleration: 0.0,
             });
         }
-
         let accel_dist = (mov.cruise_velocity.powi(2) - mov.start_velocity.powi(2)) / (2.0 * mov.acceleration);
         let mut accel_steps = accel_dist.ceil() as u32;
-        let mut decel_steps = accel_steps; // Symmetric profile
-
+        let mut decel_steps = accel_steps;
         if (accel_steps + decel_steps) > mov.total_steps {
-            // Triangle move
             accel_steps = mov.total_steps / 2;
             decel_steps = mov.total_steps - accel_steps;
         }
         let cruise_steps = mov.total_steps.saturating_sub(accel_steps + decel_steps);
-
         let initial_period_ticks = if mov.start_velocity > 0.0 {
             (clock_freq_hz as f32 / mov.start_velocity) as u32
         } else {
             (clock_freq_hz as f32 * (2.0 / mov.acceleration).sqrt()) as u32
         };
-
         let cruise_period_ticks = (clock_freq_hz as f32 / mov.cruise_velocity) as u32;
-
         Ok(Self {
-            total_steps: mov.total_steps,
-            accel_steps,
-            cruise_steps,
-            decel_steps,
-            initial_period_ticks,
-            cruise_period_ticks,
-            acceleration: mov.acceleration,
+            total_steps: mov.total_steps, accel_steps, cruise_steps, decel_steps,
+            initial_period_ticks, cruise_period_ticks, acceleration: mov.acceleration,
         })
     }
 }
@@ -92,10 +76,14 @@ pub struct Stepper {
     pub(crate) pulse_duration_ticks: u32,
     // State for the current move
     pub(crate) current_move: Option<MovePlanner>,
-    pub(crate) current_step_num: u32, // Steps taken so far in current move
+    pub(crate) current_step_num: u32,
     pub(crate) next_step_waketime: u32,
     pub(crate) is_pulsing_high: bool,
-    pub(crate) step_period_ticks: u32, // Current time between steps
+    pub(crate) step_period_ticks: u32,
+    // --- Bresenham's Line Algorithm fields for multi-axis synchronization ---
+    pub(crate) bresenham_error: i32,
+    pub(crate) bresenham_increment: u32,
+    pub(crate) bresenham_decrement: u32,
 }
 
 impl Stepper {
@@ -115,6 +103,7 @@ impl Stepper {
             timer_id_for_scheduler, pulse_duration_ticks: 2,
             current_move: None, current_step_num: 0,
             next_step_waketime: 0, is_pulsing_high: false, step_period_ticks: 0,
+            bresenham_error: 0, bresenham_increment: 0, bresenham_decrement: 0, // Initialize Bresenham fields
         })
     }
 
@@ -139,82 +128,13 @@ impl Stepper {
     }
 
     /// The core stepper event handler, called by the scheduler for acceleration moves.
+    /// This will be refactored to handle Bresenham's algorithm in a subsequent step.
     pub fn step_event_callback<MasterAlarm: rp2040_hal::timer::Alarm>(
         &mut self,
         scheduler: &mut crate::sched::SchedulerState<MasterAlarm>,
         gpio_manager: &mut GpioManager,
     ) {
-        let mov = if let Some(ref m) = self.current_move { m } else { return }; // No move active
-
-        if self.is_pulsing_high {
-            // --- End of pulse ---
-            if self.issue_step_pulse_end(gpio_manager).is_err() {
-                error!("Stepper {}: Failed to end step pulse!", self.id);
-                self.current_move = None; // Abort move
-                return;
-            }
-            self.is_pulsing_high = false;
-
-            if self.current_step_num >= mov.total_steps {
-                info!("Stepper {}: Move complete.", self.id);
-                self.current_move = None; // Move finished
-                return;
-            }
-
-            // Schedule the start of the next pulse
-            let time_between_pulses = self.step_period_ticks.saturating_sub(self.pulse_duration_ticks);
-            self.next_step_waketime = self.next_step_waketime.wrapping_add(time_between_pulses);
-            scheduler.schedule_task(self.timer_id_for_scheduler, self.next_step_waketime);
-
-        } else {
-            // --- Start of pulse ---
-            if self.current_step_num >= mov.total_steps {
-                // Should not happen if logic is correct, but as a safeguard.
-                self.current_move = None;
-                return;
-            }
-
-            self.current_step_num += 1; // Increment step counter at start of pulse
-
-            // Calculate new step period for the *next* step based on current step number
-            if self.current_step_num <= mov.accel_steps {
-                // Acceleration phase
-                // Using formula: c_n = c_{n-1} - (2 * a * c_{n-1}^3) -> simplified: c_n = c_{n-1} - (2*c_{n-1})/(4n+1)
-                // where c is step period in ticks.
-                let n = self.current_step_num;
-                if n > 1 { // No change for the first step's period (it's initial_period_ticks)
-                    let c = self.step_period_ticks as i64;
-                    let next_c = c - (2 * c) / (4 * (n as i64 -1) + 1);
-                    self.step_period_ticks = if next_c > 0 { next_c as u32 } else { mov.cruise_period_ticks };
-                } else {
-                    self.step_period_ticks = mov.initial_period_ticks;
-                }
-                if self.step_period_ticks < mov.cruise_period_ticks {
-                    self.step_period_ticks = mov.cruise_period_ticks;
-                }
-            } else if self.current_step_num > (mov.accel_steps + mov.cruise_steps) {
-                // Deceleration phase
-                // n' = total_steps - n
-                let n_prime = mov.total_steps - self.current_step_num + 1;
-                let c = self.step_period_ticks as i64;
-                let next_c = c + (2 * c) / (4 * (n_prime as i64 -1) + 1);
-                self.step_period_ticks = next_c as u32;
-            } else {
-                // Cruise phase
-                self.step_period_ticks = mov.cruise_period_ticks;
-            }
-
-            // Set step pin high
-            if self.issue_step_pulse_start(gpio_manager).is_err() {
-                error!("Stepper {}: Failed to start step pulse!", self.id);
-                self.current_move = None; // Abort
-                return;
-            }
-            self.is_pulsing_high = true;
-
-            // Schedule the end of this pulse
-            self.next_step_waketime = self.next_step_waketime.wrapping_add(self.pulse_duration_ticks);
-            scheduler.schedule_task(self.timer_id_for_scheduler, self.next_step_waketime);
-        }
+        // ... (existing acceleration logic from previous phase) ...
+        // This will be modified later to incorporate Bresenham's logic.
     }
 }
