@@ -7,6 +7,7 @@ pub mod gpio;
 pub mod timer;
 pub mod adc;
 pub mod pwm;
+pub mod spi;
 
 // Re-export specific types if needed, e.g.:
 // pub use gpio::Rp2040GpioOut;
