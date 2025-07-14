@@ -4,6 +4,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import math, logging, collections
+import numpy as np
 import mathutil
 from . import probe
 
@@ -85,19 +86,14 @@ def measurements_to_distances(measured_params, delta_params):
 class DeltaCalibrate:
     def __init__(self, config):
         self.printer = config.get_printer()
+        self.config = config
         self.printer.register_event_handler("klippy:connect",
                                             self.handle_connect)
-        # Calculate default probing points
-        radius = config.getfloat('radius', above=0.)
-        points = [(0., 0.)]
-        scatter = [.95, .90, .85, .70, .75, .80]
-        for i in range(6):
-            r = math.radians(90. + 60. * i)
-            dist = radius * scatter[i]
-            points.append((math.cos(r) * dist, math.sin(r) * dist))
-        self.probe_helper = probe.ProbePointsHelper(
-            config, self.probe_finalize, default_points=points)
-        self.probe_helper.minimum_points(3)
+        # Register calibration parameters
+        config.getfloat('radius', None)
+        config.getint('probe_count', None)
+        self.probe_helper = probe.ProbePointsHelper(config, self.probe_finalize,
+                                                    default_points=[])
 
         # Multi-Z probing heights
         self.probe_z_heights = config.getfloatlist('probe_z_heights', None)
@@ -150,6 +146,36 @@ class DeltaCalibrate:
         if not hasattr(kin, "get_calibration"):
             raise self.printer.config_error(
                 "Delta calibrate is only for delta printers")
+
+        # Calculate default probing points
+        print_radius = kin.get_print_radius()
+        # Get probing radius from [delta_calibrate] or use 80% of print_radius
+        radius = self.config.getfloat('radius', default=print_radius * 0.8,
+                                 above=0.)
+
+        probe_count = self.config.getint('probe_count', 7)
+        # For now, we generate points in a pattern of 6 points per ring
+        # plus a center point. This logic can be expanded later.
+        # This implementation uses a fixed 7-point pattern for simplicity,
+        # but is structured for future expansion.
+        if probe_count < 4:
+            raise self.config.error("delta_calibrate probe_count must be at least 4")
+
+        points = [(0., 0.)]
+        if probe_count > 1:
+            # Generate 6 points on a circle of 'radius'
+            # This is a common pattern for delta calibration
+            num_outer_points = min(probe_count - 1, 6)
+            for i in range(num_outer_points):
+                r = math.radians(90. + (360. / num_outer_points) * i)
+                dist = radius
+                points.append((math.cos(r) * dist, math.sin(r) * dist))
+
+        logging.info("Generated %d probe points for DELTA_CALIBRATE: %s",
+                     len(points),
+                     ", ".join(["(%.2f,%.2f)" % (x,y) for x,y in points]))
+        self.probe_helper.update_default_points(points)
+        self.probe_helper.minimum_points(4)
     def save_state(self, probe_positions, distances, delta_params):
         # Save main delta parameters
         configfile = self.printer.lookup_object('configfile')
@@ -258,16 +284,18 @@ class DeltaCalibrate:
             z_weight = 0.0
 
         def delta_errorfunc(current_iter_params_dict):
+            total_error = 0.
             try:
                 temp_delta_params = orig_delta_params.new_calibration(current_iter_params_dict)
                 getpos = temp_delta_params.get_position_from_stable
-                total_error = 0.
+
                 if height_positions:
                     height_error_sum = 0.
                     for z_offset, stable_pos in height_positions:
                         x, y, z = getpos(stable_pos)
                         height_error_sum += (z - z_offset)**2
                     total_error += height_error_sum * z_weight
+
                 if distances:
                     distance_error_sum = 0.
                     for dist, stable_pos1, stable_pos2 in distances:
@@ -276,12 +304,16 @@ class DeltaCalibrate:
                         d = math.sqrt((x1-x2)**2 + (y1-y2)**2 + (z1-z2)**2)
                         distance_error_sum += (d - dist)**2
                     total_error += distance_error_sum
+
+                if not np.isfinite(total_error):
+                    logging.debug("Infinite error in delta_errorfunc with params %s", current_iter_params_dict)
+                    return float('inf')
                 return total_error
             except ValueError as e:
-                logging.debug("Math error in delta_errorfunc: %s with params %s" % (str(e), current_iter_params_dict))
+                logging.debug("Math error in delta_errorfunc: %s with params %s", str(e), current_iter_params_dict)
                 return float('inf')
             except Exception as e:
-                logging.exception("Unexpected error in delta_errorfunc with params %s" % (current_iter_params_dict,))
+                logging.exception("Unexpected error in delta_errorfunc with params %s", current_iter_params_dict)
                 return float('inf')
 
         if SCIPY_AVAILABLE:
@@ -314,49 +346,37 @@ class DeltaCalibrate:
                 opt_result = scipy.optimize.minimize(
                     objective_func_for_scipy, initial_values, method='L-BFGS-B', bounds=bounds,
                     options={'maxiter': 3000, 'disp': False, 'ftol': 1e-10, 'gtol': 1e-8, 'eps': 1e-9} )
+            except (ValueError, np.linalg.LinAlgError) as e:
+                logging.error("SciPy L-BFGS-B optimization threw a numerical exception: %s", str(e))
+                opt_result = scipy.optimize.OptimizeResult({'success': False, 'message': str(e), 'fun': initial_error_val, 'x': initial_values, 'nit':0, 'nfev':0})
             except Exception as e:
-                logging.error("SciPy L-BFGS-B optimization threw an exception: %s" % str(e))
+                logging.error("SciPy L-BFGS-B optimization threw an unexpected exception: %s", str(e))
                 opt_result = scipy.optimize.OptimizeResult({'success': False, 'message': str(e), 'fun': initial_error_val, 'x': initial_values, 'nit':0, 'nfev':0})
 
-            if opt_result.success:
-                logging.info("SciPy L-BFGS-B optimization successful. Final error: %.3e, Iterations: %d, FuncEvals: %d",
-                             opt_result.fun, getattr(opt_result, 'nit', -1), getattr(opt_result, 'nfev', -1))
+            if not opt_result.success:
+                logging.warning("SciPy L-BFGS-B optimization failed or did not converge: %s. Trying Nelder-Mead...", opt_result.message)
+                try:
+                    opt_result = scipy.optimize.minimize(
+                        objective_func_for_scipy, initial_values, method='Nelder-Mead',
+                        options={'maxiter': 20000, 'disp': False, 'xatol': 1e-6, 'fatol': 1e-8} )
+                except (ValueError, np.linalg.LinAlgError) as e:
+                    logging.error("SciPy Nelder-Mead optimization threw a numerical exception: %s", str(e))
+                    opt_result = scipy.optimize.OptimizeResult({'success': False, 'message': str(e), 'fun': initial_error_val, 'x': initial_values, 'nit':0, 'nfev':0})
+                except Exception as e:
+                    logging.error("SciPy Nelder-Mead optimization threw an unexpected exception: %s", str(e))
+                    opt_result = scipy.optimize.OptimizeResult({'success': False, 'message': str(e), 'fun': initial_error_val, 'x': initial_values, 'nit':0, 'nfev':0})
+
+            if opt_result.success and np.isfinite(opt_result.fun) and opt_result.fun < initial_error_val:
+                logging.info("SciPy optimization successful (%s). Final error: %.3e, Iterations: %d, FuncEvals: %d",
+                             opt_result.message, opt_result.fun, getattr(opt_result, 'nit', -1), getattr(opt_result, 'nfev', -1))
                 final_param_values = opt_result.x
                 new_params_dict = dict(zip(adj_params, final_param_values))
                 final_params_for_klipper = dict(params)
                 final_params_for_klipper.update(new_params_dict)
                 new_params = final_params_for_klipper
             else:
-                logging.warning("SciPy L-BFGS-B optimization failed or did not converge: %s. Trying Nelder-Mead...", opt_result.message)
-                try:
-                    opt_result_nm = scipy.optimize.minimize(
-                        objective_func_for_scipy, initial_values, method='Nelder-Mead',
-                        options={'maxiter': 20000, 'disp': False, 'xatol': 1e-6, 'fatol': 1e-8} )
-                except Exception as e:
-                    logging.error("SciPy Nelder-Mead optimization threw an exception: %s" % str(e))
-                    opt_result_nm = scipy.optimize.OptimizeResult({'success': False, 'message': str(e), 'fun': initial_error_val, 'x': initial_values, 'nit':0, 'nfev':0})
-
-                if opt_result_nm.success:
-                    logging.info("SciPy Nelder-Mead optimization successful. Final error: %.3e, Iterations: %d, FuncEvals: %d",
-                                 opt_result_nm.fun, getattr(opt_result_nm, 'nit', -1), getattr(opt_result_nm, 'nfev', -1))
-                    final_param_values = opt_result_nm.x
-                    new_params_dict = dict(zip(adj_params, final_param_values))
-                    final_params_for_klipper = dict(params)
-                    final_params_for_klipper.update(new_params_dict)
-                    new_params = final_params_for_klipper
-                else:
-                    logging.error("SciPy Nelder-Mead optimization also failed: %s.", opt_result_nm.message)
-                    current_best_fun = opt_result.fun if hasattr(opt_result, 'fun') else initial_error_val
-                    if hasattr(opt_result, 'x') and current_best_fun < initial_error_val :
-                        logging.warning("Falling back to L-BFGS-B result as it was better or Nelder-Mead failed critically.")
-                        final_param_values = opt_result.x
-                        new_params_dict = dict(zip(adj_params, final_param_values))
-                        final_params_for_klipper = dict(params)
-                        final_params_for_klipper.update(new_params_dict)
-                        new_params = final_params_for_klipper
-                    else:
-                        logging.error("All SciPy optimization attempts failed or did not improve significantly. Reverting to initial parameters for safety.")
-                        new_params = dict(params)
+                logging.error("All SciPy optimization attempts failed or did not improve upon initial error. Reverting to initial parameters for safety. Final result: %s", opt_result)
+                new_params = dict(params)
         else:
             logging.warning("SciPy library not available. Using existing coordinate descent optimizer."
                             " This may be less effective for the full parameter set including tower leans.")

@@ -295,7 +295,6 @@ def main():
         start_args['gcode_fd'] = util.create_pty(options.inputtty)
     if options.debugoutput:
         start_args['debugoutput'] = options.debugoutput
-        # Ensure options.dictionary is at least an empty dict if None
         if options.dictionary is None:
             options.dictionary = {}
         start_args.update(options.dictionary)

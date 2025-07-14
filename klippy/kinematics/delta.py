@@ -92,7 +92,11 @@ class DeltaKinematics:
             rail_homing_pos = self.rails[i].get_homing_info().position_endstop
             eff_radius_i = self.radius + self.radius_offsets[i]
             val_under_sqrt = self.arm_lengths[i]**2 - eff_radius_i**2
-            if val_under_sqrt < 0: val_under_sqrt = 0 # Avoid math domain error
+            if val_under_sqrt < 0:
+                raise config.error(
+                    "Error in delta init: Arm length %.3f for stepper %s is "
+                    "too short for its effective delta radius %.3f." % (
+                        self.arm_lengths[i], chr(ord('a') + i), eff_radius_i))
             self.abs_endstops.append(rail_homing_pos + math.sqrt(val_under_sqrt))
 
         print_radius = config.getfloat('print_radius', self.radius, above=0.)
@@ -190,7 +194,14 @@ class DeltaKinematics:
         eff_carriage_y = B_iy + h_i * (math.sin(theta_r_rad) * math.sin(alpha_i_rad)
                                      + math.sin(theta_t_rad) * math.cos(alpha_i_rad))
         val_under_sqrt_z = 1.0 - math.sin(theta_r_rad)**2 - math.sin(theta_t_rad)**2
-        eff_carriage_z = h_i * math.sqrt(max(0.0, val_under_sqrt_z))
+        if val_under_sqrt_z < 0:
+            # This should not happen with valid lean angles, but as a safeguard:
+            logging.warning(
+                "Delta kinematics: Invalid lean angles for tower %d resulted "
+                "in a negative value under sqrt for Z calculation."
+                % (tower_index,))
+            val_under_sqrt_z = 0.0
+        eff_carriage_z = h_i * math.sqrt(val_under_sqrt_z)
         return eff_carriage_x, eff_carriage_y, eff_carriage_z
 
     def _actuator_to_cartesian(self, spos): # spos are carriage heights on rail
@@ -198,7 +209,14 @@ class DeltaKinematics:
         for i in range(3):
             eff_x, eff_y, eff_z = self._get_effective_tower_xy_and_z(i, spos[i])
             sphere_coords.append( (eff_x, eff_y, eff_z) )
-        return mathutil.trilateration(sphere_coords, self.arm2)
+        try:
+            return mathutil.trilateration(sphere_coords, self.arm2)
+        except ValueError as e:
+            logging.warning("Delta _actuator_to_cartesian: Failed to trilaterate."
+                            " sphere_coords=%s, arm2=%s. Error: %s",
+                            sphere_coords, self.arm2, e)
+            # Fallback to a zero position to avoid crashing Klipper
+            return (0., 0., 0.)
 
     def calc_position(self, stepper_positions):
         spos = [stepper_positions[rail.get_name()] for rail in self.rails]
@@ -220,7 +238,14 @@ class DeltaKinematics:
         homing_state.set_axes([0, 1, 2])
         forcepos = list(self.home_position)
         val_under_sqrt = max(self.arm2) - self.max_xy2
-        if val_under_sqrt < 0: val_under_sqrt = 0.0
+        if val_under_sqrt < 0:
+            # This case should ideally be caught by the max_xy2 calculation
+            # in __init__, but as a safeguard:
+            logging.warning(
+                "Delta home: max_xy2 (%.3f) is larger than max(arm2) (%.3f),"
+                " which is geometrically impossible. Check print_radius."
+                % (self.max_xy2, max(self.arm2)))
+            val_under_sqrt = 0.0
         forcepos[2] = -1.5 * math.sqrt(val_under_sqrt)
         homing_state.home_rails(self.rails, forcepos, self.home_position)
 
@@ -236,7 +261,10 @@ class DeltaKinematics:
         if end_z > self.limit_z:
             above_z_limit = end_z - self.limit_z
             val_under_sqrt = self.min_arm2 - (self.min_arm_length - above_z_limit)**2
-            if val_under_sqrt < 0: val_under_sqrt = 0.0
+            if val_under_sqrt < 0:
+                # This indicates the nozzle is too high for the arm to be angled,
+                # effectively the max radius at this Z is zero.
+                val_under_sqrt = 0.0
             allowed_radius = self.radius - math.sqrt(val_under_sqrt)
             limit_xy2 = min(limit_xy2, allowed_radius**2 if allowed_radius > 0 else 0)
         if end_xy2 > limit_xy2 or end_z > self.max_z or end_z < self.min_z:
@@ -265,6 +293,9 @@ class DeltaKinematics:
             'axis_maximum': self.axes_max,
             'cone_start_z': self.limit_z,
         }
+
+    def get_print_radius(self):
+        return math.sqrt(self.max_xy2) if self.max_xy2 > 0 else 0.0
 
     def get_calibration(self):
         endstops = [rail.get_homing_info().position_endstop
@@ -305,10 +336,11 @@ class DeltaKinematics:
             dy_sq = (E_coords_xy[i][1] - C_coords[i][1])**2
             arm_len_sq = self.arm2[i]
             val_under_sqrt = arm_len_sq - dx_sq - dy_sq
-            if val_under_sqrt < 1e-9:
+            if val_under_sqrt < 0:
                 logging.warning(
                     "Probe tilt: Unreachable effector joint %d for nozzle (%.3f,%.3f,%.3f). ArmLenSq=%.3f, dXsq+dYsq=%.3f"
                     % (i, nozzle_x, nozzle_y, nozzle_z, arm_len_sq, dx_sq + dy_sq))
+                # Fallback to a vertical normal if a joint is unreachable
                 return (0.0, 0.0, 1.0)
             e_z = C_coords[i][2] - math.sqrt(val_under_sqrt)
             E_coords_z.append(e_z)
@@ -426,52 +458,24 @@ class DeltaCalibration:
                 dist_sq = (nx - ctx_i)**2 + (ny - cty_i)**2 + (nz - ctz_i)**2
                 return dist_sq - self.arms[i]**2
 
+            # Use non-lean calculation for an initial guess
             dx_simple = self.towers[i][0] - nx
             dy_simple = self.towers[i][1] - ny
             val_under_sqrt_simple = self.arms[i]**2 - dx_simple**2 - dy_simple**2
             if val_under_sqrt_simple < 0:
-                logging.error("DeltaCalibration IK: Unreachable point for tower %d (initial guess): %s" % (i, coord,))
+                logging.warning("DeltaCalibration IK: Unreachable point for tower %d (initial guess): %s" % (i, coord,))
                 raise ValueError("Delta kinematics: Unreachable point for tower %d in IK initial guess" % i)
             h_i_approx = math.sqrt(val_under_sqrt_simple) + nz
 
-            h_min_bracket = h_i_approx - 50
-            h_max_bracket = h_i_approx + 50
-            h_min_bracket = max(h_min_bracket, -100.0)
-            h_max_bracket = min(h_max_bracket, self.endstops[i] + 100.0)
-
-            h_i_solution = None
-            try:
-                if not SCIPY_AVAILABLE:
-                    raise ImportError("SciPy not available for brentq in DeltaCalibration")
-                h_i_solution = scipy.optimize.brentq(f_h_i, h_min_bracket, h_max_bracket, xtol=1e-6, rtol=1e-6)
-            except Exception as e:
-                # Fallback to C-level IK (which is now lean-aware)
-                logging.warning("SciPy brentq for lean-aware IK in DeltaCalibration failed (tower %d, coord %s): %s. "
-                                "Falling back to C-level lean-aware IK." % (i, coord, str(e)))
-                if self.kinematics_parent is not None:
-                    ffi_main, ffi_lib = chelper.get_ffi()
-                    # The C IK is on the stepper_kinematics object (sk)
-                    sk = self.kinematics_parent.rails[i].get_steppers()[0]._stepper_kinematics
-                    # itersolve_calc_position_from_coord needs a 'move' and 'move_time'.
-                    # This FFI call is not direct for a simple XYZ.
-                    # For now, as a simpler fallback that is still better than non-lean:
-                    # Use the non-lean calculation if brentq fails AND C-call is complex to shim here.
-                    # This part needs to be improved if brentq often fails.
-                    # The C function is delta_stepper_calc_position(sk, move, move_time)
-                    # We don't have a 'move' object here.
-                    # So, the ultimate fallback is the simple math (non-lean for this point).
-                    logging.warning("DeltaCalibration: C-IK fallback from calc_stable_position not yet implemented directly, using non-lean math for point %d." % i)
-                    dx_fallback = self.towers[i][0] - nx
-                    dy_fallback = self.towers[i][1] - ny
-                    val_under_sqrt_fallback = self.arms[i]**2 - dx_fallback**2 - dy_fallback**2
-                    if val_under_sqrt_fallback < 0:
-                        logging.error("DeltaCalibration: Unreachable point in IK fallback (tower %d): %s" % (i, coord,))
-                        raise ValueError("Delta kinematics: Unreachable point for tower %d in IK fallback" % i)
-                    h_i_solution = math.sqrt(val_under_sqrt_fallback) + nz
-                else:
-                    logging.error("DeltaCalibration: kinematics_parent not available for C-IK fallback.")
-                    # This should not happen if constructed by DeltaKinematics.get_calibration()
-                    raise ValueError("Delta kinematics: kinematics_parent unavailable for fallback IK")
+            h_i_solution = h_i_approx
+            if SCIPY_AVAILABLE and any(abs(l) > 1e-6 for l in self.radial_leans_rad + self.tangential_leans_rad):
+                h_min_bracket, h_max_bracket = h_i_approx - 50, h_i_approx + 50
+                try:
+                    h_i_solution = scipy.optimize.brentq(f_h_i, h_min_bracket, h_max_bracket, xtol=1e-6, rtol=1e-6)
+                except Exception as e:
+                    logging.warning("SciPy brentq for lean-aware IK in DeltaCalibration failed (tower %d, coord %s): %s. "
+                                    "Falling back to non-lean calculation." % (i, coord, str(e)))
+                    # h_i_solution is already set to the non-lean-aware h_i_approx
 
             steppos_h_on_rail.append(h_i_solution)
 
