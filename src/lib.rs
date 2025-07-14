@@ -35,6 +35,9 @@ pub mod command_parser;
 // --- Stepper Motor Control ---
 pub mod stepper;
 
+// --- Endstops ---
+pub mod endstop;
+
 
 // --- Global/shared items can be re-exported if needed ---
 // pub use stepper::Stepper; // Example

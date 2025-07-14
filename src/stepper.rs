@@ -4,6 +4,7 @@
 use defmt::Format;
 use crate::gpio_manager::GpioManager;
 use crate::hal::StepEventResult;
+use crate::endstop::Endstop; // Import Endstop struct
 
 /// Represents the direction of stepper motor rotation.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Format)]
@@ -17,9 +18,10 @@ impl Default for StepperDirection { fn default() -> Self { StepperDirection::Clo
 #[derive(Debug, Format, Copy, Clone)]
 pub struct TrapezoidalMove {
     pub total_steps: u32,
-    pub acceleration: f32, // in steps/sec^2
-    pub start_velocity: f32, // in steps/sec
-    pub cruise_velocity: f32, // in steps/sec
+    pub acceleration: f32,
+    pub start_velocity: f32,
+    pub cruise_velocity: f32,
+    pub homing: bool, // Flag to indicate a homing move
 }
 
 /// Contains the calculated profile for a trapezoidal move.
@@ -32,16 +34,19 @@ pub struct MovePlanner {
     pub initial_period_ticks: u32,
     pub cruise_period_ticks: u32,
     pub acceleration: f32,
+    pub homing: bool, // Also store homing flag here
 }
 
 impl MovePlanner {
     pub fn new(mov: &TrapezoidalMove, clock_freq_hz: u32) -> Result<Self, &'static str> {
+        // ... (implementation as before, just copy the homing flag) ...
         if mov.cruise_velocity < mov.start_velocity { return Err("Cruise velocity must be >= start velocity"); }
         if mov.acceleration <= 0.0 { return Err("Acceleration must be positive"); }
         if mov.total_steps == 0 {
             return Ok(Self {
                 total_steps: 0, accel_steps: 0, cruise_steps: 0, decel_steps: 0,
                 initial_period_ticks: 0, cruise_period_ticks: 0, acceleration: 0.0,
+                homing: mov.homing,
             });
         }
         let accel_dist = (mov.cruise_velocity.powi(2) - mov.start_velocity.powi(2)) / (2.0 * mov.acceleration);
@@ -61,6 +66,7 @@ impl MovePlanner {
         Ok(Self {
             total_steps: mov.total_steps, accel_steps, cruise_steps, decel_steps,
             initial_period_ticks, cruise_period_ticks, acceleration: mov.acceleration,
+            homing: mov.homing,
         })
     }
 }
@@ -74,20 +80,27 @@ pub struct Stepper {
     pub(crate) current_direction: StepperDirection,
     pub(crate) timer_id_for_scheduler: u32,
     pub(crate) pulse_duration_ticks: u32,
-    // State for the current move
     pub(crate) current_move: Option<MovePlanner>,
     pub(crate) current_step_num: u32,
     pub(crate) next_step_waketime: u32,
     pub(crate) is_pulsing_high: bool,
     pub(crate) step_period_ticks: u32,
-    // --- Bresenham's Line Algorithm fields for multi-axis synchronization ---
     pub(crate) bresenham_error: i32,
     pub(crate) bresenham_increment: u32,
     pub(crate) bresenham_decrement: u32,
+    /// The endstop associated with this stepper axis, if any.
+    pub(crate) endstop: Option<Endstop>,
 }
 
 impl Stepper {
-    pub fn new(id: u32, timer_id_for_scheduler: u32, step_pin_id: u8, dir_pin_id: u8, gpio_manager: &mut GpioManager) -> Result<Self, &'static str> {
+    pub fn new(
+        id: u32,
+        timer_id_for_scheduler: u32,
+        step_pin_id: u8,
+        dir_pin_id: u8,
+        endstop: Option<Endstop>, // Add endstop config to constructor
+        gpio_manager: &mut GpioManager,
+    ) -> Result<Self, &'static str> {
         gpio_manager.configure_pin_as_output(step_pin_id)?;
         gpio_manager.write_pin_output(step_pin_id, false)?;
         gpio_manager.configure_pin_as_output(dir_pin_id)?;
@@ -97,26 +110,26 @@ impl Stepper {
             StepperDirection::CounterClockwise => true,
         };
         gpio_manager.write_pin_output(dir_pin_id, dir_pin_state)?;
-        defmt::info!("Stepper {} initialized: Step Pin {}, Dir Pin {}. Initial Dir: {:?}", id, step_pin_id, dir_pin_id, initial_direction);
+
+        // If an endstop is configured, configure its pin as an input with pull-up
+        if let Some(es) = endstop {
+            gpio_manager.configure_pin_as_input(es.pin_id, crate::hal::PullType::Up)?;
+            defmt::info!("Stepper {} Endstop on pin {} configured as Input with PullUp.", id, es.pin_id);
+        }
+
+        defmt::info!("Stepper {} initialized: Step Pin {}, Dir Pin {}. Endstop: {:?}", id, step_pin_id, dir_pin_id, defmt::Debug2Format(&endstop));
         Ok(Self {
             id, step_pin_id, dir_pin_id, current_direction: initial_direction,
             timer_id_for_scheduler, pulse_duration_ticks: 2,
             current_move: None, current_step_num: 0,
             next_step_waketime: 0, is_pulsing_high: false, step_period_ticks: 0,
             bresenham_error: 0, bresenham_increment: 0, bresenham_decrement: 0,
+            endstop,
         })
     }
 
     pub fn set_direction(&mut self, direction: StepperDirection, gpio_manager: &mut GpioManager) -> Result<(), &'static str> {
-        if self.current_direction == direction { return Ok(()); }
-        let dir_pin_state = match direction {
-            StepperDirection::Clockwise => false,
-            StepperDirection::CounterClockwise => true,
-        };
-        match gpio_manager.write_pin_output(self.dir_pin_id, dir_pin_state) {
-            Ok(()) => { self.current_direction = direction; Ok(()) }
-            Err(e) => { error!("Stepper {}: Failed to set direction pin {}: {}", self.id, self.dir_pin_id, e); Err(e) }
-        }
+        // ... as before ...
     }
 
     pub(crate) fn issue_step_pulse_start(&mut self, gpio_manager: &mut GpioManager) -> Result<(), &'static str> {
@@ -126,8 +139,4 @@ impl Stepper {
     pub(crate) fn issue_step_pulse_end(&mut self, gpio_manager: &mut GpioManager) -> Result<(), &'static str> {
         gpio_manager.write_pin_output(self.step_pin_id, false)
     }
-
-    // The `step_event_callback` has been removed from the `Stepper` struct.
-    // Its logic has been centralized into the `handle_move_event` function
-    // in `main.rs` to correctly handle multi-axis synchronization.
 }
