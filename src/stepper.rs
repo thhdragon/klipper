@@ -103,7 +103,7 @@ impl Stepper {
             timer_id_for_scheduler, pulse_duration_ticks: 2,
             current_move: None, current_step_num: 0,
             next_step_waketime: 0, is_pulsing_high: false, step_period_ticks: 0,
-            bresenham_error: 0, bresenham_increment: 0, bresenham_decrement: 0, // Initialize Bresenham fields
+            bresenham_error: 0, bresenham_increment: 0, bresenham_decrement: 0,
         })
     }
 
@@ -127,14 +127,7 @@ impl Stepper {
         gpio_manager.write_pin_output(self.step_pin_id, false)
     }
 
-    /// The core stepper event handler, called by the scheduler for acceleration moves.
-    /// This will be refactored to handle Bresenham's algorithm in a subsequent step.
-    pub fn step_event_callback<MasterAlarm: rp2040_hal::timer::Alarm>(
-        &mut self,
-        scheduler: &mut crate::sched::SchedulerState<MasterAlarm>,
-        gpio_manager: &mut GpioManager,
-    ) {
-        // ... (existing acceleration logic from previous phase) ...
-        // This will be modified later to incorporate Bresenham's logic.
-    }
+    // The `step_event_callback` has been removed from the `Stepper` struct.
+    // Its logic has been centralized into the `handle_move_event` function
+    // in `main.rs` to correctly handle multi-axis synchronization.
 }
