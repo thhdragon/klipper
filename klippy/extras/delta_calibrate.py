@@ -92,6 +92,7 @@ class DeltaCalibrate:
         # Register calibration parameters
         config.getfloat('radius', None)
         config.getint('probe_count', None)
+        config.getint('probe_rings', None)
         self.probe_helper = probe.ProbePointsHelper(config, self.probe_finalize,
                                                     default_points=[])
 
@@ -153,23 +154,33 @@ class DeltaCalibrate:
         radius = self.config.getfloat('radius', default=print_radius * 0.8,
                                  above=0.)
 
-        probe_count = self.config.getint('probe_count', 7)
-        # For now, we generate points in a pattern of 6 points per ring
-        # plus a center point. This logic can be expanded later.
-        # This implementation uses a fixed 7-point pattern for simplicity,
-        # but is structured for future expansion.
-        if probe_count < 4:
-            raise self.config.error("delta_calibrate probe_count must be at least 4")
+        probe_count = self.config.getint('probe_count', 6)
+        probe_rings = self.config.getint('probe_rings', 2, minval=1)
+
+        if probe_count < 3:
+            raise self.config.error("delta_calibrate probe_count must be at least 3")
 
         points = [(0., 0.)]
-        if probe_count > 1:
-            # Generate 6 points on a circle of 'radius'
-            # This is a common pattern for delta calibration
-            num_outer_points = min(probe_count - 1, 6)
-            for i in range(num_outer_points):
-                r = math.radians(90. + (360. / num_outer_points) * i)
-                dist = radius
-                points.append((math.cos(r) * dist, math.sin(r) * dist))
+        if probe_count > 0:
+            points_per_ring = probe_count // probe_rings
+            if points_per_ring < 3:
+                raise self.config.error(
+                    "Not enough points for the given number of rings. "
+                    "Increase probe_count or decrease probe_rings.")
+
+            ring_points_extra = probe_count % probe_rings
+
+            for i in range(probe_rings):
+                ring_radius = radius * (i + 1) / probe_rings
+                current_ring_points = points_per_ring
+                if ring_points_extra > 0:
+                    current_ring_points += 1
+                    ring_points_extra -= 1
+
+                for j in range(current_ring_points):
+                    r = math.radians(90. + (360. / current_ring_points) * j)
+                    dist = ring_radius
+                    points.append((math.cos(r) * dist, math.sin(r) * dist))
 
         logging.info("Generated %d probe points for DELTA_CALIBRATE: %s",
                      len(points),
