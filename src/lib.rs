@@ -38,6 +38,9 @@ pub mod stepper;
 // --- Endstops ---
 pub mod endstop;
 
+// --- Motion Queue ---
+pub mod move_queue;
+
 
 // --- Global/shared items can be re-exported if needed ---
 // pub use stepper::Stepper; // Example
