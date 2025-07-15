@@ -1,7 +1,7 @@
 [package]
 name = "klipper_mcu_rust"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 # Define the library crate (src/lib.rs)
 [lib]
@@ -18,8 +18,8 @@ features = ["rp2040"] # This enables rp2040-hal/rt for the binary
 
 [dependencies]
 # Dependencies for the library (and transitively for the binary)
-bitflags = "2.4.0"
-heapless = "0.7.16"
+bitflags = "*"
+heapless = "*"
 # The klipper_mcu_lib itself is a dependency for the binary if main.rs uses items from lib.rs
 # This is implicitly handled if they are in the same crate root, or explicitly:
 # klipper_mcu_lib = { path = "." } # This line is not strictly needed if main and lib are part of the same crate definition
@@ -28,20 +28,20 @@ heapless = "0.7.16"
 # or if they are not shared with the library.
 # For now, common dependencies are fine here.
 
-embedded-hal = "0.2.7"
+embedded-hal = "*"
 
 # RP2040 support
-rp2040-hal = { version = "0.9.1", features = ["rp2040-usb"] } # Enable USB feature
-cortex-m = "0.7.7"
-cortex-m-rt = "0.7.3" # Check for the latest version, ensure compatibility with cortex-m
+rp2040-hal = { version = "*", features = ["rp2040-usb"] } # Enable USB feature
+cortex-m = "*"
+cortex-m-rt = "*" # Check for the latest version, ensure compatibility with cortex-m
 
 # USB Support
-usb-device = "0.3.1" # Check for latest version
-usbd-serial = "0.2.0" # Check for latest version, ensure compatibility with usb-device
+usb-device = "*" # Check for latest version
+usbd-serial = "*" # Check for latest version, ensure compatibility with usb-device
 
 # Defmt Logging
-defmt = "0.3.5"        # Check for latest version
-defmt-rtt = "0.4.0"    # Check for latest version, ensure compatibility with defmt
+defmt = "*"        # Check for latest version
+defmt-rtt = "*"    # Check for latest version, ensure compatibility with defmt
 
 # For no_std with alloc (needed by trapq.rs which uses Vec)
 # This requires nightly compiler and a global allocator definition.
@@ -58,4 +58,4 @@ rp2040 = ["rp2040-hal/rt"] # The "rt" feature from rp2040-hal pulls in the linke
 
 [dev-dependencies]
 # For tests, especially for float comparisons in trapq.rs and itersolve.rs
-float-cmp = "0.9"
+float-cmp = "*"
