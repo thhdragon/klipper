@@ -318,21 +318,25 @@ class DeltaCalibrate:
 
                 if not np.isfinite(total_error):
                     logging.debug("Infinite error in delta_errorfunc with params %s", current_iter_params_dict)
-                    return float('inf')
+                    return 1e12
                 return total_error
             except ValueError as e:
                 logging.debug("Math error in delta_errorfunc: %s with params %s", str(e), current_iter_params_dict)
-                return float('inf')
+                return 1e12
             except Exception as e:
                 logging.exception("Unexpected error in delta_errorfunc with params %s", current_iter_params_dict)
-                return float('inf')
+                return 1e12
 
         if SCIPY_AVAILABLE:
             initial_values = [params[key] for key in adj_params]
             bounds = []
             for key in adj_params:
-                if 'arm_' in key: bounds.append((50.0, None))
-                elif key == 'radius' and 'offset' not in key: bounds.append((50.0, None))
+                if 'arm_' in key:
+                    initial_val = params[key]
+                    bounds.append((initial_val * 0.9, initial_val * 1.1))
+                elif key == 'radius' and 'offset' not in key:
+                    initial_val = params[key]
+                    bounds.append((initial_val * 0.9, initial_val * 1.1))
                 elif 'lean' in key: bounds.append((-5.0, 5.0)) # Degrees
                 else: bounds.append((None, None))
 
