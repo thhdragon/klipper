@@ -1,66 +1,101 @@
-// ... (all `use` statements and globals as before, including tmc2209) ...
-use klipper_mcu_lib::tmc2209::TMC2209;
+// ... (all `use` statements and globals as before) ...
 
-// --- Globals ---
-// ...
-static TMC2209_DRIVER: TMC2209 = TMC2209::new(); // ZST constructor
+// --- Callbacks and Dispatchers ---
+// ... (as before) ...
 
-// --- process_command ---
+// --- Entry Point & Main Loop ---
+#[entry]
+fn main() -> ! { /* ... as before ... */ }
+
+// --- Interrupt Handlers ---
+// ... (as before) ...
+
+// --- Helper Functions ---
+// ... (as before) ...
+
+// --- process_command (with G0/G1 commands) ---
 fn process_command(line: &str, serial: &mut SerialPort<UsbBus>) {
-    // ... (logic to split command and parse args as before) ...
+    // ... (command/arg parsing as before) ...
     match parsed_args_result {
         Ok(args) => {
-            // ... (other commands) ...
-            else if command == "TMC2209_WRITE" {
-                let reg_opt = args.get(&'R').and_then(|v| match v { CommandArgValue::UInteger(u) => Some(*u as u8), _ => None });
-                let val_opt = args.get(&'V').and_then(|v| match v { CommandArgValue::UInteger(u) => Some(*u), _ => None });
-                // Slave address 'A' can be added later, default to 0 for now.
+            let cmd_result : Result<(), &'static str> = if command == "PING" { /* ... */ Ok(()) }
+            else if command == "ID" { /* ... */ Ok(()) }
+            else if command == "ECHO" { /* ... */ Ok(()) }
+            else if command == "SET_PIN" { /* ... */ Ok(()) }
+            else if command == "GET_PIN" { /* ... */ Ok(()) }
+            else if command == "QUERY_ADC" { /* ... */ Ok(()) }
+            else if command == "SET_PWM" { /* ... */ Ok(()) }
+            else if command == "HOMING_MOVE" { /* ... */ Ok(()) }
+            else if command == "G90" { /* ... */ Ok(()) }
+            else if command == "G91" { /* ... */ Ok(()) }
+            else if command == "G92" { /* ... */ Ok(()) }
+            else if command == "G0" || command == "G1" { // Linear Move
+                let x_pos_opt = args.get(&'X').and_then(|v| match v { CommandArgValue::Float(f) => Some(*f), CommandArgValue::Integer(i) => Some(*i as f32), CommandArgValue::UInteger(u) => Some(*u as f32), _ => None });
+                let y_pos_opt = args.get(&'Y').and_then(|v| match v { CommandArgValue::Float(f) => Some(*f), CommandArgValue::Integer(i) => Some(*i as f32), CommandArgValue::UInteger(u) => Some(*u as f32), _ => None });
+                // Z is parsed but not yet used by motion system
+                let _z_pos_opt = args.get(&'Z').and_then(|v| match v { CommandArgValue::Float(f) => Some(*f), CommandArgValue::Integer(i) => Some(*i as f32), CommandArgValue::UInteger(u) => Some(*u as f32), _ => None });
+                let feedrate_opt = args.get(&'F').and_then(|v| match v { CommandArgValue::Float(f) => Some(*f), CommandArgValue::Integer(i) => Some(*i as f32), CommandArgValue::UInteger(u) => Some(*u as f32), _ => None });
 
-                if let (Some(reg_addr), Some(value)) = (reg_opt, val_opt) {
-                    let write_result = interrupt_free(|cs| {
-                        let mut uart_opt = UART0_PERIPHERAL.borrow(cs).borrow_mut();
-                        if let Some(ref mut uart) = uart_opt.as_mut() {
-                            TMC2209_DRIVER.write_register(uart, 0, reg_addr, value)
-                                .map_err(|e| { error!("TMC Write Error: {:?}", e); "TMC Write Error" })
-                        } else { Err("UART0 not initialized") }
-                    });
-                    if write_result.is_ok() { write!(response, "ok\r\n").unwrap(); }
-                    else { write!(response, "Error: {}\r\n", write_result.unwrap_err()).unwrap(); }
-                } else {
-                    write!(response, "Error: Missing R (register) or V (value) for TMC2209_WRITE\r\n").unwrap();
-                }
-            }
-            else if command == "TMC2209_READ" {
-                 let reg_opt = args.get(&'R').and_then(|v| match v { CommandArgValue::UInteger(u) => Some(*u as u8), _ => None });
-                 if let Some(reg_addr) = reg_opt {
-                    // This is the complex single-wire read operation.
-                    // 1. Send read request
-                    let send_res = interrupt_free(|cs| {
-                        let mut uart_opt = UART0_PERIPHERAL.borrow(cs).borrow_mut();
-                        if let Some(ref mut uart) = uart_opt.as_mut() {
-                            TMC2209_DRIVER.send_read_request(uart, 0, reg_addr)
-                                .map_err(|e| { error!("TMC Read Request Error: {:?}", e); "TMC Read Request Error" })
-                        } else { Err("UART0 not initialized") }
-                    });
+                interrupt_free(|cs| {
+                    let mut toolhead = TOOLHEAD.borrow(cs).borrow_mut();
+                    let mut queue = MOVE_QUEUE.borrow(cs).borrow_mut();
 
-                    if send_res.is_err() {
-                        write!(response, "Error: {}\r\n", send_res.unwrap_err()).unwrap();
-                    } else {
-                        // 2. Reconfigure pin and read response.
-                        // This part is highly complex and requires deconstructing/reconstructing the UART peripheral
-                        // to gain temporary GPIO access to the TX pin for reading.
-                        // This is a placeholder for that logic.
-                        warn!("TMC2209_READ: Sent read request for reg {}. Manual pin-swapping and read logic is not yet implemented.", reg_addr);
-                        write!(response, "ok (read request sent, response reading not implemented)\r\n").unwrap();
+                    // Update feedrate if F word is present
+                    if let Some(f) = feedrate_opt {
+                        toolhead.feedrate = f;
                     }
-                 } else {
-                    write!(response, "Error: Missing R (register) for TMC2209_READ\r\n").unwrap();
-                 }
+
+                    // Determine target position based on current position and mode
+                    let mut target_pos = toolhead.current_position;
+                    if toolhead.positioning_mode == PositioningMode::Absolute {
+                        if let Some(x) = x_pos_opt { target_pos.0 = x; }
+                        if let Some(y) = y_pos_opt { target_pos.1 = y; }
+                        // if let Some(z) = z_pos_opt { target_pos.2 = z; }
+                    } else { // Relative
+                        if let Some(x) = x_pos_opt { target_pos.0 += x; }
+                        if let Some(y) = y_pos_opt { target_pos.1 += y; }
+                        // if let Some(z) = z_pos_opt { target_pos.2 += z; }
+                    }
+
+                    // For now, use a fixed acceleration and the toolhead's current feedrate
+                    let accel = 1000.0; // mm/s^2
+                    let velocity = toolhead.feedrate / 60.0; // mm/s
+
+                    // Create a move and add it to the queue
+                    // HACK: Store target X/Y in start/cruise velocity fields of TrapezoidalMove
+                    // This needs to be refactored later.
+                    let mov = TrapezoidalMove {
+                        total_steps: 0, // Kinematics will calculate this
+                        acceleration: accel,
+                        start_velocity: target_pos.0, // HACK
+                        cruise_velocity: target_pos.1, // HACK
+                        end_velocity: 0.0, // Look-ahead will set this
+                        homing: false,
+                    };
+
+                    if queue.add_move(mov).is_err() {
+                        return Err("Move queue full");
+                    }
+
+                    // Update toolhead's logical position
+                    toolhead.current_position = target_pos;
+
+                    // Trigger the planner to check the queue if the machine is idle
+                    // This is non-blocking
+                    plan_next_move();
+
+                    Ok(())
+                })
             }
-            // ... (other commands) ...
+            else if command.is_empty() { Ok(()) }
+            else { Err("Unknown command") }
         }
-        // ... (error handling) ...
-    }
-    serial_write_line(serial, response.as_str());
+        Err(e) => { Err("Argument parsing failed") }
+    };
+    // ... (handle cmd_result and send response) ...
 }
-// ... (rest of file) ...
+// The old MOVE command handler is now removed.
+// The plan_next_move function also needs a refactor to get the target pos from the move struct.
+// For now, it will continue to use the HACK.
+// The `TrapezoidalMove` struct should be refactored to properly hold target coordinates.
+// This will be a subsequent step.
