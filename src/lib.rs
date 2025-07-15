@@ -21,6 +21,32 @@ pub mod stepper;    // Stepper motor control logic
 pub mod trapq;
 pub mod utils;      // Utility functions (crc, timing helpers, etc.)
 
+// --- MCU specific HAL implementations ---
+#[cfg(feature = "rp2040")] // Only compile this module if rp2040 feature is active
+pub mod rp2040_hal_impl;
+
+// --- GPIO Management ---
+#[cfg(feature = "rp2040")] // Specific to RP2040 for now due to hal_pins usage
+pub mod gpio_manager;
+
+// --- Command Parsing ---
+pub mod command_parser;
+
+// --- Stepper Motor Control ---
+pub mod stepper;
+
+// --- Endstops ---
+pub mod endstop;
+
+// --- Motion Queue ---
+pub mod move_queue;
+
+// --- TMC Stepper Drivers ---
+pub mod tmc2209;
+
+// --- Toolhead State ---
+pub mod toolhead;
+
 
 // --- Global/shared items can be re-exported if needed ---
 // pub use stepper::Stepper; // Example

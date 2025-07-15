@@ -1,33 +1,26 @@
-#![cfg_attr(not(test), no_std)]
+// ... (existing content of hal.rs: GpioOut, GpioIn, Timer, Scheduler, AdcChannel, PwmChannel, Spi) ...
 
-use crate::stepper::StepEventResult; // Assuming StepEventResult will be in stepper.rs
-
-// --- Placeholder for Hardware Abstractions (from existing src/lib.rs) ---
-pub trait GpioOut {
-    fn setup(pin_id: u8, inverted: bool) -> Self; // Simplified, HALs have more complex setup
-    fn write(&mut self, high: bool);
-    fn toggle(&mut self);
-    // gpio_out_toggle_noirq in C implies direct register access,
-    // HALs might provide this or it might require unsafe code.
-    // For now, a simple toggle is provided.
+/// Errors that can occur during UART operations.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, defmt::Format)]
+pub enum UartError {
+    InvalidPin,         // A pin cannot be used for the requested UART function.
+    PinUnavailable,     // A pin is in use by another peripheral.
+    ConfigurationError, // Error during UART peripheral or pin configuration.
+    ReadError,          // An error occurred during a read operation (e.g., overrun, parity).
+    WriteError,         // An error occurred during a write operation.
 }
 
-pub trait Timer {
-    // Represents a timer that can be scheduled by a scheduler
-    // The callback will likely need to be more flexible, perhaps taking a context.
-    // For now, using the existing signature from src/lib.rs which implies Stepper implements Timer
-    // or a similar dispatch mechanism.
-    fn new(callback: fn(&mut Self) -> StepEventResult) -> Self; // Simplified
-    fn get_waketime(&self) -> u32;
-    fn set_waketime(&mut self, waketime: u32);
-    // func pointer is handled by the callback in new()
-}
+/// Trait for a configured UART (serial) peripheral.
+pub trait Uart {
+    /// Associated error type for this UART implementation.
+    type Error: core::fmt::Debug + defmt::Format;
 
-pub trait Scheduler {
-    // Simplified scheduler interface
-    fn add_timer(&mut self, timer: &mut impl Timer);
-    fn delete_timer(&mut self, timer: &mut impl Timer);
-    fn read_time(&self) -> u32; // Equivalent to timer_read_time()
-    fn get_clock_freq(&self) -> u32; // To be used by timer_from_us
-    // timer_is_before can be implemented using direct comparison of u32 times
+    /// Writes a slice of bytes to the UART bus, blocking until the entire slice is sent.
+    fn write_blocking(&mut self, words: &[u8]) -> Result<(), Self::Error>;
+
+    /// Reads bytes from the UART bus into the provided buffer, blocking until the buffer is full.
+    fn read_blocking(&mut self, buffer: &mut [u8]) -> Result<(), Self::Error>;
+
+    /// Flushes the write buffer, ensuring all data has been sent.
+    fn flush(&mut self) -> Result<(), Self::Error>;
 }

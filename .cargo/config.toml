@@ -1,0 +1,24 @@
+# .cargo/config.toml
+
+[build]
+target = "thumbv6m-none-eabi" # Target for RP2040
+
+[target.thumbv6m-none-eabi]
+# Configure a runner for `cargo run`
+# This assumes probe-rs is installed and the specific chip is an RP2040
+runner = "probe-rs run --chip RP2040"
+
+# Optional: if you want to use gdb
+# runner = "gdb-multiarch -q -x openocd.gdb"
+
+# To use elf2uf2-rs as a runner (simpler flashing, no debugging):
+# Ensure elf2uf2-rs is installed: cargo install elf2uf2-rs
+# runner = "elf2uf2-rs -d"
+# And then you might need to specify the output binary path if it's not automatically found.
+# Typically, after `cargo build --target thumbv6m-none-eabi`, the ELF is in
+# target/thumbv6m-none-eabi/debug/<your_binary_name>
+# elf2uf2-rs target/thumbv6m-none-eabi/debug/<your_binary_name>.elf
+
+[env]
+# Optional: Set environment variables for the build process if needed
+DEFMT_LOG = "info" # Set default defmt log level
