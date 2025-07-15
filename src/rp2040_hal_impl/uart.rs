@@ -3,10 +3,10 @@
 
 use crate::hal::{Uart as KlipperUart, UartError};
 use rp2040_hal::uart::{Enabled, UartPeripheral};
-use rp2040_hal::pac::UART0; // Example, needs to be generic or specific
+use rp2040_hal::pac::UART0;
 use rp2040_hal::gpio::Pin;
 use rp2040_hal::gpio::FunctionUart;
-use embedded_hal::serial::{Read, Write}; // embedded-hal traits
+use embedded_hal::serial::{Read, Write};
 
 /// Wrapper for a configured RP2040 UART peripheral that implements Klipper's Uart trait.
 /// `UART` is the concrete `rp2040_hal::uart::UartPeripheral<...>` instance.
@@ -19,6 +19,11 @@ impl<UART> Rp2040Uart<UART> {
     /// The `hal_uart` instance must already be fully configured and enabled.
     pub fn new(hal_uart: UART) -> Self {
         Self { hal_uart }
+    }
+
+    /// Consumes the wrapper and returns the inner HAL UART peripheral.
+    pub fn into_inner(self) -> UART {
+        self.hal_uart
     }
 }
 
