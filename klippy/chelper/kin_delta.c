@@ -25,7 +25,16 @@ delta_stepper_calc_position(struct stepper_kinematics *sk, struct move *m
     struct delta_stepper *ds = container_of(sk, struct delta_stepper, sk);
     struct coord c = move_get_coord(m, move_time);
     double dx = ds->tower_x - c.x, dy = ds->tower_y - c.y;
-    double height = sqrt(ds->arm2 - dx*dx - dy*dy) + c.z;
+    double arm2_minus_xy2 = ds->arm2 - dx*dx - dy*dy;
+    
+    // Safety check to prevent sqrt of negative number
+    if (arm2_minus_xy2 < 0.0) {
+        // This should not happen with proper configuration
+        // Return a safe fallback value
+        return 0.0;
+    }
+    
+    double height = sqrt(arm2_minus_xy2) + c.z;
     
     // Apply lean compensation
     if (ds->lean_dx_dh != 0.0 || ds->lean_dy_dh != 0.0 || ds->lean_dz_dh != 0.0) {
