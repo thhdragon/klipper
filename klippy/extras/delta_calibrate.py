@@ -186,50 +186,26 @@ class DeltaCalibrate:
         corrected_probe_positions_for_stable_calc = []
         logging.info("Probe tilt compensation: Applying corrections...")
 
-        for i, (px_uncorrected, py_uncorrected, pz_bed) in enumerate(positions):
-            # Estimate nozzle XYZ at the moment of probe trigger
-            noz_x_at_trigger = px_uncorrected - probe_x_offset
-            noz_y_at_trigger = py_uncorrected - probe_y_offset
-            noz_z_at_trigger = pz_bed + probe_z_offset_config
-
-            nx, ny, nz = kin.get_effector_normal(noz_x_at_trigger, noz_y_at_trigger, noz_z_at_trigger)
-
-            x_displacement, y_displacement = 0.0, 0.0 # Initialize here
-            apply_tilt_xy_correction = True
-            # If probe_z_offset_config is very small (e.g. manual probing), skip XY correction part of tilt.
-            if abs(probe_z_offset_config) < 0.5: # Threshold for "negligible" Z offset, e.g., 0.5mm
-                apply_tilt_xy_correction = False
-                logging.debug(
-                    "Point %d: Probe Z offset (%.3f) is small, XY tilt correction heuristically skipped."
-                    % (i, probe_z_offset_config))
-
-            if apply_tilt_xy_correction and abs(nz) < 1e-6:
-                logging.warning("Probe tilt: Effector normal Z component is near zero (nz=%.3e) at point %d. Skipping XY tilt correction for this point." % (nz, i))
-                apply_tilt_xy_correction = False
-
-            if apply_tilt_xy_correction:
-                physical_probe_extension = -probe_z_offset_config
-                x_displacement = physical_probe_extension * (nx / nz)
-                y_displacement = physical_probe_extension * (ny / nz)
-                corrected_px = (noz_x_at_trigger + probe_x_offset) + x_displacement
-                corrected_py = (noz_y_at_trigger + probe_y_offset) + y_displacement
+        for i, (px, py, pz) in enumerate(positions):
+            # Calculate nozzle position at trigger
+            noz_x = px - probe_x_offset
+            noz_y = py - probe_y_offset
+            noz_z = pz + probe_z_offset_config
+            # Get tilt corrected probe position
+            normal = kin.get_effector_normal(noz_x, noz_y, noz_z)
+            if abs(normal[2]) < 1e-6:
+                logging.warning(
+                    "Probe tilt: Effector normal Z is zero at point %d."
+                    " Skipping tilt correction." % (i,))
+                cpx, cpy = px, py
             else:
-                # No XY correction applied (either due to small z_offset or vertical effector normal)
-                corrected_px = px_uncorrected
-                corrected_py = py_uncorrected
-
-            logging.debug(
-                "Point %d: Nozzle(%.3f,%.3f,%.3f) UncorrectedProbe(%.3f,%.3f) Normal(%.3f,%.3f,%.3f) Disp(%.4f,%.4f) CorrectedProbe(%.3f,%.3f)" %
-                (i, noz_x_at_trigger, noz_y_at_trigger, noz_z_at_trigger,
-                    px_uncorrected, py_uncorrected, nx, ny, nz,
-                    x_displacement, y_displacement, corrected_px, corrected_py))
-
-            corrected_probe_positions_for_stable_calc.append( (corrected_px, corrected_py, pz_bed) )
-
-        final_probe_data_for_calc = []
-        for (cpx, cpy, cpz_bed) in corrected_probe_positions_for_stable_calc:
-            stable_pos = delta_params.calc_stable_position( (cpx, cpy, cpz_bed) )
-            final_probe_data_for_calc.append( (cpz_bed, stable_pos) )
+                pz_offset = -probe_z_offset_config
+                cpx = noz_x + probe_x_offset + pz_offset * normal[0] / normal[2]
+                cpy = noz_y + probe_y_offset + pz_offset * normal[1] / normal[2]
+            # Convert to stable position for calibration
+            stable_pos = delta_params.calc_stable_position((cpx, cpy, pz))
+            corrected_probe_positions_for_stable_calc.append((pz, stable_pos))
+        final_probe_data_for_calc = corrected_probe_positions_for_stable_calc
 
         # Perform analysis
         self.calculate_params(final_probe_data_for_calc, self.last_distances)

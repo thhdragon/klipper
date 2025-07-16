@@ -324,3 +324,14 @@ config, and restart the host software.
 Printer is shutdown
 
 Unfreezing garbage collection
+Starting Klippy...
+Args: ['./klippy/klippy.py', '/config/example-delta.cfg', '-i', './_test_.gcode', '-o', '_test_output', '-v', '-d', './klippy/chelper/atmega2560.dict', '-l', '/app/_test_.log']
+Git version: '87051b1-dirty'
+Modified files: _test_.gcode, _test_.log
+Branch: (HEAD detached from 352e481)
+Remote: ?
+Tracked URL: ?
+CPU: 4 core Intel(R) Xeon(R) Processor @ 2.30GHz
+Python: '3.12.11 (main, Jul  9 2025, 00:50:55) [GCC 13.3.0]'
+Building C code module c_helper.so
+Unable to build C code module (error=256)

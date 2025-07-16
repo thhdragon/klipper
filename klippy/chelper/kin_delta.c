@@ -78,44 +78,18 @@ delta_stepper_calc_position(struct stepper_kinematics *sk, struct move *m,
     double h1 = (-B + sqrt_D) / 2.;
     double h2 = (-B - sqrt_D) / 2.;
 
-    // Choose the physically correct root.
-    // The carriage pivot is typically above the nozzle (h > z for arms pointing down).
-    // Also, h should be positive (distance along rail from Z=0).
-    // The Z coordinate of the carriage is h * lean_dz_dh.
-    // We expect c.z (nozzle_z) to be roughly C_z - arm_projection_z.
-    // So, h * lean_dz_dh should be greater than c.z for typical configurations.
-    // If lean_dz_dh is close to 1 (small lean), then h should be greater than c.z.
-    // The original non-lean formula is c.z + sqrt(...), so h is c.z + positive_value.
-    // This implies we usually want the solution that is "c.z + something".
-    // If B is large and negative (common), -B is positive.
-    // We typically want the solution that places the carriage above the nozzle.
-    // Consider nozzle at (0,0,200), arm 250. Carriage height is ~200 + sqrt(250^2 - R^2).
-    // Let's test which solution gives a carriage Z (h * lean_dz_dh) that makes sense.
-    // Usually, it's the one that results in a Z value for the carriage pivot
-    // that is 'above' the nozzle Z by a significant amount (projection of arm).
-    // If lean_dz_dh is ~1, h1 is generally preferred.
+    // Choose the physically correct root. The carriage pivot must be above
+    // the nozzle. We can determine this by checking the Z coordinate of the
+    // carriage for each solution. The correct solution is the one that yields
+    // a larger Z value for the carriage.
+    double cz1 = h1 * ds->lean_dz_dh;
+    double cz2 = h2 * ds->lean_dz_dh;
 
-    // A simpler way: the value of h (distance along rail) should be positive and result
-    // in the arm pointing generally "downwards" from carriage to effector.
-    // The solution corresponding to (c.z + sqrt(L^2 - R_eff^2)) is generally h1.
-    // Choose the root that corresponds to the arm being below the carriage.
-    // h1 = (-B + sqrt_D) / 2.0; This is generally the correct physical solution.
-    // h2 = (-B - sqrt_D) / 2.0;
-    // We need h > 0 (distance along rail).
-    // If h1 is positive, it's preferred. If h1 is negative and h2 is positive, use h2.
-    // If both are negative, point is likely geometrically impossible for the "arm down" config.
-    if (h1 >= -MAX_SQRT_ARG) { // Allow h1 to be very slightly negative due to precision
-        return (h1 < 0.) ? 0. : h1;
+    if (cz1 >= cz2) {
+        return h1;
+    } else {
+        return h2;
     }
-    if (h2 >= -MAX_SQRT_ARG) {
-        // This case (h1 < 0 and h2 > 0) should be rare for valid delta positions.
-        // errorf("Delta kinematics: IK h1 negative (%.2f), using h2 (%.2f)", h1, h2);
-        return (h2 < 0.) ? 0. : h2;
-    }
-
-    // Both solutions significantly negative, or other issue.
-    // errorf("Delta kinematics: Both IK solutions for h are negative (lean). D=%.3e, h1=%.2f, h2=%.2f", discriminant, h1, h2);
-    return NAN; // Fallback if no valid positive solution
 }
 
 struct stepper_kinematics * __visible
