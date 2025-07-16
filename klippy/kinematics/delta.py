@@ -1,485 +1,459 @@
-# Code for handling the kinematics of linear delta robots
+# Delta calibration support
 #
-# Copyright (C) 2016-2023  Kevin O'Connor <kevin@koconnor.net>
+# Copyright (C) 2017-2019  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import math, logging
-import stepper, mathutil
-import chelper # For get_effector_normal
+import math, logging, collections
+import mathutil
+from . import probe
 
 try:
     import scipy.optimize
     SCIPY_AVAILABLE = True
 except ImportError:
     SCIPY_AVAILABLE = False
-    # This module might be imported even if scipy isn't used by delta_calibrate,
-    # so a warning here might be too noisy if user isn't using advanced calibration.
-    # logging.info("SciPy library not found, brentq for lean-aware IK in DeltaCalibration will be disabled.")
+    logging.info("SciPy library not found, advanced delta calibration optimizer will be disabled.")
 
-# Slow moves once the ratio of tower to XY movement exceeds SLOW_RATIO
-SLOW_RATIO = 3.
+# A "stable position" is a 3-tuple containing the number of steps
+# taken since hitting the endstop on each delta tower.  Delta
+# calibration uses this coordinate system because it allows a position
+# to be described independent of the software parameters.
 
-class DeltaKinematics:
-    def __init__(self, toolhead, config):
-        # Setup tower rails
-        stepper_configs = [config.getsection('stepper_' + a) for a in 'abc']
-        rail_a = stepper.LookupMultiRail(
-            stepper_configs[0], need_position_minmax = False)
-        a_endstop = rail_a.get_homing_info().position_endstop
-        rail_b = stepper.LookupMultiRail(
-            stepper_configs[1], need_position_minmax = False,
-            default_position_endstop=a_endstop)
-        rail_c = stepper.LookupMultiRail(
-            stepper_configs[2], need_position_minmax = False,
-            default_position_endstop=a_endstop)
-        self.rails = [rail_a, rail_b, rail_c]
-        # Setup max velocity
-        self.max_velocity, self.max_accel = toolhead.get_max_velocity()
-        self.max_z_velocity = config.getfloat(
-            'max_z_velocity', self.max_velocity,
-            above=0., maxval=self.max_velocity)
-        self.max_z_accel = config.getfloat('max_z_accel', self.max_accel,
-                                          above=0., maxval=self.max_accel)
-        # Read global delta radius
-        self.radius = config.getfloat('delta_radius', above=0.)
-        self.effector_joint_radius = config.getfloat('delta_effector_radius', 40.0, above=0.)
-        if config.get('delta_effector_radius', None) is None:
-            logging.warning(
-                "Config option 'delta_effector_radius' not specified in [printer] section."
-                " Using default %.2fmm. For accurate probe tilt compensation, this value should be set."
-                % (self.effector_joint_radius,))
+# Load a stable position from a config entry
+def load_config_stable(config, option):
+    return config.getfloatlist(option, count=3)
 
-        # Read per-stepper parameters
-        self.angles = []
-        self.arm_lengths = []
-        self.radius_offsets = []
-        self.radial_leans_rad = []
-        self.tangential_leans_rad = []
 
-        default_angles = [210., 330., 90.]
-        arm_length_a_cfg = stepper_configs[0].getfloat('arm_length')
-        radius_offset_a_cfg = stepper_configs[0].getfloat('delta_radius_offset', 0.0)
+######################################################################
+# Delta calibration object
+######################################################################
 
-        for i, sconfig in enumerate(stepper_configs):
-            self.angles.append(sconfig.getfloat('angle', default_angles[i]))
-            current_arm_length = sconfig.getfloat('arm_length', arm_length_a_cfg)
-            self.arm_lengths.append(current_arm_length)
-            self.radius_offsets.append(sconfig.getfloat('delta_radius_offset',
-                                                        radius_offset_a_cfg))
-            radial_lean_deg = sconfig.getfloat('radial_lean', 0.0)
-            tangential_lean_deg = sconfig.getfloat('tangential_lean', 0.0)
-            self.radial_leans_rad.append(math.radians(radial_lean_deg))
-            self.tangential_leans_rad.append(math.radians(tangential_lean_deg))
+# The angles and distances of the calibration object found in
+# docs/prints/calibrate_size.stl
+MeasureAngles = [210., 270., 330., 30., 90., 150.]
+MeasureOuterRadius = 65
+MeasureRidgeRadius = 5. - .5
 
-        self.arm2 = [arm**2 for arm in self.arm_lengths]
+# How much to prefer a distance measurement over a height measurement
+MEASURE_WEIGHT = 0.5
 
-        # Determine tower base locations (at Z=0) in cartesian space
-        self.towers = [] # Stores (Base_X, Base_Y) for each tower
-        for i in range(3):
-            eff_radius = self.radius + self.radius_offsets[i]
-            if self.arm_lengths[i] <= eff_radius:
-                raise config.error(
-                    "Arm length %.3f for stepper %s must be greater than its"
-                    " effective delta radius %.3f (delta_radius %.3f + offset %.3f)" % (
-                        self.arm_lengths[i], chr(ord('a') + i), eff_radius,
-                        self.radius, self.radius_offsets[i]))
-            angle_rad = math.radians(self.angles[i])
-            self.towers.append((math.cos(angle_rad) * eff_radius,
-                                math.sin(angle_rad) * eff_radius))
+# Convert distance measurements made on the calibration object to
+# 3-tuples of (actual_distance, stable_position1, stable_position2)
+def measurements_to_distances(measured_params, delta_params):
+    # Extract params
+    mp = measured_params
+    dp = delta_params
+    scale = mp['SCALE'][0]
+    cpw = mp['CENTER_PILLAR_WIDTHS']
+    center_widths = [cpw[0], cpw[2], cpw[1], cpw[0], cpw[2], cpw[1]]
+    center_dists = [od - cw
+                    for od, cw in zip(mp['CENTER_DISTS'], center_widths)]
+    outer_dists = [
+        od - opw
+        for od, opw in zip(mp['OUTER_DISTS'], mp['OUTER_PILLAR_WIDTHS']) ]
+    # Convert angles in degrees to an XY multiplier
+    obj_angles = list(map(math.radians, MeasureAngles))
+    xy_angles = list(zip(map(math.cos, obj_angles), map(math.sin, obj_angles)))
+    # Calculate stable positions for center measurements
+    inner_ridge = MeasureRidgeRadius * scale
+    inner_pos = [(ax * inner_ridge, ay * inner_ridge, 0.)
+                 for ax, ay in xy_angles]
+    outer_ridge = (MeasureOuterRadius + MeasureRidgeRadius) * scale
+    outer_pos = [(ax * outer_ridge, ay * outer_ridge, 0.)
+                 for ax, ay in xy_angles]
+    center_positions = [
+        (cd, dp.calc_stable_position(ip), dp.calc_stable_position(op))
+        for cd, ip, op in zip(center_dists, inner_pos, outer_pos)]
+    # Calculate positions of outer measurements
+    outer_center = MeasureOuterRadius * scale
+    start_pos = [(ax * outer_center, ay * outer_center) for ax, ay in xy_angles]
+    shifted_angles = xy_angles[2:] + xy_angles[:2]
+    first_pos = [(ax * inner_ridge + spx, ay * inner_ridge + spy, 0.)
+                 for (ax, ay), (spx, spy) in zip(shifted_angles, start_pos)]
+    second_pos = [(ax * outer_ridge + spx, ay * outer_ridge + spy, 0.)
+                  for (ax, ay), (spx, spy) in zip(shifted_angles, start_pos)]
+    outer_positions = [
+        (od, dp.calc_stable_position(fp), dp.calc_stable_position(sp))
+        for od, fp, sp in zip(outer_dists, first_pos, second_pos)]
+    return center_positions + outer_positions
 
-        self.abs_endstops = []
-        for i in range(3):
-            rail_homing_pos = self.rails[i].get_homing_info().position_endstop
-            eff_radius_i = self.radius + self.radius_offsets[i]
-            val_under_sqrt = self.arm_lengths[i]**2 - eff_radius_i**2
-            if val_under_sqrt < 0: val_under_sqrt = 0 # Avoid math domain error
-            self.abs_endstops.append(rail_homing_pos + math.sqrt(val_under_sqrt))
 
-        print_radius = config.getfloat('print_radius', self.radius, above=0.)
+######################################################################
+# Delta Calibrate class
+######################################################################
 
-        # Precompute lean factors for C helper
-        self.lean_factors = []
-        for i in range(3):
-            alpha_i_rad = math.radians(self.angles[i])
-            theta_r_rad = self.radial_leans_rad[i]
-            theta_t_rad = self.tangential_leans_rad[i]
+class DeltaCalibrate:
+    def __init__(self, config):
+        self.printer = config.get_printer()
+        self.printer.register_event_handler("klippy:connect",
+                                            self.handle_connect)
+        # Calculate default probing points
+        radius = config.getfloat('radius', above=0.)
+        points = [(0., 0.)]
+        scatter = [.95, .90, .85, .70, .75, .80]
+        for i in range(6):
+            r = math.radians(90. + 60. * i)
+            dist = radius * scatter[i]
+            points.append((math.cos(r) * dist, math.sin(r) * dist))
+        self.probe_helper = probe.ProbePointsHelper(
+            config, self.probe_finalize, default_points=points)
+        self.probe_helper.minimum_points(3)
 
-            s_tr = math.sin(theta_r_rad)
-            s_tt = math.sin(theta_t_rad)
-            c_a = math.cos(alpha_i_rad)
-            s_a = math.sin(alpha_i_rad)
+        # Multi-Z probing heights - simplified implementation
+        self.probe_z_heights = config.getfloatlist('probe_z_heights', None)
+        if self.probe_z_heights is not None and len(self.probe_z_heights) > 1:
+            logging.info("Multi-Z height probing configured for DELTA_CALIBRATE. "
+                         "Using first height: %.3f" % self.probe_z_heights[0])
 
-            lean_dx_dh_i = s_tr * c_a - s_tt * s_a
-            lean_dy_dh_i = s_tr * s_a + s_tt * c_a
+        # Restore probe stable positions
+        self.last_probe_positions = []
+        for i in range(999):
+            height = config.getfloat("height%d" % (i,), None)
+            if height is None:
+                break
+            height_pos = load_config_stable(config, "height%d_pos" % (i,))
+            self.last_probe_positions.append((height, height_pos))
+        
+        # Restore manually entered heights
+        self.manual_heights = []
+        for i in range(999):
+            height = config.getfloat("manual_height%d" % (i,), None)
+            if height is None:
+                break
+            height_pos = load_config_stable(config, "manual_height%d_pos" % (i,))
+            self.manual_heights.append((height, height_pos))
+        
+        # Restore distance measurements
+        self.delta_analyze_entry = {'SCALE': [1.0]}  # Fixed: should be list, not tuple
+        self.last_distances = []
+        for i in range(999):
+            dist = config.getfloat("distance%d" % (i,), None)
+            if dist is None:
+                break
+            distance_pos1 = load_config_stable(config, "distance%d_pos1" % (i,))
+            distance_pos2 = load_config_stable(config, "distance%d_pos2" % (i,))
+            self.last_distances.append((dist, distance_pos1, distance_pos2))
+        
+        # Register gcode commands
+        self.gcode = self.printer.lookup_object('gcode')
+        self.gcode.register_command('DELTA_CALIBRATE', self.cmd_DELTA_CALIBRATE,
+                                    desc=self.cmd_DELTA_CALIBRATE_help)
+        self.gcode.register_command('DELTA_ANALYZE', self.cmd_DELTA_ANALYZE,
+                                    desc=self.cmd_DELTA_ANALYZE_help)
 
-            val_for_dz_sqrt = 1.0 - s_tr**2 - s_tt**2
-            if val_for_dz_sqrt < 0: val_for_dz_sqrt = 0.0
-            lean_dz_dh_i = math.sqrt(val_for_dz_sqrt)
+    def handle_connect(self):
+        kin = self.printer.lookup_object('toolhead').get_kinematics()
+        if not hasattr(kin, "get_calibration"):
+            raise self.printer.config_error(
+                "Delta calibrate is only for delta printers")
 
-            self.lean_factors.append( (lean_dx_dh_i, lean_dy_dh_i, lean_dz_dh_i) )
+    def save_state(self, probe_positions, distances, delta_params):
+        # Save main delta parameters
+        configfile = self.printer.lookup_object('configfile')
+        delta_params.save_state(configfile)
+        # Save probe stable positions
+        section = 'delta_calibrate'
+        configfile.remove_section(section)
+        for i, (z_offset, spos) in enumerate(probe_positions):
+            configfile.set(section, "height%d" % (i,), z_offset)
+            configfile.set(section, "height%d_pos" % (i,),
+                           "%.3f,%.3f,%.3f" % tuple(spos))
+        # Save manually entered heights
+        for i, (z_offset, spos) in enumerate(self.manual_heights):
+            configfile.set(section, "manual_height%d" % (i,), z_offset)
+            configfile.set(section, "manual_height%d_pos" % (i,),
+                           "%.3f,%.3f,%.3f" % tuple(spos))
+        # Save distance measurements
+        for i, (dist, spos1, spos2) in enumerate(distances):
+            configfile.set(section, "distance%d" % (i,), dist)
+            configfile.set(section, "distance%d_pos1" % (i,),
+                           "%.3f,%.3f,%.3f" % tuple(spos1))
+            configfile.set(section, "distance%d_pos2" % (i,),
+                           "%.3f,%.3f,%.3f" % tuple(spos2))
 
-        for i in range(3):
-            base_tower_x = self.towers[i][0]
-            base_tower_y = self.towers[i][1]
-            lean_dx_dh, lean_dy_dh, lean_dz_dh = self.lean_factors[i]
-            self.rails[i].setup_itersolve('delta_stepper_alloc', self.arm2[i],
-                                          base_tower_x, base_tower_y,
-                                          lean_dx_dh, lean_dy_dh, lean_dz_dh)
-        for s in self.get_steppers():
-            s.set_trapq(toolhead.get_trapq())
-            toolhead.register_step_generator(s.generate_steps)
+    def probe_finalize(self, offsets, positions):
+        # Convert positions into (z_offset, stable_position) pairs
+        probe_x_offset, probe_y_offset, probe_z_offset_config = offsets
+        toolhead = self.printer.lookup_object('toolhead')
+        kin = toolhead.get_kinematics()
+        delta_params = kin.get_calibration()
 
-        self.need_home = True
-        self.limit_xy2 = -1.
-        self.home_position = tuple(
-            self._actuator_to_cartesian(self.abs_endstops))
-        self.max_z = min([rail.get_homing_info().position_endstop
-                          for rail in self.rails])
-        self.min_z = config.getfloat('minimum_z_position', 0, maxval=self.max_z)
+        corrected_probe_positions = []
+        logging.info("Probe tilt compensation: Applying corrections...")
 
-        min_arm_val = min(self.arm_lengths)
-        self.limit_z = min([ep - arm for ep, arm in zip(self.abs_endstops, self.arm_lengths)]) # Approx
-        self.min_arm_length = min_arm_val
-        self.min_arm2 = self.min_arm_length**2
-        logging.info(
-            "Delta max build height %.2fmm (radius tapered above %.2fmm)"
-            % (self.max_z, self.limit_z))
+        for i, (px_uncorrected, py_uncorrected, pz_bed) in enumerate(positions):
+            # Estimate nozzle XYZ at the moment of probe trigger
+            noz_x_at_trigger = px_uncorrected - probe_x_offset
+            noz_y_at_trigger = py_uncorrected - probe_y_offset
+            noz_z_at_trigger = pz_bed + probe_z_offset_config
 
-        half_min_step_dist = min([r.get_steppers()[0].get_step_dist()
-                                  for r in self.rails]) * .5
-        def ratio_to_xy(ratio, arm_len, r_boundary):
-            val_inside_sqrt = (arm_len**2 / (ratio**2 + 1.)) - half_min_step_dist**2
-            if val_inside_sqrt < 0.: val_inside_sqrt = 0.
-            return (ratio * math.sqrt(val_inside_sqrt)
-                    + half_min_step_dist - r_boundary)
-
-        self.slow_xy2 = ratio_to_xy(SLOW_RATIO, self.min_arm_length, self.radius)**2
-        self.very_slow_xy2 = ratio_to_xy(2. * SLOW_RATIO, self.min_arm_length, self.radius)**2
-        max_safe_xy_for_min_arm = 0.0
-        if self.min_arm_length > self.radius:
-             max_safe_xy_for_min_arm = ratio_to_xy(4. * SLOW_RATIO, self.min_arm_length, self.radius)
-        else:
-             logging.warning("min_arm_length (%.2f) is not greater than delta_radius (%.2f) "
-                             "for max_xy2 boundary calculation." % (self.min_arm_length, self.radius))
-        self.max_xy2 = min(print_radius, max_safe_xy_for_min_arm)**2
-        if print_radius > max_safe_xy_for_min_arm and max_safe_xy_for_min_arm > 0:
-            logging.warning("print_radius %.2fmm is larger than kinematically safe radius %.2fmm"
-                            % (print_radius, max_safe_xy_for_min_arm))
-
-        max_xy = math.sqrt(self.max_xy2) if self.max_xy2 > 0 else 0.0
-        logging.info("Delta max build radius %.2fmm (moves slowed past %.2fmm"
-                     " and %.2fmm)"
-                     % (max_xy, math.sqrt(self.slow_xy2) if self.slow_xy2 > 0 else 0.0,
-                        math.sqrt(self.very_slow_xy2) if self.very_slow_xy2 > 0 else 0.0))
-        self.axes_min = toolhead.Coord(-max_xy, -max_xy, self.min_z, 0.)
-        self.axes_max = toolhead.Coord(max_xy, max_xy, self.max_z, 0.)
-        self.set_position([0., 0., 0.], "")
-
-    def get_steppers(self):
-        return [s for rail in self.rails for s in rail.get_steppers()]
-
-    def _get_effective_tower_xy_and_z(self, tower_index, carriage_height_on_rail):
-        h_i = carriage_height_on_rail
-        B_ix, B_iy = self.towers[tower_index]
-        alpha_i_rad = math.radians(self.angles[tower_index])
-        theta_r_rad = self.radial_leans_rad[tower_index]
-        theta_t_rad = self.tangential_leans_rad[tower_index]
-
-        eff_carriage_x = B_ix + h_i * (math.sin(theta_r_rad) * math.cos(alpha_i_rad)
-                                     - math.sin(theta_t_rad) * math.sin(alpha_i_rad))
-        eff_carriage_y = B_iy + h_i * (math.sin(theta_r_rad) * math.sin(alpha_i_rad)
-                                     + math.sin(theta_t_rad) * math.cos(alpha_i_rad))
-        val_under_sqrt_z = 1.0 - math.sin(theta_r_rad)**2 - math.sin(theta_t_rad)**2
-        eff_carriage_z = h_i * math.sqrt(max(0.0, val_under_sqrt_z))
-        return eff_carriage_x, eff_carriage_y, eff_carriage_z
-
-    def _actuator_to_cartesian(self, spos): # spos are carriage heights on rail
-        sphere_coords = []
-        for i in range(3):
-            eff_x, eff_y, eff_z = self._get_effective_tower_xy_and_z(i, spos[i])
-            sphere_coords.append( (eff_x, eff_y, eff_z) )
-        return mathutil.trilateration(sphere_coords, self.arm2)
-
-    def calc_position(self, stepper_positions):
-        spos = [stepper_positions[rail.get_name()] for rail in self.rails]
-        return self._actuator_to_cartesian(spos)
-
-    def set_position(self, newpos, homing_axes):
-        for rail in self.rails:
-            rail.set_position(newpos)
-        self.limit_xy2 = -1.
-        if homing_axes == "xyz":
-            self.need_home = False
-
-    def clear_homing_state(self, clear_axes):
-        if clear_axes:
-            self.limit_xy2 = -1
-            self.need_home = True
-
-    def home(self, homing_state):
-        homing_state.set_axes([0, 1, 2])
-        forcepos = list(self.home_position)
-        val_under_sqrt = max(self.arm2) - self.max_xy2
-        if val_under_sqrt < 0: val_under_sqrt = 0.0
-        forcepos[2] = -1.5 * math.sqrt(val_under_sqrt)
-        homing_state.home_rails(self.rails, forcepos, self.home_position)
-
-    def check_move(self, move):
-        end_pos = move.end_pos
-        end_xy2 = end_pos[0]**2 + end_pos[1]**2
-        if end_xy2 <= self.limit_xy2 and not move.axes_d[2]:
-            return
-        if self.need_home:
-            raise move.move_error("Must home first")
-        end_z = end_pos[2]
-        limit_xy2 = self.max_xy2
-        if end_z > self.limit_z:
-            above_z_limit = end_z - self.limit_z
-            val_under_sqrt = self.min_arm2 - (self.min_arm_length - above_z_limit)**2
-            if val_under_sqrt < 0: val_under_sqrt = 0.0
-            allowed_radius = self.radius - math.sqrt(val_under_sqrt)
-            limit_xy2 = min(limit_xy2, allowed_radius**2 if allowed_radius > 0 else 0)
-        if end_xy2 > limit_xy2 or end_z > self.max_z or end_z < self.min_z:
-            if (end_pos[:2] != self.home_position[:2]
-                or end_z < self.min_z or end_z > self.home_position[2]):
-                raise move.move_error()
-            limit_xy2 = -1.
-        if move.axes_d[2]:
-            z_ratio = move.move_d / abs(move.axes_d[2]) if abs(move.axes_d[2]) > 1e-9 else SLOW_RATIO * 10
-            move.limit_speed(self.max_z_velocity * z_ratio,
-                             self.max_z_accel * z_ratio)
-            limit_xy2 = -1.
-        extreme_xy2 = max(end_xy2, move.start_pos[0]**2 + move.start_pos[1]**2)
-        if extreme_xy2 > self.slow_xy2:
-            r = 0.5
-            if extreme_xy2 > self.very_slow_xy2:
-                r = 0.25
-            move.limit_speed(self.max_velocity * r, self.max_accel * r)
-            limit_xy2 = -1.
-        self.limit_xy2 = min(limit_xy2, self.slow_xy2 if self.slow_xy2 > 0 else -1.)
-
-    def get_status(self, eventtime):
-        return {
-            'homed_axes': '' if self.need_home else 'xyz',
-            'axis_minimum': self.axes_min,
-            'axis_maximum': self.axes_max,
-            'cone_start_z': self.limit_z,
-        }
-
-    def get_calibration(self):
-        endstops = [rail.get_homing_info().position_endstop
-                    for rail in self.rails]
-        stepdists = [rail.get_steppers()[0].get_step_dist()
-                     for rail in self.rails]
-        return DeltaCalibration(self, self.radius, self.angles, self.arm_lengths,
-                                endstops, stepdists, self.radius_offsets,
-                                self.effector_joint_radius,
-                                self.radial_leans_rad, self.tangential_leans_rad)
-
-    def get_effector_normal(self, nozzle_x, nozzle_y, nozzle_z):
-        ffi_main, ffi_lib = chelper.get_ffi()
-        carriage_heights = []
-        for i in range(3):
-            stepper_obj = self.rails[i].get_steppers()[0]
-            sk = stepper_obj._stepper_kinematics
-            h = ffi_lib.itersolve_calc_position_from_coord(
-                sk, nozzle_x, nozzle_y, nozzle_z
-            )
-            carriage_heights.append(h)
-
-        C_coords = []
-        for i in range(3):
-            eff_cx, eff_cy, eff_cz = self._get_effective_tower_xy_and_z(i, carriage_heights[i])
-            C_coords.append( (eff_cx, eff_cy, eff_cz) )
-
-        E_coords_xy = []
-        for i in range(3):
-            angle_rad = math.radians(self.angles[i])
-            ex = nozzle_x + self.effector_joint_radius * math.cos(angle_rad)
-            ey = nozzle_y + self.effector_joint_radius * math.sin(angle_rad)
-            E_coords_xy.append( (ex, ey) )
-
-        E_coords_z = []
-        for i in range(3):
-            dx_sq = (E_coords_xy[i][0] - C_coords[i][0])**2
-            dy_sq = (E_coords_xy[i][1] - C_coords[i][1])**2
-            arm_len_sq = self.arm2[i]
-            val_under_sqrt = arm_len_sq - dx_sq - dy_sq
-            if val_under_sqrt < 1e-9:
-                logging.warning(
-                    "Probe tilt: Unreachable effector joint %d for nozzle (%.3f,%.3f,%.3f). ArmLenSq=%.3f, dXsq+dYsq=%.3f"
-                    % (i, nozzle_x, nozzle_y, nozzle_z, arm_len_sq, dx_sq + dy_sq))
-                return (0.0, 0.0, 1.0)
-            e_z = C_coords[i][2] - math.sqrt(val_under_sqrt)
-            E_coords_z.append(e_z)
-
-        E = [ (E_coords_xy[i][0], E_coords_xy[i][1], E_coords_z[i]) for i in range(3) ]
-        v1_x, v1_y, v1_z = E[1][0]-E[0][0], E[1][1]-E[0][1], E[1][2]-E[0][2]
-        v2_x, v2_y, v2_z = E[2][0]-E[0][0], E[2][1]-E[0][1], E[2][2]-E[0][2]
-        nx, ny, nz = (v1_y*v2_z - v1_z*v2_y), (v1_z*v2_x - v1_x*v2_z), (v1_x*v2_y - v1_y*v2_x)
-        norm_len = math.sqrt(nx**2 + ny**2 + nz**2)
-        if norm_len < 1e-9:
-            logging.warning("Probe tilt: Zero length normal vector for nozzle (%.3f,%.3f,%.3f)."
-                            % (nozzle_x, nozzle_y, nozzle_z))
-            return (0.0, 0.0, 1.0)
-        nx /= norm_len; ny /= norm_len; nz /= norm_len
-        return (-nx, -ny, -nz) if nz < 0.0 else (nx, ny, nz)
-
-# Delta parameter calibration for DELTA_CALIBRATE tool
-class DeltaCalibration:
-    def __init__(self, kinematics_parent, radius, angles, arms, endstops, stepdists,
-                 radius_offsets=None, effector_joint_radius=40.0,
-                 radial_leans_rad=None, tangential_leans_rad=None):
-        self.kinematics_parent = kinematics_parent
-        self.radius = radius
-        self.angles = angles
-        self.arms = arms
-        self.endstops = endstops
-        self.stepdists = stepdists
-        self.radius_offsets = radius_offsets if radius_offsets is not None else [0.0, 0.0, 0.0]
-        self.effector_joint_radius = effector_joint_radius
-        self.radial_leans_rad = radial_leans_rad if radial_leans_rad is not None else [0.0, 0.0, 0.0]
-        self.tangential_leans_rad = tangential_leans_rad if tangential_leans_rad is not None else [0.0, 0.0, 0.0]
-
-        self.towers = []
-        for i in range(3):
-            eff_radius = self.radius + self.radius_offsets[i]
-            angle_rad = math.radians(self.angles[i])
-            self.towers.append((math.cos(angle_rad) * eff_radius,
-                                math.sin(angle_rad) * eff_radius))
-
-        self.abs_endstops = []
-        for i in range(3):
-            eff_radius_i = self.radius + self.radius_offsets[i]
-            val_inside_sqrt = self.arms[i]**2 - eff_radius_i**2
-            if val_inside_sqrt < 0:
-                logging.warning("DeltaCalibration init: Arm %.2f for tower %d is too short for effective radius %.2f."
-                                % (self.arms[i], i, eff_radius_i))
-                val_inside_sqrt = 0
-            self.abs_endstops.append(self.endstops[i] + math.sqrt(val_inside_sqrt))
-
-    def coordinate_descent_params(self, is_extended=False):
-        adj_params = [
-            'radius', 'radius_offset_a', 'radius_offset_b', 'radius_offset_c',
-            'angle_a', 'angle_b',
-            'arm_a', 'arm_b', 'arm_c',
-            'endstop_a', 'endstop_b', 'endstop_c',
-            'radial_lean_a', 'radial_lean_b', 'radial_lean_c',
-            'tangential_lean_a', 'tangential_lean_b', 'tangential_lean_c'
-        ]
-        params = {'radius': self.radius}
-        for i, axis in enumerate('abc'):
-            params['radius_offset_'+axis] = self.radius_offsets[i]
-            params['angle_'+axis] = self.angles[i]
-            params['arm_'+axis] = self.arms[i]
-            params['endstop_'+axis] = self.endstops[i]
-            params['stepdist_'+axis] = self.stepdists[i]
-            params['radial_lean_'+axis] = math.degrees(self.radial_leans_rad[i])
-            params['tangential_lean_'+axis] = math.degrees(self.tangential_leans_rad[i])
-        return adj_params, params
-
-    def new_calibration(self, params):
-        radius = params['radius']
-        current_angles = list(self.angles)
-        current_angles[0] = params.get('angle_a', self.angles[0])
-        current_angles[1] = params.get('angle_b', self.angles[1])
-        new_radius_offsets = [params.get('radius_offset_'+axis, self.radius_offsets[i]) for i, axis in enumerate('abc')]
-        new_arms = [params.get('arm_'+axis, self.arms[i]) for i, axis in enumerate('abc')]
-        new_endstops = [params.get('endstop_'+axis, self.endstops[i]) for i, axis in enumerate('abc')]
-        new_radial_leans_rad = [math.radians(params.get('radial_lean_'+axis, math.degrees(self.radial_leans_rad[i]))) for i, axis in enumerate('abc')]
-        new_tangential_leans_rad = [math.radians(params.get('tangential_lean_'+axis, math.degrees(self.tangential_leans_rad[i]))) for i, axis in enumerate('abc')]
-
-        return DeltaCalibration(self.kinematics_parent, radius, current_angles, new_arms, new_endstops,
-                                self.stepdists, new_radius_offsets,
-                                self.effector_joint_radius,
-                                new_radial_leans_rad, new_tangential_leans_rad)
-
-    def _get_effective_tower_xy_and_z(self, tower_index, carriage_height_on_rail):
-        h_i = carriage_height_on_rail
-        B_ix, B_iy = self.towers[tower_index]
-        alpha_i_rad = math.radians(self.angles[tower_index])
-        theta_r_rad = self.radial_leans_rad[tower_index]
-        theta_t_rad = self.tangential_leans_rad[tower_index]
-        eff_carriage_x = B_ix + h_i * (math.sin(theta_r_rad) * math.cos(alpha_i_rad)
-                                     - math.sin(theta_t_rad) * math.sin(alpha_i_rad))
-        eff_carriage_y = B_iy + h_i * (math.sin(theta_r_rad) * math.sin(alpha_i_rad)
-                                     + math.sin(theta_t_rad) * math.cos(alpha_i_rad))
-        val_under_sqrt_z = 1.0 - math.sin(theta_r_rad)**2 - math.sin(theta_t_rad)**2
-        eff_carriage_z = h_i * math.sqrt(max(0.0, val_under_sqrt_z))
-        return eff_carriage_x, eff_carriage_y, eff_carriage_z
-
-    def get_position_from_stable(self, stable_position): # FK
-        sphere_coords = []
-        for i in range(3):
-            h_i = self.endstops[i] - (stable_position[i] * self.stepdists[i])
-            eff_x, eff_y, eff_z = self._get_effective_tower_xy_and_z(i, h_i)
-            sphere_coords.append( (eff_x, eff_y, eff_z) )
-        return mathutil.trilateration(sphere_coords, [a**2 for a in self.arms])
-
-    def calc_stable_position(self, coord): # IK (coord is nozzle_xyz = (nx, ny, nz))
-        nx, ny, nz = coord
-        steppos_h_on_rail = []
-
-        for i in range(3):
-            def f_h_i(h_i_trial):
-                ctx_i, cty_i, ctz_i = self._get_effective_tower_xy_and_z(i, h_i_trial)
-                dist_sq = (nx - ctx_i)**2 + (ny - cty_i)**2 + (nz - ctz_i)**2
-                return dist_sq - self.arms[i]**2
-
-            dx_simple = self.towers[i][0] - nx
-            dy_simple = self.towers[i][1] - ny
-            val_under_sqrt_simple = self.arms[i]**2 - dx_simple**2 - dy_simple**2
-            if val_under_sqrt_simple < 0:
-                logging.error("DeltaCalibration IK: Unreachable point for tower %d (initial guess): %s" % (i, coord,))
-                raise ValueError("Delta kinematics: Unreachable point for tower %d in IK initial guess" % i)
-            h_i_approx = math.sqrt(val_under_sqrt_simple) + nz
-
-            h_min_bracket = h_i_approx - 50
-            h_max_bracket = h_i_approx + 50
-            h_min_bracket = max(h_min_bracket, -100.0)
-            h_max_bracket = min(h_max_bracket, self.endstops[i] + 100.0)
-
-            h_i_solution = None
+            # Get effector normal for tilt compensation
             try:
-                if not SCIPY_AVAILABLE:
-                    raise ImportError("SciPy not available for brentq in DeltaCalibration")
-                h_i_solution = scipy.optimize.brentq(f_h_i, h_min_bracket, h_max_bracket, xtol=1e-6, rtol=1e-6)
+                nx, ny, nz = kin.get_effector_normal(noz_x_at_trigger, noz_y_at_trigger, noz_z_at_trigger)
+            except AttributeError:
+                # Fallback if get_effector_normal doesn't exist
+                nx, ny, nz = 0.0, 0.0, 1.0
+                logging.debug("get_effector_normal not available, using vertical normal")
+
+            # Apply tilt correction
+            apply_tilt_correction = True
+            if abs(probe_z_offset_config) < 0.5:  # Small Z offset threshold
+                apply_tilt_correction = False
+                logging.debug("Point %d: Small probe Z offset, skipping tilt correction" % i)
+
+            if apply_tilt_correction and abs(nz) > 1e-6:
+                physical_probe_extension = -probe_z_offset_config
+                x_displacement = physical_probe_extension * (nx / nz)
+                y_displacement = physical_probe_extension * (ny / nz)
+                corrected_px = px_uncorrected + x_displacement
+                corrected_py = py_uncorrected + y_displacement
+            else:
+                corrected_px = px_uncorrected
+                corrected_py = py_uncorrected
+
+            logging.debug(
+                "Point %d: Uncorrected(%.3f,%.3f,%.3f) -> Corrected(%.3f,%.3f,%.3f)" %
+                (i, px_uncorrected, py_uncorrected, pz_bed, corrected_px, corrected_py, pz_bed))
+
+            corrected_probe_positions.append((corrected_px, corrected_py, pz_bed))
+
+        # Convert to stable positions for calibration
+        final_probe_data = []
+        for cpx, cpy, cpz_bed in corrected_probe_positions:
+            stable_pos = delta_params.calc_stable_position((cpx, cpy, cpz_bed))
+            final_probe_data.append((cpz_bed, stable_pos))
+
+        # Perform analysis
+        self.calculate_params(final_probe_data, self.last_distances)
+
+    def calculate_params(self, probe_positions, distances):
+        height_positions = self.manual_heights + probe_positions
+        if not height_positions:
+            self.gcode.respond_info("No probe positions available for calibration.")
+            return
+
+        # Setup for coordinate descent analysis
+        toolhead = self.printer.lookup_object('toolhead')
+        kin = toolhead.get_kinematics()
+        orig_delta_params = kin.get_calibration()
+        
+        # Get calibration parameters
+        try:
+            adj_params, params = orig_delta_params.coordinate_descent_params(is_extended=True)
+        except TypeError:
+            # Fallback for older API
+            adj_params, params = orig_delta_params.coordinate_descent_params()
+
+        logging.info("Calculating delta calibration with %d height points and %d distance points." %
+                     (len(height_positions), len(distances)))
+        logging.info("Initial parameters: %s" % params)
+        logging.info("Adjustable parameters: %s" % adj_params)
+
+        # Weight calculation
+        z_weight = 1.0
+        if distances and probe_positions:
+            z_weight = len(distances) / (MEASURE_WEIGHT * len(probe_positions))
+        elif distances and not probe_positions:
+            z_weight = 0.0
+
+        def delta_errorfunc(current_params_dict):
+            try:
+                temp_delta_params = orig_delta_params.new_calibration(current_params_dict)
+                getpos = temp_delta_params.get_position_from_stable
+                total_error = 0.0
+
+                # Height error calculation
+                if height_positions:
+                    height_error = 0.0
+                    for z_offset, stable_pos in height_positions:
+                        x, y, z = getpos(stable_pos)
+                        height_error += (z - z_offset) ** 2
+                    total_error += height_error * z_weight
+
+                # Distance error calculation
+                if distances:
+                    distance_error = 0.0
+                    for dist, stable_pos1, stable_pos2 in distances:
+                        x1, y1, z1 = getpos(stable_pos1)
+                        x2, y2, z2 = getpos(stable_pos2)
+                        calculated_dist = math.sqrt((x1-x2)**2 + (y1-y2)**2 + (z1-z2)**2)
+                        distance_error += (calculated_dist - dist) ** 2
+                    total_error += distance_error
+
+                return total_error
             except Exception as e:
-                logging.warning("SciPy brentq for lean-aware IK in DeltaCalibration failed (tower %d, coord %s): %s. "
-                                "Falling back to C-level lean-aware IK." % (i, coord, str(e)))
-                if self.kinematics_parent is not None:
-                    ffi_main, ffi_lib = chelper.get_ffi()
-                    sk = self.kinematics_parent.rails[i].get_steppers()[0]._stepper_kinematics
-                    h_i_solution = ffi_lib.itersolve_calc_position_from_coord(sk, nx, ny, nz)
+                logging.debug("Error in delta_errorfunc: %s" % str(e))
+                return float('inf')
+
+        # Optimization
+        if SCIPY_AVAILABLE:
+            initial_values = [params[key] for key in adj_params]
+            
+            # Set bounds for parameters
+            bounds = []
+            for key in adj_params:
+                if 'arm_' in key:
+                    bounds.append((50.0, None))
+                elif key == 'radius' and 'offset' not in key:
+                    bounds.append((50.0, None))
+                elif 'lean' in key:
+                    bounds.append((-5.0, 5.0))
                 else:
-                    logging.error("DeltaCalibration: kinematics_parent not available for C-IK fallback.")
-                    raise ValueError("Delta kinematics: kinematics_parent unavailable for fallback IK")
+                    bounds.append((None, None))
 
-            steppos_h_on_rail.append(h_i_solution)
+            def objective_func(x_values):
+                current_params = dict(zip(adj_params, x_values))
+                full_params = dict(params)
+                full_params.update(current_params)
+                return delta_errorfunc(full_params)
 
-        return [(self.endstops[i] - h_i) / self.stepdists[i]
-                for i, h_i in enumerate(steppos_h_on_rail)]
+            # Calculate initial error
+            initial_error = objective_func(initial_values)
+            logging.info("Initial error: %.6e" % initial_error)
 
-    def save_state(self, configfile):
-        configfile.set('printer', 'delta_radius', "%.6f" % (self.radius,))
-        configfile.set('printer', 'delta_effector_radius', "%.6f" % (self.effector_joint_radius,))
-        gcode_lines = ["delta_radius: %.6f" % self.radius,
-                       "delta_effector_radius: %.6f" % self.effector_joint_radius]
-        for i, axis in enumerate('abc'):
-            section = 'stepper_'+axis
-            configfile.set(section, 'angle', "%.6f" % (self.angles[i],))
-            configfile.set(section, 'arm_length', "%.6f" % (self.arms[i],))
-            configfile.set(section, 'position_endstop', "%.6f" % (self.endstops[i],))
-            configfile.set(section, 'delta_radius_offset', "%.6f" % (self.radius_offsets[i],))
-            configfile.set(section, 'radial_lean', "%.4f" % (math.degrees(self.radial_leans_rad[i]),))
-            configfile.set(section, 'tangential_lean', "%.4f" % (math.degrees(self.tangential_leans_rad[i]),))
-            gcode_lines.append(
-                "%s: pos_endstop: %.4f angle: %.4f arm: %.4f roff: %.4f rlean: %.4f tlean: %.4f" %
-                (section, self.endstops[i], self.angles[i], self.arms[i],
-                 self.radius_offsets[i], math.degrees(self.radial_leans_rad[i]),
-                 math.degrees(self.tangential_leans_rad[i])))
-        gcode = configfile.get_printer().lookup_object("gcode")
-        gcode.respond_info("\n".join(gcode_lines))
+            # Try L-BFGS-B first
+            try:
+                result = scipy.optimize.minimize(
+                    objective_func, initial_values, 
+                    method='L-BFGS-B', bounds=bounds,
+                    options={'maxiter': 3000, 'ftol': 1e-10, 'gtol': 1e-8}
+                )
+                
+                if result.success:
+                    logging.info("L-BFGS-B optimization successful. Final error: %.6e" % result.fun)
+                    final_values = result.x
+                else:
+                    logging.warning("L-BFGS-B failed: %s. Trying Nelder-Mead..." % result.message)
+                    result = scipy.optimize.minimize(
+                        objective_func, initial_values,
+                        method='Nelder-Mead',
+                        options={'maxiter': 20000, 'xatol': 1e-6, 'fatol': 1e-8}
+                    )
+                    if result.success:
+                        logging.info("Nelder-Mead optimization successful. Final error: %.6e" % result.fun)
+                        final_values = result.x
+                    else:
+                        logging.error("Both optimization methods failed. Using initial values.")
+                        final_values = initial_values
+            except Exception as e:
+                logging.error("SciPy optimization failed: %s" % str(e))
+                final_values = initial_values
 
-def load_kinematics(toolhead, config):
-    return DeltaKinematics(toolhead, config)
+            # Update parameters
+            new_params_dict = dict(zip(adj_params, final_values))
+            new_params = dict(params)
+            new_params.update(new_params_dict)
+        else:
+            # Fallback to coordinate descent
+            logging.info("Using coordinate descent optimization")
+            new_params = mathutil.background_coordinate_descent(
+                self.printer, adj_params, params, delta_errorfunc)
+
+        # Apply new parameters and log results
+        logging.info("Final parameters: %s" % new_params)
+        new_delta_params = orig_delta_params.new_calibration(new_params)
+        
+        # Log height improvements
+        for z_offset, spos in height_positions:
+            orig_z = orig_delta_params.get_position_from_stable(spos)[2]
+            new_z = new_delta_params.get_position_from_stable(spos)[2]
+            logging.info("Height: original=%.6f new=%.6f target=%.6f" % (orig_z, new_z, z_offset))
+
+        # Log distance improvements
+        for dist, spos1, spos2 in distances:
+            # Original distance
+            x1, y1, z1 = orig_delta_params.get_position_from_stable(spos1)
+            x2, y2, z2 = orig_delta_params.get_position_from_stable(spos2)
+            orig_dist = math.sqrt((x1-x2)**2 + (y1-y2)**2 + (z1-z2)**2)
+            # New distance
+            x1, y1, z1 = new_delta_params.get_position_from_stable(spos1)
+            x2, y2, z2 = new_delta_params.get_position_from_stable(spos2)
+            new_dist = math.sqrt((x1-x2)**2 + (y1-y2)**2 + (z1-z2)**2)
+            logging.info("Distance: original=%.6f new=%.6f target=%.6f" % (orig_dist, new_dist, dist))
+
+        # Save results
+        self.save_state(probe_positions, distances, new_delta_params)
+        self.gcode.respond_info(
+            "Delta calibration complete. Use SAVE_CONFIG to store results.")
+
+    cmd_DELTA_CALIBRATE_help = "Delta calibration script"
+    def cmd_DELTA_CALIBRATE(self, gcmd):
+        self.probe_helper.start_probe(gcmd)
+
+    def add_manual_height(self, height):
+        # Get current toolhead position
+        toolhead = self.printer.lookup_object('toolhead')
+        toolhead.flush_step_generation()
+        kin = toolhead.get_kinematics()
+        
+        # Get stepper positions
+        kin_spos = {s.get_name(): s.get_commanded_position()
+                    for s in kin.get_steppers()}
+        kin_pos = kin.calc_position(kin_spos)
+        
+        # Convert to stable position
+        delta_params = kin.get_calibration()
+        stable_pos = tuple(delta_params.calc_stable_position(kin_pos))
+        
+        # Add to manual heights
+        self.manual_heights.append((height, stable_pos))
+        self.gcode.respond_info(
+            "Added manual height: position(%.3f,%.3f,%.3f) = z%.3f" %
+            (kin_pos[0], kin_pos[1], kin_pos[2], height))
+
+    def do_extended_calibration(self):
+        # Get distance measurements
+        if len(self.delta_analyze_entry) <= 1:
+            distances = self.last_distances
+        elif len(self.delta_analyze_entry) < 5:
+            raise self.gcode.error("Not all measurements provided")
+        else:
+            kin = self.printer.lookup_object('toolhead').get_kinematics()
+            delta_params = kin.get_calibration()
+            distances = measurements_to_distances(self.delta_analyze_entry, delta_params)
+        
+        if not self.last_probe_positions:
+            raise self.gcode.error("Must run DELTA_CALIBRATE first")
+        
+        # Perform extended calibration
+        self.calculate_params(self.last_probe_positions, distances)
+
+    cmd_DELTA_ANALYZE_help = "Extended delta calibration tool"
+    def cmd_DELTA_ANALYZE(self, gcmd):
+        # Handle manual height entry
+        mheight = gcmd.get_float('MANUAL_HEIGHT', None)
+        if mheight is not None:
+            self.add_manual_height(mheight)
+            return
+
+        # Parse measurement parameters
+        measurement_params = {
+            'CENTER_DISTS': 6, 'CENTER_PILLAR_WIDTHS': 3,
+            'OUTER_DISTS': 6, 'OUTER_PILLAR_WIDTHS': 6, 'SCALE': 1
+        }
+        
+        for name, expected_count in measurement_params.items():
+            data = gcmd.get(name, None)
+            if data is None:
+                continue
+            try:
+                values = [float(x.strip()) for x in data.split(',')]
+            except (ValueError, AttributeError):
+                raise gcmd.error("Unable to parse parameter '%s'" % name)
+            
+            if len(values) != expected_count:
+                raise gcmd.error("Parameter '%s' must have %d values, got %d" %
+                                 (name, expected_count, len(values)))
+            
+            self.delta_analyze_entry[name] = values
+            logging.info("DELTA_ANALYZE %s = %s" % (name, values))
+
+        # Perform calibration if requested
+        action = gcmd.get('CALIBRATE', None)
+        if action == 'extended':
+            self.do_extended_calibration()
+        elif action is not None:
+            raise gcmd.error("Unknown calibrate action: %s" % action)
+
+def load_config(config):
+    return DeltaCalibrate(config)
