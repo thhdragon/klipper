@@ -1,7 +1,7 @@
 # .cargo/config.toml
 
 [build]
-target = "thumbv6m-none-eabi" # Target for RP2040
+# target = "thumbv6m-none-eabi" # Target for RP2040
 
 [target.thumbv6m-none-eabi]
 # Configure a runner for `cargo run`
