@@ -1,0 +1,1 @@
+// Stub for whconsole.py
