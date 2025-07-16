@@ -64,9 +64,10 @@ delta_stepper_calc_position(struct stepper_kinematics *sk, struct move *m,
 
     double discriminant = B*B - 4.*C_prime;
 
-    if (discriminant < -MAX_SQRT_ARG) {
+    if (isnan(discriminant) || discriminant < -MAX_SQRT_ARG) {
         // Unreachable point with current lean model. Propagate NAN.
-        // errorf("Delta kinematics: Unreachable point (lean) at (%.3f,%.3f,%.3f), D=%.3e", c.x,c.y,c.z, discriminant);
+        errorf("Delta kinematics: Unreachable point (lean) at (%.3f,%.3f,%.3f), D=%.3e", c.x,c.y,c.z, discriminant);
+        logging.info("Delta kinematics: Unreachable point (lean) at (%.3f,%.3f,%.3f), D=%.3e", c.x,c.y,c.z, discriminant);
         return NAN;
     }
     if (discriminant < 0.) discriminant = 0.; // Clamp if slightly negative

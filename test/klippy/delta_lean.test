@@ -1,0 +1,6 @@
+CONFIG test/klippy/delta_lean.cfg
+DICTIONARY klippy/chelper/atmega2560.dict
+GCODE G28 DELTA_CALIBRATE
+SHOULD_FAIL
+--error:
+CALIBRATE FAILED

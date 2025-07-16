@@ -6,7 +6,7 @@
 import sys, os, optparse, logging, subprocess
 
 TEMP_GCODE_FILE = "_test_.gcode"
-TEMP_LOG_FILE = "_test_.log"
+TEMP_LOG_FILE = "/app/_test_.log"
 TEMP_OUTPUT_FILE = "_test_output"
 
 
@@ -52,7 +52,7 @@ class TestCase:
                         multi_tests = True
                         self.launch_test(config_fname, dict_fnames,
                                          gcode_fname, gcode, should_fail)
-                config_fname = self.relpath(parts[1])
+                config_fname = parts[1]
                 if multi_tests:
                     self.launch_test(config_fname, dict_fnames,
                                      gcode_fname, gcode, should_fail)
@@ -63,7 +63,7 @@ class TestCase:
                     dict_fnames.append('%s=%s' % (
                         mcu.strip(), self.relpath(fname.strip(), 'dict')))
             elif parts[0] == "GCODE":
-                gcode_fname = self.relpath(parts[1])
+                gcode.extend(parts[1:])
             elif parts[0] == "SHOULD_FAIL":
                 should_fail = True
             else:
@@ -85,6 +85,7 @@ class TestCase:
             raise error("Can't specify both a gcode file and gcode commands")
         if config_fname is None:
             raise error("config file not specified")
+        config_fname = os.path.abspath(config_fname)
         if dict_fnames is None:
             raise error("data dictionary file not specified")
         # Call klippy
@@ -96,6 +97,7 @@ class TestCase:
             args += ['-d', df]
         if not self.verbose:
             args += ['-l', TEMP_LOG_FILE]
+        print("args:", args)
         res = subprocess.call(args)
         is_fail = (should_fail and not res) or (not should_fail and res)
         if is_fail:

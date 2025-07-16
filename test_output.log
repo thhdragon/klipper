@@ -1,0 +1,4 @@
+    Starting test/klippy/delta_lean.test (delta_lean.cfg)
+
+    All 1 test cases passed
+args: ['/home/jules/.pyenv/versions/3.12.11/bin/python3', './klippy/klippy.py', '/app/test/klippy/delta_lean.cfg', '-i', './_test_.gcode', '-o', '_test_output', '-v', '-d', './klippy/chelper/atmega2560.dict', '-l', '/app/_test_.log']

@@ -262,8 +262,11 @@ itersolve_calc_position_from_coord(struct stepper_kinematics *sk
     m.start_pos.x = x;
     m.start_pos.y = y;
     m.start_pos.z = z;
-    m.move_t = 1000.;
-    return sk->calc_position_cb(sk, &m, 500.);
+    m.axes_r.x = 0.;
+    m.axes_r.y = 0.;
+    m.axes_r.z = 0.;
+    m.move_t = 0.;
+    return sk->calc_position_cb(sk, &m, 0.);
 }
 
 void __visible

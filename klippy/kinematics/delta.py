@@ -445,32 +445,14 @@ class DeltaCalibration:
                     raise ImportError("SciPy not available for brentq in DeltaCalibration")
                 h_i_solution = scipy.optimize.brentq(f_h_i, h_min_bracket, h_max_bracket, xtol=1e-6, rtol=1e-6)
             except Exception as e:
-                # Fallback to C-level IK (which is now lean-aware)
                 logging.warning("SciPy brentq for lean-aware IK in DeltaCalibration failed (tower %d, coord %s): %s. "
                                 "Falling back to C-level lean-aware IK." % (i, coord, str(e)))
                 if self.kinematics_parent is not None:
                     ffi_main, ffi_lib = chelper.get_ffi()
-                    # The C IK is on the stepper_kinematics object (sk)
                     sk = self.kinematics_parent.rails[i].get_steppers()[0]._stepper_kinematics
-                    # itersolve_calc_position_from_coord needs a 'move' and 'move_time'.
-                    # This FFI call is not direct for a simple XYZ.
-                    # For now, as a simpler fallback that is still better than non-lean:
-                    # Use the non-lean calculation if brentq fails AND C-call is complex to shim here.
-                    # This part needs to be improved if brentq often fails.
-                    # The C function is delta_stepper_calc_position(sk, move, move_time)
-                    # We don't have a 'move' object here.
-                    # So, the ultimate fallback is the simple math (non-lean for this point).
-                    logging.warning("DeltaCalibration: C-IK fallback from calc_stable_position not yet implemented directly, using non-lean math for point %d." % i)
-                    dx_fallback = self.towers[i][0] - nx
-                    dy_fallback = self.towers[i][1] - ny
-                    val_under_sqrt_fallback = self.arms[i]**2 - dx_fallback**2 - dy_fallback**2
-                    if val_under_sqrt_fallback < 0:
-                        logging.error("DeltaCalibration: Unreachable point in IK fallback (tower %d): %s" % (i, coord,))
-                        raise ValueError("Delta kinematics: Unreachable point for tower %d in IK fallback" % i)
-                    h_i_solution = math.sqrt(val_under_sqrt_fallback) + nz
+                    h_i_solution = ffi_lib.itersolve_calc_position_from_coord(sk, nx, ny, nz)
                 else:
                     logging.error("DeltaCalibration: kinematics_parent not available for C-IK fallback.")
-                    # This should not happen if constructed by DeltaKinematics.get_calibration()
                     raise ValueError("Delta kinematics: kinematics_parent unavailable for fallback IK")
 
             steppos_h_on_rail.append(h_i_solution)
