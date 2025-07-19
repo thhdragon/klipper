@@ -1,10 +1,10 @@
+use crate::configfile::Config;
 use crate::itersolve::StepperKinematics;
+use crate::toolhead::Move;
 
 // Placeholders
 pub struct Toolhead;
-pub struct Config;
 pub struct HomingState;
-pub struct Move;
 pub struct Printer;
 mod idex_modes {
     pub struct DualCarriages;
