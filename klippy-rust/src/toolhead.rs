@@ -141,6 +141,89 @@ impl Move {
             decel_t: 0.0,
         }
     }
+
+    pub fn calc_junction(&mut self, prev_move: &Move) {
+        if !self.is_kinematic_move || !prev_move.is_kinematic_move {
+            return;
+        }
+        // Allow extra axes to calculate maximum junction
+        // let ea_v2 = self
+        //     .toolhead
+        //     .extra_axes
+        //     .iter()
+        //     .enumerate()
+        //     .map(|(i, ea)| ea.calc_junction(prev_move, self, i + 3))
+        //     .collect::<Vec<_>>();
+        let max_start_v2 = self
+            .max_cruise_v2
+            .min(prev_move.max_cruise_v2)
+            .min(prev_move.next_junction_v2)
+            .min(prev_move.max_start_v2 + prev_move.delta_v2);
+        // .min(ea_v2.iter().fold(std::f64::INFINITY, |a, &b| a.min(b)));
+
+        // Find max velocity using "approximated centripetal velocity"
+        let axes_r = self.axes_r;
+        let prev_axes_r = prev_move.axes_r;
+        let junction_cos_theta = -(axes_r[0] * prev_axes_r[0]
+            + axes_r[1] * prev_axes_r[1]
+            + axes_r[2] * prev_axes_r[2]);
+        let sin_theta_d2 = (0.5 * (1.0 - junction_cos_theta)).max(0.0).sqrt();
+        let cos_theta_d2 = (0.5 * (1.0 + junction_cos_theta)).max(0.0).sqrt();
+        let one_minus_sin_theta_d2 = 1.0 - sin_theta_d2;
+        if one_minus_sin_theta_d2 > 0.0 && cos_theta_d2 > 0.0 {
+            let r_jd = sin_theta_d2 / one_minus_sin_theta_d2;
+            let move_jd_v2 = r_jd * self.junction_deviation * self.accel;
+            let pmove_jd_v2 = r_jd * prev_move.junction_deviation * prev_move.accel;
+            let quarter_tan_theta_d2 = 0.25 * sin_theta_d2 / cos_theta_d2;
+            let move_centripetal_v2 = self.delta_v2 * quarter_tan_theta_d2;
+            let pmove_centripetal_v2 = prev_move.delta_v2 * quarter_tan_theta_d2;
+            let max_start_v2 = max_start_v2
+                .min(move_jd_v2)
+                .min(pmove_jd_v2)
+                .min(move_centripetal_v2)
+                .min(pmove_centripetal_v2);
+        }
+        // Apply limits
+        self.max_start_v2 = max_start_v2;
+        self.max_smoothed_v2 = max_start_v2.min(prev_move.max_smoothed_v2 + prev_move.smooth_delta_v2);
+    }
+
+    pub fn set_junction(&mut self, start_v2: f64, cruise_v2: f64, end_v2: f64) {
+        let half_inv_accel = 0.5 / self.accel;
+        let accel_d = (cruise_v2 - start_v2) * half_inv_accel;
+        let decel_d = (cruise_v2 - end_v2) * half_inv_accel;
+        let cruise_d = self.move_d - accel_d - decel_d;
+        self.start_v = start_v2.sqrt();
+        self.cruise_v = cruise_v2.sqrt();
+        self.end_v = end_v2.sqrt();
+        self.accel_t = accel_d / ((self.start_v + self.cruise_v) * 0.5);
+        self.cruise_t = cruise_d / self.cruise_v;
+        self.decel_t = decel_d / ((self.end_v + self.cruise_v) * 0.5);
+    }
+
+    pub fn limit_speed(&mut self, speed: f64, accel: f64) {
+        let speed2 = speed * speed;
+        if speed2 < self.max_cruise_v2 {
+            self.max_cruise_v2 = speed2;
+            self.min_move_t = self.move_d / speed;
+        }
+        self.accel = self.accel.min(accel);
+        self.delta_v2 = 2.0 * self.move_d * self.accel;
+        self.smooth_delta_v2 = self.smooth_delta_v2.min(self.delta_v2);
+    }
+
+    pub fn limit_next_junction_speed(&mut self, speed: f64) {
+        self.next_junction_v2 = self.next_junction_v2.min(speed * speed);
+    }
+
+    pub fn move_error(&self, msg: &str) {
+        let ep = self.end_pos;
+        let m = format!(
+            "{}: {:.3} {:.3} {:.3} [{:.3}]",
+            msg, ep[0], ep[1], ep[2], ep[3]
+        );
+        // unsafe { (*self.toolhead).printer.command_error(m) };
+    }
 }
 
 pub struct LookAheadQueue {
