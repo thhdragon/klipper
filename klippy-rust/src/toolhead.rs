@@ -1,6 +1,6 @@
-use crate::kinematics::cartesian::{CartKinematics, Toolhead};
+use crate::kinematics::cartesian::CartKinematics;
 use crate::mcu::MCU;
-use crate::trapq::{self, TrapQ};
+use crate::trapq::TrapQ;
 use crate::Printer;
 use std::collections::VecDeque;
 
@@ -41,6 +41,7 @@ pub mod chelper {
 }
 pub mod kinematics {
     pub mod extruder {
+        #[derive(Clone, Copy)]
         pub struct DummyExtruder;
         impl DummyExtruder {
             pub fn new() -> Self {
@@ -50,6 +51,7 @@ pub mod kinematics {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct Move {
     toolhead: *mut ToolHead,
     start_pos: [f64; 4],
@@ -57,7 +59,6 @@ pub struct Move {
     speed: f64,
     accel: f64,
     junction_deviation: f64,
-    timing_callbacks: Vec<fn(f64)>,
     is_kinematic_move: bool,
     axes_d: [f64; 4],
     move_d: f64,
@@ -121,7 +122,6 @@ impl Move {
             speed,
             accel,
             junction_deviation: toolhead.junction_deviation,
-            timing_callbacks: vec![],
             is_kinematic_move,
             axes_d,
             move_d,
@@ -154,7 +154,7 @@ impl Move {
         //     .enumerate()
         //     .map(|(i, ea)| ea.calc_junction(prev_move, self, i + 3))
         //     .collect::<Vec<_>>();
-        let max_start_v2 = self
+        let mut max_start_v2 = self
             .max_cruise_v2
             .min(prev_move.max_cruise_v2)
             .min(prev_move.next_junction_v2)
@@ -177,7 +177,7 @@ impl Move {
             let quarter_tan_theta_d2 = 0.25 * sin_theta_d2 / cos_theta_d2;
             let move_centripetal_v2 = self.delta_v2 * quarter_tan_theta_d2;
             let pmove_centripetal_v2 = prev_move.delta_v2 * quarter_tan_theta_d2;
-            let max_start_v2 = max_start_v2
+            max_start_v2 = max_start_v2
                 .min(move_jd_v2)
                 .min(pmove_jd_v2)
                 .min(move_centripetal_v2)
@@ -185,7 +185,8 @@ impl Move {
         }
         // Apply limits
         self.max_start_v2 = max_start_v2;
-        self.max_smoothed_v2 = max_start_v2.min(prev_move.max_smoothed_v2 + prev_move.smooth_delta_v2);
+        self.max_smoothed_v2 =
+            max_start_v2.min(prev_move.max_smoothed_v2 + prev_move.smooth_delta_v2);
     }
 
     pub fn set_junction(&mut self, start_v2: f64, cruise_v2: f64, end_v2: f64) {
@@ -218,7 +219,7 @@ impl Move {
 
     pub fn move_error(&self, msg: &str) {
         let ep = self.end_pos;
-        let m = format!(
+        let _m = format!(
             "{}: {:.3} {:.3} {:.3} [{:.3}]",
             msg, ep[0], ep[1], ep[2], ep[3]
         );
@@ -252,13 +253,74 @@ impl LookAheadQueue {
         self.queue.back_mut()
     }
 
-    pub fn add_move(&mut self, move_to_add: Move) -> bool {
-        if let Some(_prev_move) = self.queue.back() {
-            // move_to_add.calc_junction(prev_move);
+    pub fn add_move(&mut self, mut move_to_add: Move) -> bool {
+        if let Some(prev_move) = self.queue.back() {
+            move_to_add.calc_junction(prev_move);
         }
         self.junction_flush -= move_to_add.min_move_t;
         self.queue.push_back(move_to_add);
         self.junction_flush <= 0.0
+    }
+
+    pub fn flush(&mut self, lazy: bool) -> Vec<Move> {
+        self.junction_flush = 0.250;
+        let mut update_flush_count = lazy;
+        let queue = &mut self.queue;
+        let mut flush_count = queue.len();
+
+        let mut delayed: Vec<(Move, f64, f64)> = vec![];
+        let mut next_end_v2 = 0.0;
+        let mut next_smoothed_v2 = 0.0;
+        let mut peak_cruise_v2 = 0.0;
+
+        for i in (0..flush_count).rev() {
+            let mut move_ = queue[i];
+            let reachable_start_v2 = next_end_v2 + move_.delta_v2;
+            let start_v2 = move_.max_start_v2.min(reachable_start_v2);
+            let reachable_smoothed_v2 = next_smoothed_v2 + move_.smooth_delta_v2;
+            let smoothed_v2 = move_.max_smoothed_v2.min(reachable_smoothed_v2);
+
+            if smoothed_v2 < reachable_smoothed_v2 {
+                if smoothed_v2 + move_.smooth_delta_v2 > next_smoothed_v2 || !delayed.is_empty() {
+                    if update_flush_count && peak_cruise_v2 > 0.0 {
+                        flush_count = i;
+                        update_flush_count = false;
+                    }
+                    peak_cruise_v2 = move_
+                        .max_cruise_v2
+                        .min((smoothed_v2 + reachable_smoothed_v2) * 0.5);
+                    if !delayed.is_empty() {
+                        if !update_flush_count && i < flush_count {
+                            let mut mc_v2 = peak_cruise_v2;
+                            for (m, ms_v2, me_v2) in delayed.iter_mut().rev() {
+                                mc_v2 = mc_v2.min(*ms_v2);
+                                m.set_junction(ms_v2.min(mc_v2), mc_v2, me_v2.min(mc_v2));
+                            }
+                        }
+                        delayed.clear();
+                    }
+                }
+                if !update_flush_count && i < flush_count {
+                    let cruise_v2 = (start_v2 + reachable_start_v2) * 0.5;
+                    let cruise_v2 = cruise_v2.min(move_.max_cruise_v2).min(peak_cruise_v2);
+                    move_.set_junction(
+                        start_v2.min(cruise_v2),
+                        cruise_v2,
+                        next_end_v2.min(cruise_v2),
+                    );
+                }
+            } else {
+                delayed.push((move_, start_v2, next_end_v2));
+            }
+            next_end_v2 = start_v2;
+            next_smoothed_v2 = smoothed_v2;
+        }
+
+        if update_flush_count || flush_count == 0 {
+            return vec![];
+        }
+
+        queue.drain(..flush_count).collect()
     }
 }
 
@@ -322,10 +384,7 @@ impl ToolHead {
         // let reactor = printer.get_reactor();
         // let all_mcus = printer.lookup_objects("mcu");
         // let mcu = all_mcus[0].1;
-        let lookahead = LookAheadQueue {
-            queue: VecDeque::new(),
-            junction_flush: 0.250,
-        };
+        let lookahead = LookAheadQueue::new();
         // lookahead.set_flush_time(2.0);
         let commanded_pos = [0.0, 0.0, 0.0, 0.0];
         // let max_velocity = config.get_float("max_velocity", None, Some(0.0), None);
@@ -367,7 +426,10 @@ impl ToolHead {
             trapq_finalize_moves: chelper::trapq_finalize_moves,
             step_generators: vec![],
             flush_trapqs: vec![trapq],
-            kin: CartKinematics::new(&Toolhead, config),
+            kin: CartKinematics::new(
+                &crate::kinematics::cartesian::Toolhead,
+                config,
+            ),
             coord: gcode::Coord,
             extra_axes: vec![kinematics::extruder::DummyExtruder::new()],
         }
@@ -413,7 +475,7 @@ impl ToolHead {
 
 pub struct DripCompletion;
 
-pub fn add_printer_objects(config: &()) {
+pub fn add_printer_objects(_config: &()) {
     // config.get_printer().add_object("toolhead", ToolHead::new(config));
     // kinematics::extruder::add_printer_objects(config);
 }
