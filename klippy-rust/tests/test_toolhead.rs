@@ -27,3 +27,9 @@ fn test_toolhead_move() {
 fn test_lookahead_queue_new() {
     let _laq = LookAheadQueue::new();
 }
+
+#[test]
+fn test_toolhead_new() {
+    let config = Config {};
+    let _toolhead = ToolHead::new(&config);
+}

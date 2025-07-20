@@ -471,6 +471,149 @@ impl ToolHead {
         // self.drip_update_time(next_move_time, drip_completion, &[]);
         // self.trapq_finalize_moves(self.trapq, std::f64::INFINITY, 0.0);
     }
+
+    fn _process_lookahead(&mut self, lazy: bool) {
+        let moves = self.lookahead.flush(lazy);
+        if moves.is_empty() {
+            return;
+        }
+        if !self.special_queuing_state.is_empty() {
+            self.special_queuing_state = "".to_string();
+            self.need_check_pause = -1.0;
+            self._calc_print_time();
+        }
+        let mut next_move_time = self.print_time;
+        for move_ in moves {
+            if move_.is_kinematic_move {
+                (self.trapq_append)(
+                    self.trapq,
+                    next_move_time,
+                    move_.accel_t,
+                    move_.cruise_t,
+                    move_.decel_t,
+                    move_.start_pos[0],
+                    move_.start_pos[1],
+                    move_.start_pos[2],
+                    move_.axes_r[0],
+                    move_.axes_r[1],
+                    move_.axes_r[2],
+                    move_.start_v,
+                    move_.cruise_v,
+                    move_.accel,
+                );
+            }
+            // for (e_index, ea) in self.extra_axes.iter().enumerate() {
+            //     if move_.axes_d[e_index + 3] != 0.0 {
+            //         ea.process_move(next_move_time, &move_, e_index + 3);
+            //     }
+            // }
+            next_move_time += move_.accel_t + move_.cruise_t + move_.decel_t;
+            // for cb in move_.timing_callbacks {
+            //     cb(next_move_time);
+            // }
+        }
+        // self.note_mcu_movequeue_activity(next_move_time + self.kin_flush_delay, true);
+        self._advance_move_time(next_move_time);
+    }
+
+    fn _advance_move_time(&mut self, next_print_time: f64) {
+        let pt_delay = self.kin_flush_delay + 0.050; // STEPCOMPRESS_FLUSH_TIME
+        let flush_time = self.last_flush_time.max(self.print_time - pt_delay);
+        self.print_time = self.print_time.max(next_print_time);
+        let want_flush_time = flush_time.max(self.print_time - pt_delay);
+        let mut flush_time = flush_time;
+        while flush_time < want_flush_time {
+            flush_time = (flush_time + 0.500).min(want_flush_time); // MOVE_BATCH_TIME
+                                                                    // self.advance_flush_time(flush_time);
+        }
+    }
+
+    fn _calc_print_time(&mut self) {
+        // let curtime = self.reactor.monotonic();
+        // let est_print_time = self.mcu.estimated_print_time(curtime);
+        // let kin_time = (est_print_time + 0.100).max(self.min_restart_time); // MIN_KIN_TIME
+        // let kin_time = kin_time + self.kin_flush_delay;
+        // let min_print_time = (est_print_time + 0.250).max(kin_time); // BUFFER_TIME_START
+        // if min_print_time > self.print_time {
+        //     self.print_time = min_print_time;
+        //     // self.printer.send_event("toolhead:sync_print_time", curtime, est_print_time, self.print_time);
+        // }
+    }
+
+    fn _check_pause(&mut self) {
+        // let eventtime = self.reactor.monotonic();
+        // let est_print_time = self.mcu.estimated_print_time(eventtime);
+        // let buffer_time = self.print_time - est_print_time;
+        // if !self.special_queuing_state.is_empty() {
+        //     if self.check_stall_time > 0.0 {
+        //         if est_print_time < self.check_stall_time {
+        //             self.print_stall += 1;
+        //         }
+        //         self.check_stall_time = 0.0;
+        //     }
+        //     self.special_queuing_state = "Priming".to_string();
+        //     self.need_check_pause = -1.0;
+        //     if self.priming_timer.is_null() {
+        //         self.priming_timer = self.reactor.register_timer(self._priming_handler);
+        //     }
+        //     let wtime = eventtime + (0.100).max(buffer_time - 1.0); // BUFFER_TIME_LOW
+        //     self.reactor.update_timer(self.priming_timer, wtime);
+        // }
+        // while {
+        //     let pause_time = buffer_time - 2.0; // BUFFER_TIME_HIGH
+        //     pause_time > 0.0
+        // } {
+        //     if !self.can_pause {
+        //         self.need_check_pause = std::f64::INFINITY;
+        //         return;
+        //     }
+        //     eventtime = self.reactor.pause(eventtime + (1.0).min(pause_time));
+        //     est_print_time = self.mcu.estimated_print_time(eventtime);
+        //     buffer_time = self.print_time - est_print_time;
+        // }
+        // if self.special_queuing_state.is_empty() {
+        //     self.need_check_pause = est_print_time + 2.0 + 0.100; // BUFFER_TIME_HIGH
+        // }
+    }
+
+    fn _priming_handler(&mut self, _eventtime: f64) {
+        // self.reactor.unregister_timer(self.priming_timer);
+        // self.priming_timer = std::ptr::null_mut();
+        // if self.special_queuing_state == "Priming" {
+        //     self._flush_lookahead();
+        //     self.check_stall_time = self.print_time;
+        // }
+    }
+
+    fn _flush_handler(&mut self, eventtime: f64) {
+        // let est_print_time = self.mcu.estimated_print_time(eventtime);
+        // if self.special_queuing_state.is_empty() {
+        //     let print_time = self.print_time;
+        //     let buffer_time = print_time - est_print_time;
+        //     if buffer_time > 1.0 {
+        //         // BUFFER_TIME_LOW
+        //         return eventtime + buffer_time - 1.0;
+        //     }
+        //     self._flush_lookahead();
+        //     if print_time != self.print_time {
+        //         self.check_stall_time = self.print_time;
+        //     }
+        // }
+        // loop {
+        //     let end_flush = self.need_flush_time + 0.250; // BGFLUSH_EXTRA_TIME
+        //     if self.last_flush_time >= end_flush {
+        //         self.do_kick_flush_timer = true;
+        //         return std::f64::INFINITY;
+        //     }
+        //     let buffer_time = self.last_flush_time - est_print_time;
+        //     if buffer_time > 0.200 {
+        //         // BGFLUSH_LOW_TIME
+        //         return eventtime + buffer_time - 0.200;
+        //     }
+        //     let ftime = est_print_time + 0.200 + 0.200; // BGFLUSH_LOW_TIME + BGFLUSH_BATCH_TIME
+        //     self._advance_flush_time(end_flush.min(ftime));
+        // }
+    }
 }
 
 pub struct DripCompletion;
