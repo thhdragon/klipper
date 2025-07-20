@@ -28,8 +28,22 @@ fn test_lookahead_queue_new() {
     let _laq = LookAheadQueue::new();
 }
 
+use klippy_rust::kinematics::extruder::DummyExtruder;
+
 #[test]
 fn test_toolhead_new() {
     let config = Config {};
     let _toolhead = ToolHead::new(&config);
+}
+
+#[test]
+fn test_toolhead_extra_axes() {
+    let config = Config {};
+    let mut toolhead = ToolHead::new(&config);
+    assert_eq!(toolhead.get_extra_axes().len(), 4);
+    let extruder = DummyExtruder::new();
+    toolhead.add_extra_axis(extruder);
+    assert_eq!(toolhead.get_extra_axes().len(), 5);
+    toolhead.remove_extra_axis(extruder);
+    assert_eq!(toolhead.get_extra_axes().len(), 4);
 }

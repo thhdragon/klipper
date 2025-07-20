@@ -1,3 +1,4 @@
+use crate::configfile::Config;
 use crate::kinematics::cartesian::CartKinematics;
 use crate::mcu::MCU;
 use crate::trapq::TrapQ;
@@ -41,7 +42,7 @@ pub mod chelper {
 }
 pub mod kinematics {
     pub mod extruder {
-        #[derive(Clone, Copy)]
+        #[derive(Clone, Copy, PartialEq)]
         pub struct DummyExtruder;
         impl DummyExtruder {
             pub fn new() -> Self {
@@ -53,7 +54,6 @@ pub mod kinematics {
 
 #[derive(Clone, Copy)]
 pub struct Move {
-    toolhead: *mut ToolHead,
     start_pos: [f64; 4],
     end_pos: [f64; 4],
     speed: f64,
@@ -79,9 +79,17 @@ pub struct Move {
 }
 
 impl Move {
-    pub fn new(toolhead: &mut ToolHead, start_pos: [f64; 4], end_pos: [f64; 4], speed: f64) -> Self {
+    pub fn new(
+        max_velocity: f64,
+        max_accel: f64,
+        junction_deviation: f64,
+        max_accel_to_decel: f64,
+        start_pos: &[f64],
+        end_pos: &[f64],
+        speed: f64,
+    ) -> Self {
         let mut move_d = 0.0;
-        let mut axes_d = [0.0; 4];
+        let mut axes_d = vec![0.0; start_pos.len()];
         for i in 0..3 {
             axes_d[i] = end_pos[i] - start_pos[i];
             move_d += axes_d[i] * axes_d[i];
@@ -89,9 +97,9 @@ impl Move {
         move_d = move_d.sqrt();
 
         let mut is_kinematic_move = true;
-        let mut velocity = speed.min(toolhead.max_velocity);
-        let mut accel = toolhead.max_accel;
-        let mut end_pos = end_pos;
+        let mut velocity = speed.min(max_velocity);
+        let mut accel = max_accel;
+        let mut end_pos = end_pos.to_vec();
 
         if move_d < 0.000000001 {
             // Extrude only move
@@ -108,30 +116,24 @@ impl Move {
         }
 
         let inv_move_d = if move_d > 0.0 { 1.0 / move_d } else { 0.0 };
-        let axes_r = [
-            axes_d[0] * inv_move_d,
-            axes_d[1] * inv_move_d,
-            axes_d[2] * inv_move_d,
-            axes_d[3] * inv_move_d,
-        ];
+        let axes_r = axes_d.iter().map(|d| d * inv_move_d).collect::<Vec<_>>();
 
         Move {
-            toolhead,
-            start_pos,
-            end_pos,
+            start_pos: start_pos.try_into().unwrap(),
+            end_pos: end_pos.try_into().unwrap(),
             speed,
             accel,
-            junction_deviation: toolhead.junction_deviation,
+            junction_deviation,
             is_kinematic_move,
-            axes_d,
+            axes_d: axes_d.try_into().unwrap(),
             move_d,
-            axes_r,
+            axes_r: axes_r.try_into().unwrap(),
             min_move_t: move_d / velocity,
             max_start_v2: 0.0,
             max_cruise_v2: velocity * velocity,
             delta_v2: 2.0 * move_d * accel,
             max_smoothed_v2: 0.0,
-            smooth_delta_v2: 2.0 * move_d * toolhead.max_accel_to_decel,
+            smooth_delta_v2: 2.0 * move_d * max_accel_to_decel,
             next_junction_v2: 999999999.9,
             start_v: 0.0,
             cruise_v: 0.0,
@@ -330,7 +332,7 @@ pub struct ToolHead {
     all_mcus: Vec<*mut MCU>,
     mcu: *mut MCU,
     lookahead: LookAheadQueue,
-    commanded_pos: [f64; 4],
+    commanded_pos: Vec<f64>,
     max_velocity: f64,
     max_accel: f64,
     min_cruise_ratio: f64,
@@ -375,18 +377,18 @@ pub struct ToolHead {
     flush_trapqs: Vec<*mut TrapQ>,
     kin: CartKinematics,
     coord: gcode::Coord,
-    extra_axes: Vec<kinematics::extruder::DummyExtruder>,
+    pub extra_axes: Vec<kinematics::extruder::DummyExtruder>,
 }
 
 impl ToolHead {
-    pub fn new(config: &crate::configfile::Config) -> Self {
+    pub fn new(config: &Config) -> Self {
         // let printer = config.get_printer();
         // let reactor = printer.get_reactor();
         // let all_mcus = printer.lookup_objects("mcu");
         // let mcu = all_mcus[0].1;
         let lookahead = LookAheadQueue::new();
         // lookahead.set_flush_time(2.0);
-        let commanded_pos = [0.0, 0.0, 0.0, 0.0];
+        let commanded_pos = vec![0.0, 0.0, 0.0, 0.0];
         // let max_velocity = config.get_float("max_velocity", None, Some(0.0), None);
         // let max_accel = config.get_float("max_accel", None, Some(0.0), None);
         // let min_cruise_ratio = 0.5;
@@ -435,8 +437,16 @@ impl ToolHead {
         }
     }
 
-    pub fn move_(&mut self, newpos: [f64; 4], speed: f64) {
-        let mut move_ = Move::new(self, self.commanded_pos, newpos, speed);
+    pub fn move_(&mut self, newpos: &[f64], speed: f64) {
+        let mut move_ = Move::new(
+            self.max_velocity,
+            self.max_accel,
+            self.junction_deviation,
+            self.max_accel_to_decel,
+            &self.commanded_pos,
+            newpos,
+            speed,
+        );
         if move_.move_d == 0.0 {
             return;
         }
@@ -448,7 +458,7 @@ impl ToolHead {
         //         ea.check_move(move_, e_index + 3);
         //     }
         // }
-        self.commanded_pos = newpos;
+        self.commanded_pos = newpos.to_vec();
         let want_flush = self.lookahead.add_move(move_);
         if want_flush {
             // self.process_lookahead(true);
@@ -458,10 +468,18 @@ impl ToolHead {
         // }
     }
 
-    pub fn drip_move(&mut self, newpos: [f64; 4], speed: f64, _drip_completion: &DripCompletion) {
-        let mut newpos = newpos;
+    pub fn drip_move(&mut self, newpos: &[f64], speed: f64, _drip_completion: &DripCompletion) {
+        let mut newpos = newpos.to_vec();
         newpos[3] = self.commanded_pos[3];
-        let mut move_ = Move::new(self, self.commanded_pos, newpos, speed);
+        let mut move_ = Move::new(
+            self.max_velocity,
+            self.max_accel,
+            self.junction_deviation,
+            self.max_accel_to_decel,
+            &self.commanded_pos,
+            &newpos,
+            speed,
+        );
         if move_.move_d > 0.0 {
             self.kin.check_move(&mut move_);
         }
@@ -585,7 +603,7 @@ impl ToolHead {
         // }
     }
 
-    fn _flush_handler(&mut self, eventtime: f64) {
+    fn _flush_handler(&mut self, _eventtime: f64) {
         // let est_print_time = self.mcu.estimated_print_time(eventtime);
         // if self.special_queuing_state.is_empty() {
         //     let print_time = self.print_time;
@@ -613,6 +631,70 @@ impl ToolHead {
         //     let ftime = est_print_time + 0.200 + 0.200; // BGFLUSH_LOW_TIME + BGFLUSH_BATCH_TIME
         //     self._advance_flush_time(end_flush.min(ftime));
         // }
+    }
+
+    fn dwell(&mut self, _delay: f64) {
+        // let next_print_time = self.get_last_move_time() + delay.max(0.0);
+        // self._advance_move_time(next_print_time);
+        // self._check_pause();
+    }
+
+    fn wait_moves(&mut self) {
+        // self._flush_lookahead();
+        // let mut eventtime = self.reactor.monotonic();
+        // while !self.special_queuing_state.is_empty() || self.print_time >= self.mcu.estimated_print_time(eventtime) {
+        //     if !self.can_pause {
+        //         break;
+        //     }
+        //     eventtime = self.reactor.pause(eventtime + 0.100);
+        // }
+    }
+
+    fn set_extruder(&mut self, extruder: kinematics::extruder::DummyExtruder, extrude_pos: f64) {
+        // let prev_ea_trapq = self.extra_axes[0].get_trapq();
+        // if self.flush_trapqs.contains(&prev_ea_trapq) {
+        //     self.flush_trapqs.remove_item(&prev_ea_trapq);
+        // }
+        self.extra_axes[0] = extruder;
+        self.commanded_pos[3] = extrude_pos;
+        // let ea_trapq = extruder.get_trapq();
+        // if !ea_trapq.is_null() {
+        //     self.flush_trapqs.push(ea_trapq);
+        // }
+    }
+
+    fn get_extruder(&self) -> &kinematics::extruder::DummyExtruder {
+        &self.extra_axes[0]
+    }
+
+    pub fn add_extra_axis(&mut self, ea: kinematics::extruder::DummyExtruder) {
+        // self._flush_lookahead();
+        self.extra_axes.push(ea);
+        self.commanded_pos.push(0.0);
+        // let ea_trapq = ea.get_trapq();
+        // if !ea_trapq.is_null() {
+        //     self.flush_trapqs.push(ea_trapq);
+        // }
+        // self.printer.send_event("toolhead:update_extra_axes");
+    }
+
+    pub fn remove_extra_axis(&mut self, _ea: kinematics::extruder::DummyExtruder) {
+        // self._flush_lookahead();
+        // if let Some(ea_index) = self.extra_axes.iter().position(|&x| x == ea) {
+        //     let ea_trapq = self.extra_axes[ea_index].get_trapq();
+        //     if self.flush_trapqs.contains(&ea_trapq) {
+        //         self.flush_trapqs.remove_item(&ea_trapq);
+        //     }
+        //     self.commanded_pos.remove(ea_index + 3);
+        //     self.extra_axes.remove(ea_index);
+        //     // self.printer.send_event("toolhead:update_extra_axes");
+        // }
+    }
+
+    pub fn get_extra_axes(&self) -> Vec<Option<kinematics::extruder::DummyExtruder>> {
+        let mut axes = vec![None, None, None];
+        axes.extend(self.extra_axes.iter().map(|ea| Some(*ea)));
+        axes
     }
 }
 
