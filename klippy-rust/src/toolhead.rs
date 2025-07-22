@@ -333,12 +333,12 @@ pub struct ToolHead {
     mcu: *mut MCU,
     lookahead: LookAheadQueue,
     commanded_pos: Vec<f64>,
-    max_velocity: f64,
-    max_accel: f64,
+    pub max_velocity: f64,
+    pub max_accel: f64,
     min_cruise_ratio: f64,
-    square_corner_velocity: f64,
-    junction_deviation: f64,
-    max_accel_to_decel: f64,
+    pub square_corner_velocity: f64,
+    pub junction_deviation: f64,
+    pub max_accel_to_decel: f64,
     check_stall_time: f64,
     print_stall: u32,
     can_pause: bool,
@@ -695,6 +695,31 @@ impl ToolHead {
         let mut axes = vec![None, None, None];
         axes.extend(self.extra_axes.iter().map(|ea| Some(*ea)));
         axes
+    }
+
+    fn note_mcu_movequeue_activity(&mut self, _wake_time: f64, _triggered: bool) {
+        // self.need_flush_time = self.need_flush_time.max(wake_time);
+        // if self.do_kick_flush_timer {
+        //     self.do_kick_flush_timer = false;
+        //     let curtime = self.reactor.monotonic();
+        //     self.reactor.update_timer(self.flush_timer, curtime);
+        // }
+    }
+
+    pub fn get_max_velocity(&self) -> (f64, f64) {
+        (self.max_velocity, self.max_accel)
+    }
+
+    pub fn _calc_junction_deviation(&mut self) {
+        let scv2 = self.square_corner_velocity * self.square_corner_velocity;
+        self.junction_deviation = scv2 * (2.0f64.sqrt() - 1.0) / self.max_accel;
+        self.max_accel_to_decel = self.max_accel;
+        // self.max_accel_to_decel = self.config.get_float(
+        //     "max_accel_to_decel",
+        //     self.max_accel,
+        //     0.0,
+        //     None,
+        // );
     }
 }
 

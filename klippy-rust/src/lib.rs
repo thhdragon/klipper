@@ -6,6 +6,7 @@ pub mod stepcompress;
 pub mod toolhead;
 pub mod trapq;
 pub mod webhooks;
+mod tests;
 
 use std::collections::HashMap;
 
@@ -47,6 +48,9 @@ pub mod configfile {
     }
     pub struct Config;
     impl Config {
+        pub fn new() -> Self {
+            Config
+        }
         pub fn get_prefix_sections(&self, _prefix: &str) -> Vec<Section> {
             vec![]
         }
